@@ -7,6 +7,7 @@ import {
   buildProviderOptionSelectionsFromDescriptors,
   createModelCapabilities,
   createModelSelection,
+  getModelInputCapabilities,
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
   getProviderOptionDescriptors,
@@ -160,6 +161,68 @@ describe("descriptor helpers", () => {
     ).toBeUndefined();
     expect(getModelSelectionStringOptionValue(selection, "reasoningEffort")).toBe("high");
     expect(getModelSelectionBooleanOptionValue(selection, "fastMode")).toBe(true);
+  });
+});
+
+describe("model slug normalization", () => {
+  it("preserves exact custom slugs instead of expanding provider aliases", () => {
+    const claude = ProviderDriverKind.make("claudeAgent");
+
+    expect(normalizeModelSlug("opus", claude)).toBe("claude-opus-5");
+    expect(normalizeCustomModelSlug(" opus ")).toBe("opus");
+  });
+});
+
+describe("input capabilities", () => {
+  it("omits capability fields when no modality is disabled", () => {
+    const caps = createModelCapabilities({ optionDescriptors: [] });
+    expect(caps.inputImages).toBeUndefined();
+    expect(caps.inputAudio).toBeUndefined();
+    expect(caps.inputFiles).toBeUndefined();
+  });
+
+  it("only records modalities that are explicitly disabled", () => {
+    const caps = createModelCapabilities({
+      optionDescriptors: [],
+      inputImages: false,
+      inputAudio: false,
+    });
+    expect(caps.inputImages).toBe(false);
+    expect(caps.inputAudio).toBe(false);
+    expect(caps.inputFiles).toBeUndefined();
+  });
+
+  it("ignores explicit true so the wire shape stays minimal", () => {
+    const caps = createModelCapabilities({
+      optionDescriptors: [],
+      inputImages: true,
+      inputFiles: true,
+    });
+    expect(caps.inputImages).toBeUndefined();
+    expect(caps.inputFiles).toBeUndefined();
+  });
+
+  it("resolves absent fields to supported", () => {
+    expect(getModelInputCapabilities(undefined)).toEqual({
+      images: true,
+      audio: true,
+      files: true,
+    });
+    expect(getModelInputCapabilities({ optionDescriptors: [] })).toEqual({
+      images: true,
+      audio: true,
+      files: true,
+    });
+  });
+
+  it("resolves explicitly disabled fields to false", () => {
+    expect(
+      getModelInputCapabilities({
+        optionDescriptors: [],
+        inputImages: false,
+        inputAudio: false,
+      }),
+    ).toEqual({ images: false, audio: false, files: true });
   });
 });
 
