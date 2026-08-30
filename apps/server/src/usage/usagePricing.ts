@@ -26,6 +26,51 @@ export interface ModelRate {
 
 export type RateTable = ReadonlyMap<string, ModelRate>;
 
+/** Convert a provider snapshot's persisted pricing metadata into rates. */
+export function parseProviderModelRateTable(document: unknown): RateTable {
+  const table = new Map<string, ModelRate>();
+  if (typeof document !== "object" || document === null || Array.isArray(document)) {
+    return table;
+  }
+  const models = (document as Record<string, unknown>).models;
+  if (!Array.isArray(models)) return table;
+
+  const toRate = (pricing: unknown): ModelRate | null => {
+    if (typeof pricing !== "object" || pricing === null || Array.isArray(pricing)) return null;
+    const record = pricing as Record<string, unknown>;
+    const perMillion = (key: string): number | null => {
+      const value = record[key];
+      return typeof value === "number" && Number.isFinite(value) && value >= 0
+        ? value / 1_000_000
+        : null;
+    };
+    const input = perMillion("inputPerMillion");
+    const output = perMillion("outputPerMillion");
+    if (input === null || output === null) return null;
+    return {
+      inputCostPerToken: input,
+      outputCostPerToken: output,
+      cacheReadCostPerToken: perMillion("cachedInputPerMillion") ?? input,
+      cacheCreationCostPerToken: perMillion("cacheCreationPerMillion") ?? input,
+    };
+  };
+
+  for (const model of models) {
+    if (typeof model !== "object" || model === null || Array.isArray(model)) continue;
+    const entry = model as Record<string, unknown>;
+    const slug = typeof entry.slug === "string" ? entry.slug : "";
+    const direct = toRate(entry.pricing);
+    if (slug && direct) table.set(normalizeModelName(slug), direct);
+    const variants = entry.pricingByVariant;
+    if (typeof variants !== "object" || variants === null || Array.isArray(variants)) continue;
+    for (const [variant, pricing] of Object.entries(variants as Record<string, unknown>)) {
+      const rate = toRate(pricing);
+      if (rate) table.set(normalizeModelName(variant), rate);
+    }
+  }
+  return table;
+}
+
 /** Raw shape of one LiteLLM entry, narrowed to the fields we read. */
 interface LiteLlmEntry {
   readonly input_cost_per_token?: unknown;

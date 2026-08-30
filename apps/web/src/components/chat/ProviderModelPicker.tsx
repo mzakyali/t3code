@@ -1,6 +1,7 @@
 import {
   type ProviderInstanceId,
   type ProviderDriverKind,
+  type ProviderOptionSelection,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
 import { memo, useEffect, useMemo, useState } from "react";
@@ -14,6 +15,7 @@ import { ModelPickerContent } from "./ModelPickerContent";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import {
   ModelEsque,
+  getModelProviderBrand,
   getTriggerDisplayModelLabel,
   getTriggerDisplayModelName,
 } from "./providerIconUtils";
@@ -44,6 +46,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   onOpenChange?: (open: boolean) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
   onInstanceModelChange: (instanceId: ProviderInstanceId, model: string) => void;
+  /**
+   * Stored provider option selections for the active model. Forwarded to
+   * {@link ModelPickerContent} so the picker can display and control the
+   * reasoning level without changing the model identity.
+   */
+  activeModelOptions?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  onModelOptionsChange?: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => void;
 }) {
   const [uncontrolledIsMenuOpen, setUncontrolledIsMenuOpen] = useState(false);
   const isMenuOpen = props.open ?? uncontrolledIsMenuOpen;
@@ -70,6 +79,10 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
     : props.model;
   const showInstanceBadge =
     activeEntry !== null && shouldShowInstanceBadge(activeEntry, props.instanceEntries);
+  const ActiveModelProviderIcon =
+    activeEntry?.driverKind === "devin" && selectedModel
+      ? getModelProviderBrand(activeEntry.driverKind, selectedModel).icon
+      : null;
 
   const setIsMenuOpen = (open: boolean) => {
     props.onOpenChange?.(open);
@@ -159,7 +172,11 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         }
       >
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          {activeEntry ? (
+          {ActiveModelProviderIcon ? (
+            <ActiveModelProviderIcon
+              className={cn("size-4 shrink-0", props.activeProviderIconClassName)}
+            />
+          ) : activeEntry ? (
             <ProviderInstanceIcon
               driverKind={activeEntry.driverKind}
               displayName={activeEntry.displayName}
@@ -209,6 +226,12 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
             ? { getModelDisabledReason: props.getModelDisabledReason }
             : {})}
           onInstanceModelChange={handleInstanceModelChange}
+          {...(props.activeModelOptions !== undefined
+            ? { activeModelOptions: props.activeModelOptions }
+            : {})}
+          {...(props.onModelOptionsChange
+            ? { onModelOptionsChange: props.onModelOptionsChange }
+            : {})}
         />
       </PopoverPopup>
     </Popover>
