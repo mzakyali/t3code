@@ -50,6 +50,7 @@ import {
 import {
   applyClaudePromptEffortPrefix,
   createModelSelection,
+  getModelInputCapabilities,
   resolvePromptInjectedEffort,
 } from "@t3tools/shared/model";
 import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
@@ -322,7 +323,11 @@ import {
   hasDismissedResumeCompaction,
   shouldOfferResumeCompaction,
 } from "./chat/ContextWindowMeter.logic";
-import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "../lib/contextWindow";
+import {
+  deriveKnownContextWindowSnapshot,
+  deriveLatestContextWindowSnapshot,
+  formatContextWindowTokens,
+} from "../lib/contextWindow";
 import { ThreadSyncStatusPill } from "./chat/ThreadSyncStatusPill";
 import {
   DRAFT_HERO_TRANSITION_ANIMATION_ID,
@@ -386,6 +391,8 @@ import { previewEnvironment } from "../state/preview";
 import { clampFileAttachmentUploadBytes } from "@t3tools/client-runtime/state/attachments";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { fileAttachmentCapabilityBlockReason } from "./chat/composerAttachmentFiles";
+import { findModelCapabilities } from "./chat/modelFamilyGrouping";
+import { preserveCompatibleOptions } from "./ChatView.modelOptions";
 import { assetEnvironment } from "../state/assets";
 import { readPreparedConnection } from "../state/session";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -1461,6 +1468,15 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  // Tracks a thread that is expecting an in-place session restart because the
+  // user changed the model on an existing session (Devin restarts the ACP
+  // session on the next sendTurn). Set when the model picker writes a new
+  // model on a thread that already has a session; cleared once the session
+  // leaves the transient "starting" status so the reinitializing banner
+  // disappears when the new session is ready.
+  const [pendingModelReinitThreadKey, setPendingModelReinitThreadKey] = useState<string | null>(
+    null,
+  );
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -2324,10 +2340,32 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
+  // The session goes through a transient "starting" status when the Devin
+  // adapter restarts the ACP session for a model change. The banner below
+  // distinguishes that from an initial connect using the flag set in
+  // onProviderModelSelect. Clear the flag as soon as the session leaves
+  // "starting" so the indicator disappears the moment the new session is ready.
+  const isReinitializingForModelChange =
+    phase === "connecting" &&
+    activeThreadKey !== null &&
+    pendingModelReinitThreadKey === activeThreadKey;
+  useEffect(() => {
+    if (phase !== "connecting" && pendingModelReinitThreadKey !== null) {
+      setPendingModelReinitThreadKey(null);
+    }
+  }, [phase, pendingModelReinitThreadKey]);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const activeContextWindow = useMemo(
-    () => deriveLatestContextWindowSnapshot(threadActivities),
-    [threadActivities],
+    () =>
+      deriveLatestContextWindowSnapshot(threadActivities) ??
+      (activeThread
+        ? deriveKnownContextWindowSnapshot({
+            selection: activeThread?.modelSelection,
+            providers: providerStatuses,
+            updatedAt: activeThread.updatedAt,
+          })
+        : null),
+    [activeThread, providerStatuses, threadActivities],
   );
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
   const turnPlans = useMemo(() => deriveTurnPlans(threadActivities), [threadActivities]);
@@ -5005,6 +5043,22 @@ function ChatViewContent(props: ChatViewProps) {
     }
     void handleSwitchCheckoutToThread();
   }, [gitStatusQuery.data?.hasWorkingTreeChanges, handleSwitchCheckoutToThread]);
+  const reinitBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    if (!isReinitializingForModelChange || !activeThreadKey) return null;
+    return {
+      id: `model-reinit:${activeThreadKey}`,
+      variant: "default",
+      icon: (
+        <span
+          className="size-1.5 animate-status-pulse rounded-full bg-foreground"
+          aria-hidden="true"
+        />
+      ),
+      title: "Reinitializing session for new model…",
+      description: "The new model is being loaded. This will only take a moment.",
+    };
+  }, [isReinitializingForModelChange, activeThreadKey]);
+
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const isUrgentSystemItem = (item: ComposerBannerStackItem) =>
       item.urgent === true || item.variant === "error" || item.variant === "warning";
@@ -5016,11 +5070,13 @@ function ChatViewContent(props: ChatViewProps) {
       resumeCompactionBannerItem === null ? [] : [resumeCompactionBannerItem];
     const wokeThreadItems = wokeThreadBannerItem === null ? [] : [wokeThreadBannerItem];
     const parkedThreadItems = parkedThreadBannerItem === null ? [] : [parkedThreadBannerItem];
+    const reinitItems = reinitBannerItem === null ? [] : [reinitBannerItem];
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
         ...urgentSystemItems,
         ...backgroundLivenessItems,
         ...calmSystemItems,
+        ...reinitItems,
         ...resumeCompactionItems,
         ...wokeThreadItems,
         ...parkedThreadItems,
@@ -5030,6 +5086,7 @@ function ChatViewContent(props: ChatViewProps) {
       ...urgentSystemItems,
       ...backgroundLivenessItems,
       ...calmSystemItems,
+      ...reinitItems,
       ...resumeCompactionItems,
       ...wokeThreadItems,
       {
@@ -5080,6 +5137,7 @@ function ChatViewContent(props: ChatViewProps) {
     isRestoringThreadBranch,
     localCheckoutBranchMismatch,
     parkedThreadBannerItem,
+    reinitBannerItem,
     resumeCompactionBannerItem,
     showBranchMismatchBanner,
     systemComposerBannerItems,
@@ -5088,6 +5146,7 @@ function ChatViewContent(props: ChatViewProps) {
   useEffect(() => {
     setPendingServerThreadEnvMode(null);
     setPendingServerThreadBranch(undefined);
+    setPendingModelReinitThreadKey(null);
   }, [activeThread?.id]);
 
   useEffect(() => {
@@ -5768,6 +5827,29 @@ function ChatViewContent(props: ChatViewProps) {
       text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
+      return;
+    }
+
+    // Block the turn when queued attachments use a modality the active model
+    // does not accept. This catches the case where a user queued images or
+    // files and then switched to a model that rejects them; rather than
+    // silently dropping the attachments or failing inside the provider, we
+    // surface a clear error so the user can remove them or switch back.
+    const modelInputCaps = getModelInputCapabilities(
+      getProviderModelCapabilities(
+        ctxSelectedProviderModels,
+        ctxSelectedModel,
+        ctxSelectedProvider,
+      ),
+    );
+    const modelInputBlockReason =
+      composerImagesSnapshot.length > 0 && !modelInputCaps.images
+        ? "The selected model does not accept image attachments. Remove them or switch models."
+        : composerFilesSnapshot.length > 0 && !modelInputCaps.files
+          ? "The selected model does not accept file attachments. Remove them or switch models."
+          : null;
+    if (modelInputBlockReason !== null) {
+      setThreadError(threadIdForSend, modelInputBlockReason);
       return;
     }
 
@@ -6758,9 +6840,18 @@ function ChatViewContent(props: ChatViewProps) {
         scheduleComposerFocus();
         return;
       }
+      // Preserve compatible options across model switches. Carry over any
+      // stored option whose descriptor id also exists on the new model's
+      // capabilities, so a reasoning-effort choice survives switching from one
+      // model to another in the same family. Options the new model does not
+      // expose are dropped rather than sent blindly.
+      const currentOptions = activeThread.modelSelection?.options;
+      const nextCaps = entry ? findModelCapabilities(entry.models, resolvedModel) : null;
+      const preservedOptions = preserveCompatibleOptions(currentOptions, nextCaps);
       const nextModelSelection: ModelSelection = {
         instanceId,
         model: resolvedModel,
+        ...(preservedOptions ? { options: preservedOptions } : {}),
       };
       const modelChangeBlockReason = getStartedThreadModelChangeBlockReason({
         providers: providerStatuses,
@@ -6784,6 +6875,14 @@ function ChatViewContent(props: ChatViewProps) {
         { explicit: true },
       );
       setStickyComposerModelSelection(nextModelSelection);
+      // Mark this thread as expecting an in-place session restart when the
+      // model changes on a session that is already running. The banner uses
+      // this to distinguish a model-change "starting" from an initial connect.
+      if (activeThread.session !== null && activeThread.modelSelection?.model !== resolvedModel) {
+        setPendingModelReinitThreadKey(
+          scopedThreadKey(scopeThreadRef(activeThread.environmentId, activeThread.id)),
+        );
+      }
       scheduleComposerFocus();
     },
     [

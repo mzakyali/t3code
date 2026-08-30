@@ -1031,7 +1031,15 @@ export function NewTaskDraftScreen(props: {
               disabled={isIncomingShareTransferPending}
               emphasized
               iconNode={
-                <ProviderIcon provider={flow.selectedModelOption?.providerDriver} size={16} />
+                <ProviderIcon
+                  provider={flow.selectedModelOption?.providerDriver}
+                  model={
+                    flow.selectedModelOption
+                      ? `${flow.selectedModelOption.selection.model} ${flow.selectedModelOption.label}`
+                      : undefined
+                  }
+                  size={16}
+                />
               }
               label={flow.selectedModelOption?.label ?? "Choose model"}
               maxWidth={152}

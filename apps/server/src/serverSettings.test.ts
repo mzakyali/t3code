@@ -723,6 +723,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       yield* serverSettings.updateSettings({
         providers: {
           cursor: { enabled: true },
+          devin: { enabled: true },
           grok: { enabled: true },
           opencode: { enabled: true },
         },
@@ -733,6 +734,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       const persisted = JSON.parse(raw);
       assert.isTrue(persisted.providers.cursor.enabled);
+      assert.isTrue(persisted.providers.devin.enabled);
       assert.isTrue(persisted.providers.grok.enabled);
       assert.isTrue(persisted.providers.opencode.enabled);
     }).pipe(Effect.provide(makeServerSettingsLayer())),
@@ -748,6 +750,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.isFalse(initial.providers.grok.enabled);
       assert.isFalse(initial.providers.opencode.enabled);
       assert.isFalse(initial.providers.cursor.enabled);
+      assert.isFalse(initial.providers.devin.enabled);
 
       const next = yield* serverSettings.updateSettings({
         addProjectBaseDirectory: "~/Development",
@@ -961,6 +964,9 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             binaryPath: "/opt/homebrew/bin/codex",
           },
           cursor: {
+            enabled: false,
+          },
+          devin: {
             enabled: false,
           },
           grok: {

@@ -137,6 +137,30 @@ function agentActivityText(agent: RuntimeSubagent): string | null {
   );
 }
 
+function AgentActivityTranscript({ agent }: { agent: RuntimeSubagent }) {
+  if (agent.recentActivity.length <= 1) return null;
+  return (
+    <details className="ml-5 rounded-md border border-border/40 bg-muted/10 px-2 py-1">
+      <summary className="cursor-pointer list-none text-[.65rem] font-medium text-muted-foreground marker:hidden">
+        Activity · {agent.recentActivity.length} observations
+      </summary>
+      <ol className="mt-1 flex max-h-28 flex-col gap-1 overflow-y-auto border-l border-border/50 pl-2">
+        {agent.recentActivity.map((entry, index) => (
+          <li key={`${entry.at}-${index}`} className="flex min-w-0 gap-2 text-[.65rem]">
+            <time className="shrink-0 font-mono tabular-nums text-muted-foreground/60">
+              {new Date(entry.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </time>
+            <span className="min-w-0 truncate text-muted-foreground">{entry.summary}</span>
+          </li>
+        ))}
+      </ol>
+      <p className="mt-1 text-[.6rem] text-muted-foreground/60">
+        Provider summaries, tools, and status only. Private reasoning is never shown.
+      </p>
+    </details>
+  );
+}
+
 /** Flat, non-interactive agent status line. No unfold. */
 function AgentRow({ agent }: { agent: RuntimeSubagent }) {
   const visuals = STATUS_VISUALS[agent.status];
@@ -154,39 +178,42 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
   ].filter((value): value is string => value !== null);
 
   return (
-    <div className="grid h-[3.875rem] grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 rounded-md px-1.5 py-1">
-      <span className="col-start-1 row-start-1 flex items-center">
-        <StatusDot status={agent.status} />
-      </span>
-      <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
-        <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
-        {role ? (
-          <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 font-mono text-[.65rem] text-muted-foreground">
-            {role}
-          </span>
-        ) : null}
-      </span>
-      <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-[.7rem] text-muted-foreground/80">
-        <span className="inline-flex items-center gap-1">
-          <AgentElapsed agent={agent} />
-          {agent.status === "completed" ? (
-            <Check aria-hidden className="size-3 text-success" />
+    <>
+      <div className="grid h-[3.875rem] grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 rounded-md px-1.5 py-1">
+        <span className="col-start-1 row-start-1 flex items-center">
+          <StatusDot status={agent.status} />
+        </span>
+        <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
+          <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
+          {role ? (
+            <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 font-mono text-[.65rem] text-muted-foreground">
+              {role}
+            </span>
           ) : null}
         </span>
-      </span>
-      <span
-        className={cn(
-          "col-start-2 col-end-4 row-start-2 block truncate text-xs",
-          agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
-        )}
-      >
-        {activity ?? visuals.label}
-      </span>
-      <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-[.7rem] tabular-nums text-muted-foreground/70">
-        {metadata.join(" · ")}
-      </span>
-      <span className="sr-only">{visuals.label}</span>
-    </div>
+        <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-[.7rem] text-muted-foreground/80">
+          <span className="inline-flex items-center gap-1">
+            <AgentElapsed agent={agent} />
+            {agent.status === "completed" ? (
+              <Check aria-hidden className="size-3 text-success" />
+            ) : null}
+          </span>
+        </span>
+        <span
+          className={cn(
+            "col-start-2 col-end-4 row-start-2 block truncate text-xs",
+            agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
+          )}
+        >
+          {activity ?? visuals.label}
+        </span>
+        <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-[.7rem] tabular-nums text-muted-foreground/70">
+          {metadata.join(" · ")}
+        </span>
+        <span className="sr-only">{visuals.label}</span>
+      </div>
+      <AgentActivityTranscript agent={agent} />
+    </>
   );
 }
 
@@ -537,6 +564,10 @@ export function AgentsPanel({
         <p className="max-w-56 text-xs text-muted-foreground">
           When this thread spawns subagents or runs a workflow, they show up here with live status,
           activity, and token usage.
+        </p>
+        <p className="max-w-64 text-[.65rem] text-muted-foreground/60">
+          This panel only consumes structured provider events. Assistant prose and private reasoning
+          never create an agent row.
         </p>
       </div>
     );

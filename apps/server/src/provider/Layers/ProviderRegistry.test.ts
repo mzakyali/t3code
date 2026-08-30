@@ -563,6 +563,91 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         assert.strictEqual(haveProvidersChanged(providers, [...providers]), false);
       });
 
+      it("replaces the previous model inventory when the catalog version changes", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("devin"),
+          driver: ProviderDriverKind.make("devin"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-30T00:00:00.000Z",
+          version: "1.0.0",
+          modelCatalogVersion: "devin-model-catalog-v1",
+          models: [
+            {
+              slug: "claude-opus-5-medium",
+              name: "Medium",
+              isCustom: false,
+              capabilities: createModelCapabilities({ optionDescriptors: [] }),
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        } satisfies ServerProvider;
+        const refreshedProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-30T00:01:00.000Z",
+          modelCatalogVersion: "devin-model-catalog-v2",
+          models: [
+            {
+              slug: "claude-opus-5",
+              name: "Claude Opus 5",
+              isCustom: false,
+              capabilities: createModelCapabilities({
+                optionDescriptors: [selectDescriptor("reasoning", "Reasoning", [])],
+              }),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider),
+          refreshedProvider,
+        );
+      });
+
+      it("treats a ready Devin catalog as authoritative within one version", () => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("devin"),
+          driver: ProviderDriverKind.make("devin"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-30T00:00:00.000Z",
+          version: "1.0.0",
+          modelCatalogVersion: "devin-model-catalog-v2",
+          models: [
+            {
+              slug: "legacy-flattened-model",
+              name: "Legacy Flattened Model",
+              isCustom: false,
+              capabilities: createModelCapabilities({ optionDescriptors: [] }),
+            },
+          ],
+          slashCommands: [],
+          skills: [],
+        } satisfies ServerProvider;
+        const refreshedProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-30T00:01:00.000Z",
+          models: [
+            {
+              slug: "claude-opus-5",
+              name: "Claude Opus 5",
+              isCustom: false,
+              capabilities: createModelCapabilities({ optionDescriptors: [] }),
+            },
+          ],
+        } satisfies ServerProvider;
+
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).models,
+          refreshedProvider.models,
+        );
+      });
+
       it("preserves previously discovered provider models when a refresh returns none", () => {
         const previousProvider = {
           instanceId: ProviderInstanceId.make("cursor"),
@@ -1971,6 +2056,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "claudeAgent",
                 "codex",
                 "cursor",
+                "devin",
                 "grok",
                 "opencode",
               ]);

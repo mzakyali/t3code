@@ -18,9 +18,10 @@ import type { UsageProviderKind } from "@t3tools/contracts";
 
 import type { UsageRecord } from "./usageTranscripts.ts";
 
-// v2: Codex fork-copy suppression changed what a file parses to, so v1
-// entries would keep serving double-counted records forever.
-export const USAGE_SCAN_CACHE_VERSION = 2 as const;
+// v3: Devin ACP event-log records were added and the provider set is part of
+// the cache schema. Invalidating older entries also ensures a previously
+// flattened provider snapshot cannot mask the new model/session attribution.
+export const USAGE_SCAN_CACHE_VERSION = 3 as const;
 
 export interface CachedFile {
   readonly size: number;
@@ -134,7 +135,8 @@ export function decodeScanCache(document: unknown): ScanCache {
     if (typeof raw !== "object" || raw === null) continue;
     const entry = raw as Partial<SerializedFile>;
     if (typeof entry.s !== "number" || typeof entry.m !== "number") continue;
-    if (entry.p !== "claude" && entry.p !== "codex" && entry.p !== "grok") continue;
+    if (entry.p !== "claude" && entry.p !== "codex" && entry.p !== "grok" && entry.p !== "devin")
+      continue;
     if (!isRecordArray(entry.r)) continue;
 
     const provider: UsageProviderKind = entry.p;

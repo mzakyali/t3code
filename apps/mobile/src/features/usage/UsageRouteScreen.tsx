@@ -1,4 +1,5 @@
 import { useNavigation } from "@react-navigation/native";
+import type { UsageAccountConsumption } from "@t3tools/contracts";
 import type { DailyTotals, MergedUsage } from "@t3tools/shared/usageMerge";
 import {
   enumerateDays,
@@ -127,6 +128,9 @@ export function UsageRouteScreen() {
           </Text>
         ) : (
           <>
+            {merged.accountUsage !== null ? (
+              <DevinAccountUsageSection usage={merged.accountUsage} />
+            ) : null}
             <ChartCard
               merged={merged}
               days={chartDays}
@@ -145,6 +149,41 @@ export function UsageRouteScreen() {
         )}
       </ScrollView>
     </View>
+  );
+}
+
+function formatAcus(value: number): string {
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value);
+}
+
+function DevinAccountUsageSection({ usage }: { readonly usage: UsageAccountConsumption }) {
+  const message =
+    usage.status === "notConfigured"
+      ? "Optional account ACU data is not configured on the server."
+      : usage.status === "forbidden"
+        ? "The configured Devin key cannot read organization consumption."
+        : usage.status === "failed"
+          ? (usage.message ?? "Devin account consumption could not be loaded.")
+          : null;
+
+  return (
+    <SettingsSection title="Devin account usage" card>
+      <View className="gap-1 p-4">
+        {usage.status === "available" ? (
+          <Text className="text-2xl font-t3-medium tabular-nums text-foreground">
+            {formatAcus(usage.totalAcus)} ACUs
+          </Text>
+        ) : null}
+        <Text className="text-sm text-foreground-muted">
+          {message ?? "Official organization consumption for this window."}
+        </Text>
+        {usage.status === "available" ? (
+          <Text className="text-xs text-foreground-tertiary">
+            {usage.days.length} billing days returned · Source: {usage.source}
+          </Text>
+        ) : null}
+      </View>
+    </SettingsSection>
   );
 }
 

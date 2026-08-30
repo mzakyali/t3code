@@ -2,6 +2,8 @@
 
 import {
   ArrowUpCircleIcon,
+  CircleAlertIcon,
+  CircleCheckIcon,
   CopyIcon,
   DownloadIcon,
   LoaderIcon,
@@ -13,12 +15,12 @@ import * as Arr from "effect/Array";
 import * as Result from "effect/Result";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  ProviderDriverKind,
   isProviderDriverKind,
   resolveProviderInstanceEnabled,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   type ProviderInstanceId,
-  type ProviderDriverKind,
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
@@ -162,6 +164,148 @@ function ProviderAuthEmail(props: { readonly email: string | undefined }) {
       hideTooltip="Click to hide email"
       className="max-w-full truncate"
     />
+  );
+}
+
+function redactDiagnosticConfig(config: unknown): Record<string, unknown> {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return {};
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+    if (/(token|secret|password|api[-_]?key|credential)/iu.test(key)) {
+      redacted[key] = "[redacted]";
+    } else if (typeof value === "string") {
+      redacted[key] = value;
+    } else if (typeof value === "boolean" || typeof value === "number" || value === null) {
+      redacted[key] = value;
+    }
+  }
+  return redacted;
+}
+
+function DevinDiagnosticsSection(props: {
+  readonly instance: ProviderInstanceConfig;
+  readonly provider: ServerProvider | undefined;
+  readonly models: ReadonlyArray<ServerProviderModel>;
+  readonly onRefresh?: (() => void) | undefined;
+  readonly refreshing: boolean;
+}) {
+  const { instance, provider, models, onRefresh, refreshing } = props;
+  const [copied, setCopied] = useState(false);
+  const builtInModels = models.filter((model) => !model.isCustom);
+  const pricedModels = builtInModels.filter(
+    (model) => model.pricing !== undefined || Object.keys(model.pricingByVariant ?? {}).length > 0,
+  ).length;
+  const contextModels = builtInModels.filter(
+    (model) => model.contextWindowTokens !== undefined,
+  ).length;
+  const metadataComplete = builtInModels.length > 0 && pricedModels === builtInModels.length;
+  const config = instance.config as Record<string, unknown> | undefined;
+  const accountUsageNames = new Set([
+    "DEVIN_API_KEY",
+    "DEVIN_PERSONAL_ACCESS_TOKEN",
+    "DEVIN_ORG_ID",
+    "DEVIN_ORGANIZATION_ID",
+  ]);
+  const accountUsageConfigured = (instance.environment ?? []).some((variable) =>
+    accountUsageNames.has(variable.name.toUpperCase()),
+  );
+  const accountUsageLabel = accountUsageConfigured
+    ? "Optional Devin organization ACU API configured (value redacted)."
+    : "Optional Devin organization ACU API not configured; CLI login alone does not grant billing access.";
+  const binaryPath =
+    typeof config?.binaryPath === "string" && config.binaryPath.trim()
+      ? config.binaryPath.trim()
+      : "devin (PATH)";
+  const diagnosticsPayload = JSON.stringify(
+    {
+      provider: "devin",
+      transport: "devin acp",
+      binaryPath,
+      status: provider?.status ?? "unknown",
+      installed: provider?.installed ?? false,
+      authenticated: provider?.auth.status === "authenticated",
+      version: provider?.version ?? null,
+      checkedAt: provider?.checkedAt ?? null,
+      modelCatalogVersion: provider?.modelCatalogVersion ?? null,
+      modelCount: builtInModels.length,
+      pricedModelCount: pricedModels,
+      contextModelCount: contextModels,
+      usageSource: "T3 local provider event logs",
+      accountUsage: accountUsageConfigured ? "configured (value redacted)" : "not configured",
+      subagentEvents: "not advertised by standard ACP",
+      config: redactDiagnosticConfig(instance.config),
+    },
+    null,
+    2,
+  );
+  const copyDiagnostics = () => {
+    if (!globalThis.navigator?.clipboard) return;
+    void globalThis.navigator.clipboard.writeText(diagnosticsPayload).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => undefined,
+    );
+  };
+
+  return (
+    <details className="rounded-md border border-border/70 bg-muted/20">
+      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-foreground [&::-webkit-details-marker]:hidden">
+        <span className="inline-flex items-center gap-2">
+          {metadataComplete ? (
+            <CircleCheckIcon className="size-3.5 text-success" aria-hidden />
+          ) : (
+            <CircleAlertIcon className="size-3.5 text-warning" aria-hidden />
+          )}
+          Devin ACP diagnostics
+        </span>
+      </summary>
+      <div className="grid gap-2 border-t border-border/60 px-3 py-3 text-[11px] text-muted-foreground">
+        <div className="grid grid-cols-[7rem_minmax(0,1fr)] gap-x-2 gap-y-1">
+          <span>Transport</span>
+          <span className="font-mono text-foreground">{binaryPath} acp</span>
+          <span>CLI / auth</span>
+          <span className="text-foreground">
+            {provider?.version ?? "Not probed"} · {provider?.auth.status ?? "unknown"}
+          </span>
+          <span>Catalog</span>
+          <span className="text-foreground">
+            {builtInModels.length} parent models ·{" "}
+            {provider?.modelCatalogVersion ?? "not versioned"}
+          </span>
+          <span>Metadata</span>
+          <span className="text-foreground">
+            {pricedModels}/{builtInModels.length} priced · {contextModels}/{builtInModels.length}{" "}
+            context sizes
+          </span>
+          <span>Usage</span>
+          <span className="text-foreground">Local T3 event-log estimate. {accountUsageLabel}</span>
+          <span>Subagents</span>
+          <span className="text-foreground">
+            Standard ACP does not advertise child-agent events; only structured events are shown.
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-2 pt-1">
+          {onRefresh ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={refreshing}
+              onClick={onRefresh}
+            >
+              {refreshing ? <LoaderIcon className="animate-spin" /> : null}
+              {refreshing ? "Re-probing…" : "Re-probe Devin"}
+            </Button>
+          ) : null}
+          <Button type="button" size="xs" variant="ghost" onClick={copyDiagnostics}>
+            <CopyIcon />
+            {copied ? "Copied" : "Copy redacted diagnostics"}
+          </Button>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -384,6 +528,9 @@ interface ProviderInstanceCardProps {
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
   readonly onRunUpdate?: (() => void) | undefined;
   readonly isUpdating?: boolean | undefined;
+  /** Re-run the provider probe from the diagnostics panel. */
+  readonly onRefresh?: (() => void) | undefined;
+  readonly isRefreshing?: boolean | undefined;
 }
 
 /**
@@ -425,6 +572,8 @@ export function ProviderInstanceCard({
   onModelOrderChange,
   onRunUpdate,
   isUpdating = false,
+  onRefresh,
+  isRefreshing = false,
 }: ProviderInstanceCardProps) {
   const [activeTab, setActiveTab] = useState<"configuration" | "models">("configuration");
   const enabled = resolveProviderInstanceEnabled(instance);
@@ -896,6 +1045,16 @@ export function ProviderInstanceCard({
                 idPrefix={`provider-instance-${instanceId}`}
                 variant="card"
                 onChange={updateConfig}
+              />
+            ) : null}
+
+            {driverKind === ProviderDriverKind.make("devin") ? (
+              <DevinDiagnosticsSection
+                instance={instance}
+                provider={liveProvider}
+                models={modelsForDisplay}
+                onRefresh={onRefresh}
+                refreshing={isRefreshing}
               />
             ) : null}
 

@@ -7,13 +7,14 @@ orchestration layer does not know which one is behind a thread.
 
 ## Built-in drivers
 
-[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with five entries:
+[`builtInDrivers.ts`][drivers] exports `BUILT_IN_DRIVERS` with six entries:
 
 | Driver kind   | Driver source                           |
 | ------------- | --------------------------------------- |
 | `codex`       | [`Drivers/CodexDriver.ts`][codex]       |
 | `claudeAgent` | [`Drivers/ClaudeDriver.ts`][claude]     |
 | `cursor`      | [`Drivers/CursorDriver.ts`][cursor]     |
+| `devin`       | [`Drivers/DevinDriver.ts`][devin]       |
 | `grok`        | [`Drivers/GrokDriver.ts`][grok]         |
 | `opencode`    | [`Drivers/OpenCodeDriver.ts`][opencode] |
 
@@ -77,11 +78,30 @@ update snapshot enrichment. Other providers retain their existing refresh policy
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
 an external reload or restart before T3 Code's next refresh sees them.
 
+Devin model discovery follows the same startup and settings-change refresh path. Its CLI family
+variants are normalized into parent model rows with reasoning, speed, and context-window option
+descriptors before the snapshot is published. Devin snapshots carry a provider-owned model catalog
+version; when that version changes, the registry replaces (rather than merges) the previous
+snapshot and rewrites the per-instance status cache. This prevents a pre-grouping flattened cache
+from reappearing in the picker.
+
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful
 empty inventory is authoritative. Existing threads keep their explicit model identifier and
 options when catalog metadata is missing; the catalog is not permission to choose a different
 model for a thread.
+
+Devin ACP telemetry is normalized in `DevinAdapter` from both `usage_update` notifications (context
+window and cumulative session cost) and prompt response usage (per-turn token deltas). The adapter
+emits the shared `thread.token-usage.updated` event, which feeds the composer context meter and the
+Usage service. Usage scans canonical `events.<thread>.log` files only; native ACP protocol lines
+are retained for diagnostics but are not treated as billing records. The scan cache version is
+invalidated when this provider record shape changes. When explicitly configured, `UsageService`
+also reads Devin's organization consumption endpoint with a server-only `cog_...` service key and
+organization ID. That ACU result is an optional `UsageSummary.accountUsage` field and remains
+separate from token/cost buckets. Standard ACP does not define a child-agent event stream, so the
+Agents panel displays only provider-supplied structured activity and labels child-agent telemetry
+as unavailable when the transport does not advertise it.
 
 ## Model manifest
 
@@ -101,7 +121,7 @@ The server stores uploaded attachments in its attachment directory, outside the 
 `ProviderService` adds the absolute path of each attachment to the turn text, then passes every
 attachment to the provider adapter. Each adapter decides what its provider ingests natively:
 
-- Codex, Claude, Cursor, and Grok send images as native image inputs and skip generic files. For
+- Codex, Claude, Cursor, Devin, and Grok send images as native image inputs and skip generic files. For
   these providers, generic files reach the agent only as file paths in the turn text.
 - OpenCode sends PNG/JPEG/GIF/WebP images, text files, and PDFs up to 20 MB as native file parts
   with their real mime type. Everything else (ZIP and other binaries, image formats model APIs
@@ -110,7 +130,7 @@ attachment to the provider adapter. Each adapter decides what its provider inges
 Claude receives the attachment directory as an allowed additional directory. Codex keeps its
 configured sandbox policy, so access depends on that policy and the selected runtime mode. OpenCode
 allows all paths in full-access mode and requests approval for directories outside the workspace in
-restricted modes. Cursor and Grok use their own provider permission rules.
+restricted modes. Cursor, Devin, and Grok use their own provider permission rules.
 
 The server does not copy attachments into a project or bypass provider approval rules. If an agent
 cannot read an attachment, the user must approve the access or select a runtime mode that permits it.
@@ -163,6 +183,7 @@ when a request opens (approval) or user input is requested, via
 [codex]: ../../apps/server/src/provider/Drivers/CodexDriver.ts
 [claude]: ../../apps/server/src/provider/Drivers/ClaudeDriver.ts
 [cursor]: ../../apps/server/src/provider/Drivers/CursorDriver.ts
+[devin]: ../../apps/server/src/provider/Drivers/DevinDriver.ts
 [grok]: ../../apps/server/src/provider/Drivers/GrokDriver.ts
 [opencode]: ../../apps/server/src/provider/Drivers/OpenCodeDriver.ts
 [opencode-server-owner]: ../../apps/server/src/provider/OpenCodeServerOwner.ts

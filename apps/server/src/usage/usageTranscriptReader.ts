@@ -22,6 +22,7 @@ import {
   mightCarryUsage,
   parseClaudeLine,
   parseCodexLine,
+  parseDevinCanonicalLogLine,
   parseGrokLine,
   type UsageRecord,
 } from "./usageTranscripts.ts";
@@ -85,6 +86,47 @@ export async function listTranscriptFiles(
 }
 
 /**
+ * Lists T3 provider event logs (`events.<thread>.log`) and their rotated
+ * siblings. Event logs are intentionally kept flat in one provider directory,
+ * unlike CLI transcripts which use nested session folders.
+ */
+export async function listProviderEventLogFiles(
+  root: string,
+  baseName: string,
+  sinceMs = Number.NEGATIVE_INFINITY,
+): Promise<readonly TranscriptFile[]> {
+  const found: TranscriptFile[] = [];
+  let entries: ReadonlyArray<NodeFS.Dirent>;
+  try {
+    entries = await NodeFSP.readdir(root, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+
+  const prefix = `${baseName}.`;
+  for (const entry of entries) {
+    if (
+      !entry.isFile() ||
+      !entry.name.startsWith(prefix) ||
+      !/\.log(?:\.\d+)?$/u.test(entry.name)
+    ) {
+      continue;
+    }
+    const child = NodePath.join(root, entry.name);
+    try {
+      const stats = await NodeFSP.stat(child);
+      if (stats.mtimeMs >= sinceMs) {
+        found.push({ path: child, size: stats.size, mtimeMs: stats.mtimeMs });
+      }
+    } catch {
+      // Rotated logs may disappear between readdir and stat.
+    }
+  }
+
+  return found;
+}
+
+/**
  * Filesystem identity of a directory, as `device:inode`.
  *
  * Used to tell "two servers reading the same transcript directory" apart from
@@ -127,6 +169,18 @@ export async function readTranscriptRecords(
     });
 
     for await (const line of lines) {
+      if (provider === "devin") {
+        // Canonical event logs also contain native ACP and orchestration
+        // records. Avoid parsing those as JSON unless this line could be one
+        // of Devin's normalized usage events.
+        if (!line.includes('"thread.token-usage.updated"') || !line.includes('"devin"')) {
+          continue;
+        }
+        const record = parseDevinCanonicalLogLine(line);
+        if (record !== null) records.push(record);
+        continue;
+      }
+
       if (provider === "codex") {
         if (
           !mightCarryUsage(line, provider) &&

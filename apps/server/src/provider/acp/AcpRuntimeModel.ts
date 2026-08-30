@@ -108,6 +108,11 @@ export type AcpParsedSessionEvent =
       readonly itemId?: string;
       readonly text: string;
       readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "UsageUpdated";
+      readonly usage: EffectAcpSchema.UsageUpdate;
+      readonly rawPayload: unknown;
     };
 
 type AcpSessionSetupResponse =
@@ -821,6 +826,14 @@ export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotificat
           rawPayload: params,
         });
       }
+      break;
+    }
+    case "usage_update": {
+      events.push({
+        _tag: "UsageUpdated",
+        usage: upd,
+        rawPayload: params,
+      });
       break;
     }
     default:
