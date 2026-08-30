@@ -2,6 +2,7 @@ import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type ProviderInstanceId,
   type ProviderDriverKind,
+  type ProviderOptionSelection,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
@@ -14,10 +15,20 @@ import { getProviderStatusMessage, hasProviderSetup } from "./ProviderStatusBann
 import {
   modelPickerLegacySectionKey,
   modelPickerModelKey,
+  modelPickerProviderGroupKey,
   parseModelPickerLegacySectionKey,
   parseModelPickerModelKey,
+  parseModelPickerProviderGroupKey,
 } from "./modelPickerKeys";
 import { buildModelPickerSearchText, scoreModelPickerSearch } from "./modelPickerSearch";
+import {
+  groupByProvider,
+  getProviderGroupLabel,
+  getReasoningLevelDescriptor,
+  resolveReasoningLevelLabel,
+  withReasoningLevelChange,
+  findModelCapabilities,
+} from "./modelFamilyGrouping";
 import {
   Combobox,
   ComboboxEmpty,
@@ -25,7 +36,7 @@ import {
   ComboboxItem,
   ComboboxListVirtualized,
 } from "../ui/combobox";
-import { ModelEsque } from "./providerIconUtils";
+import { ModelEsque, PROVIDER_ICON_BY_PROVIDER } from "./providerIconUtils";
 import {
   modelPickerJumpCommandForIndex,
   modelPickerJumpIndexFromCommand,
@@ -148,6 +159,20 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   onOpenProviderSetup?: (instanceId: ProviderInstanceId) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
   onInstanceModelChange: (instanceId: ProviderInstanceId, model: string) => void;
+  /**
+   * Stored provider option selections for the active model (the `options`
+   * array on `ModelSelection`). Used to read the current reasoning level so
+   * the picker can display it on the selected row. When absent, the
+   * reasoning-level indicator is hidden.
+   */
+  activeModelOptions?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  /**
+   * Callback fired when the user changes the reasoning level from within the
+   * picker. Receives the next options array (with the reasoning descriptor
+   * value replaced, all other options preserved). When absent, the
+   * reasoning-level control renders read-only.
+   */
+  onModelOptionsChange?: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => void;
 }) {
   const {
     keybindings: providedKeybindings,
@@ -602,6 +627,23 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     }
     return mapping;
   }, [getModelDisabledReason, visibleModels]);
+
+  // ── Provider group headers ────────────────────────────────────────────
+  // When the visible list spans more than one provider (favorites view or
+  // search results), insert a provider logo + name header before each
+  // provider's models. Single-instance views already identify the provider
+  // via the sidebar, so headers are omitted there to avoid redundancy.
+  const providerGroups = useMemo(() => {
+    if (legacySection) {
+      return null;
+    }
+    const groups = groupByProvider(visibleModels);
+    if (groups.length <= 1) {
+      return null;
+    }
+    return groups;
+  }, [legacySection, visibleModels]);
+
   const modelJumpModelKeys = useMemo(
     () => [...modelJumpCommandByKey.keys()],
     [modelJumpCommandByKey],
@@ -614,6 +656,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           .filter((model) => model.isLegacy)
           .map((model) => modelPickerLegacySectionKey(model.instanceId)),
       ),
+      ...new Set(flatModels.map((model) => modelPickerProviderGroupKey(model.driverKind))),
     ],
     [flatModels],
   );
@@ -621,12 +664,22 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     const modelKeys = visibleModels.map((model) =>
       modelPickerModelKey(model.instanceId, model.slug),
     );
-    if (!legacySection) {
+    if (legacySection) {
+      modelKeys.splice(legacySection.currentModels.length, 0, legacySection.key);
       return modelKeys;
     }
-    modelKeys.splice(legacySection.currentModels.length, 0, legacySection.key);
+    if (providerGroups) {
+      const interleaved: string[] = [];
+      for (const group of providerGroups) {
+        interleaved.push(modelPickerProviderGroupKey(group.driverKind));
+        for (const model of group.items) {
+          interleaved.push(modelPickerModelKey(model.instanceId, model.slug));
+        }
+      }
+      return interleaved;
+    }
     return modelKeys;
-  }, [legacySection, visibleModels]);
+  }, [legacySection, providerGroups, visibleModels]);
   const filteredModelByKey = useMemo(
     (): ReadonlyMap<string, ModelPickerItem> =>
       new Map(
@@ -636,6 +689,59 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       ),
     [visibleModels],
   );
+
+  // ── Reasoning level for the active model ──────────────────────────────
+  // Read the selected model's capabilities from its instance snapshot so the
+  // picker can show the current reasoning effort and let the user change it
+  // without leaving the picker. The descriptor comes from the model's
+  // `capabilities.optionDescriptors`; the current value is resolved against
+  // the stored `options` array (`activeModelOptions`).
+  const activeModelCapabilities = useMemo(() => {
+    const activeEntry = entryByInstanceId.get(props.activeInstanceId);
+    if (!activeEntry) {
+      return { optionDescriptors: [] };
+    }
+    return findModelCapabilities(activeEntry.models, props.model);
+  }, [entryByInstanceId, props.activeInstanceId, props.model]);
+
+  const activeReasoningDescriptor = useMemo(
+    () =>
+      getReasoningLevelDescriptor({
+        caps: activeModelCapabilities,
+        selections: props.activeModelOptions,
+      }),
+    [activeModelCapabilities, props.activeModelOptions],
+  );
+
+  const activeReasoningLabel = useMemo(
+    () =>
+      resolveReasoningLevelLabel({
+        caps: activeModelCapabilities,
+        selections: props.activeModelOptions,
+      }),
+    [activeModelCapabilities, props.activeModelOptions],
+  );
+
+  const handleReasoningLevelChange = useCallback(
+    (nextValue: string) => {
+      if (!props.onModelOptionsChange || !activeReasoningDescriptor) {
+        return;
+      }
+      const nextOptions = withReasoningLevelChange({
+        caps: activeModelCapabilities,
+        selections: props.activeModelOptions,
+        nextValue,
+      });
+      props.onModelOptionsChange(nextOptions);
+    },
+    [
+      activeModelCapabilities,
+      activeReasoningDescriptor,
+      props.activeModelOptions,
+      props.onModelOptionsChange,
+    ],
+  );
+
   const updateModelListScrollFades = useCallback(() => {
     const scrollElement = modelListRef.current?.getScrollableNode();
     if (!(scrollElement instanceof HTMLElement)) {
@@ -772,6 +878,10 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             if (typeof modelKey !== "string") {
               return;
             }
+            const providerGroupKind = parseModelPickerProviderGroupKey(modelKey);
+            if (providerGroupKind) {
+              return;
+            }
             const legacyInstanceId = parseModelPickerLegacySectionKey(modelKey);
             if (legacyInstanceId) {
               toggleLegacySection(legacyInstanceId);
@@ -816,6 +926,9 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                       ).preventBaseUIHandler?.();
                       e.preventDefault();
                       e.stopPropagation();
+                      if (parseModelPickerProviderGroupKey(highlightedModelKeyRef.current)) {
+                        return;
+                      }
                       const legacyInstanceId = parseModelPickerLegacySectionKey(
                         highlightedModelKeyRef.current,
                       );
@@ -848,6 +961,22 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                   extraData={modelListExtraData}
                   keyExtractor={(modelKey) => modelKey}
                   renderItem={({ item: modelKey, index }) => {
+                    const providerGroupKind = parseModelPickerProviderGroupKey(modelKey);
+                    if (providerGroupKind) {
+                      const ProviderIcon = PROVIDER_ICON_BY_PROVIDER[providerGroupKind] ?? null;
+                      return (
+                        <div
+                          key={modelKey}
+                          className="flex items-center gap-1.5 px-2 pb-1 pt-2.5"
+                          aria-hidden="true"
+                        >
+                          {ProviderIcon ? <ProviderIcon className="size-3.5 shrink-0" /> : null}
+                          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                            {getProviderGroupLabel(providerGroupKind)}
+                          </span>
+                        </div>
+                      );
+                    }
                     if (legacySection?.key === modelKey) {
                       return (
                         <ComboboxItem
@@ -879,6 +1008,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                     }
                     const disabledReason =
                       getModelDisabledReason?.(model.instanceId, model.slug) ?? null;
+                    const isRowSelected = modelKey === activeModelKey;
                     return (
                       <ModelListRow
                         key={modelKey}
@@ -891,7 +1021,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                         isFavorite={favoritesSet.has(
                           providerModelKey(model.instanceId, model.slug),
                         )}
-                        isSelected={modelKey === activeModelKey}
+                        isSelected={isRowSelected}
                         showProvider
                         preferShortName={!isLocked}
                         useTriggerLabel={false}
@@ -900,6 +1030,15 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                         jumpLabel={modelJumpLabelByKey.get(modelKey) ?? null}
                         disabledReason={disabledReason}
                         onToggleFavorite={() => toggleFavorite(model.instanceId, model.slug)}
+                        {...(isRowSelected && activeReasoningDescriptor
+                          ? {
+                              reasoningDescriptor: activeReasoningDescriptor,
+                              reasoningLabel: activeReasoningLabel,
+                              ...(props.onModelOptionsChange
+                                ? { onReasoningLevelChange: handleReasoningLevelChange }
+                                : {}),
+                            }
+                          : {})}
                       />
                     );
                   }}

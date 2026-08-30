@@ -916,6 +916,8 @@ export function EnvironmentProviderSettings({
             : undefined
         }
         isUpdating={mode === "editor" && showInlineUpdateButton ? isDriverUpdateRunning : undefined}
+        onRefresh={mode === "editor" && !readOnly ? () => void refreshProviders() : undefined}
+        isRefreshing={mode === "editor" && isRefreshingProviders}
       />
     );
   };

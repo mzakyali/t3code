@@ -57,6 +57,12 @@ export interface ServerProviderPresentation {
   readonly badgeLabel?: string;
   readonly showInteractionModeToggle?: boolean;
   readonly requiresNewThreadForModelChange?: boolean;
+  /**
+   * Provider-owned model inventory version. When present, the provider
+   * registry treats a snapshot from another version as incompatible and
+   * replaces it instead of retaining its models.
+   */
+  readonly modelCatalogVersion?: string;
 }
 
 export type ServerProviderDraft = Omit<ServerProvider, "instanceId" | "driver">;
@@ -238,6 +244,9 @@ export function buildServerProvider(input: {
       : {}),
     ...(typeof input.presentation.requiresNewThreadForModelChange === "boolean"
       ? { requiresNewThreadForModelChange: input.presentation.requiresNewThreadForModelChange }
+      : {}),
+    ...(input.presentation.modelCatalogVersion
+      ? { modelCatalogVersion: input.presentation.modelCatalogVersion }
       : {}),
     enabled: input.enabled,
     installed: input.probe.installed,

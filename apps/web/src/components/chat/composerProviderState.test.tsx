@@ -61,6 +61,8 @@ const ULTRATHINK_FRAME_CLASSES = {
   modelPickerIconClassName: "ultrathink-chroma",
 } as const;
 
+const DEFAULT_INPUT_CAPS = { images: true, audio: true, files: true } as const;
+
 describe("getComposerProviderState", () => {
   it("derives a stable prompt injection state for ordinary prompt edits", () => {
     expect(getComposerPromptInjectionState("Investigate this failure")).toBe("none");
@@ -87,6 +89,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: "high",
       modelOptionsForDispatch: undefined,
+      inputCapabilities: DEFAULT_INPUT_CAPS,
     });
   });
 
@@ -109,6 +112,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: "low",
       modelOptionsForDispatch: selections(["effort", "low"], ["fastMode", true]),
+      inputCapabilities: DEFAULT_INPUT_CAPS,
     });
   });
 
@@ -142,6 +146,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: null,
       modelOptionsForDispatch: selections(["thinking", false]),
+      inputCapabilities: DEFAULT_INPUT_CAPS,
     });
   });
 
@@ -200,6 +205,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: null,
       modelOptionsForDispatch: undefined,
+      inputCapabilities: DEFAULT_INPUT_CAPS,
     });
   });
 
@@ -233,6 +239,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: null,
       modelOptionsForDispatch: undefined,
+      inputCapabilities: DEFAULT_INPUT_CAPS,
     });
   });
 
@@ -351,6 +358,7 @@ describe("getComposerProviderState", () => {
       provider: PROVIDER,
       promptEffort: "medium",
       modelOptionsForDispatch: selections(["effort", "medium"]),
+      inputCapabilities: DEFAULT_INPUT_CAPS,
       ...ULTRATHINK_FRAME_CLASSES,
     });
   });
@@ -372,6 +380,41 @@ describe("getComposerProviderState", () => {
     expect(state).not.toHaveProperty("composerFrameClassName");
     expect(state).not.toHaveProperty("composerSurfaceClassName");
     expect(state).not.toHaveProperty("modelPickerIconClassName");
+  });
+
+  it("reflects the active model's declared input capabilities", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: [
+        {
+          slug: MODEL,
+          name: MODEL,
+          isCustom: false,
+          capabilities: { optionDescriptors: [], inputImages: false, inputAudio: false },
+        },
+      ],
+      modelOptions: undefined,
+      planModeEnabled: true,
+    });
+
+    expect(state.inputCapabilities).toEqual({
+      images: false,
+      audio: false,
+      files: true,
+    });
+  });
+
+  it("defaults unsupported-modalities to true when the model declares none", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([]),
+      modelOptions: undefined,
+      planModeEnabled: true,
+    });
+
+    expect(state.inputCapabilities).toEqual(DEFAULT_INPUT_CAPS);
   });
 });
 

@@ -7,6 +7,8 @@ import {
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
+  getModelInputCapabilities,
+  type ModelInputCapabilities,
   getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
   isClaudeUltrathinkPrompt,
@@ -36,6 +38,13 @@ export type ComposerProviderState = {
   provider: ProviderDriverKind;
   promptEffort: string | null;
   modelOptionsForDispatch: ReadonlyArray<ProviderOptionSelection> | undefined;
+  /**
+   * Resolved input modalities for the active model. Absent capability fields
+   * default to supported, so this is only false when the model explicitly
+   * declares it cannot accept that modality. The composer uses this to
+   * disable or warn about unsupported attachments.
+   */
+  inputCapabilities: ModelInputCapabilities;
   composerFrameClassName?: string;
   composerSurfaceClassName?: string;
   modelPickerIconClassName?: string;
@@ -83,6 +92,10 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
         promptEffort: null,
         modelOptionsForDispatch:
           preservedOptions && preservedOptions.length > 0 ? preservedOptions : undefined,
+        // The model is absent from the catalog, so we cannot know its
+        // capabilities. Default to permissive so attachments are not
+        // silently blocked on a stale catalog.
+        inputCapabilities: getModelInputCapabilities(null),
       };
     }
   }
@@ -105,6 +118,7 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
       descriptors,
       modelOptions,
     ),
+    inputCapabilities: getModelInputCapabilities(caps),
     ...(ultrathinkActive
       ? {
           composerFrameClassName: "ultrathink-frame",

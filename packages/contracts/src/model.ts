@@ -124,12 +124,42 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
+  /**
+   * Per-model input modalities. All default to `true` when absent so providers
+   * that do not populate them keep their existing attachment behavior. Text is
+   * always supported and has no field. A provider sets a field to `false` only
+   * to signal that the model rejects that modality, so the composer can disable
+   * or warn about the corresponding attachment.
+   */
+  inputImages: Schema.optional(Schema.Boolean),
+  inputAudio: Schema.optional(Schema.Boolean),
+  inputFiles: Schema.optional(Schema.Boolean),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
+
+/**
+ * Provider-reported model pricing, expressed in USD per one million tokens.
+ *
+ * This is deliberately metadata rather than a billing record: it describes
+ * the rate advertised by a provider at probe time and is used to calculate a
+ * transparent local estimate when a transcript does not include a cost.
+ */
+export const ModelPricing = Schema.Struct({
+  inputPerMillion: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  cachedInputPerMillion: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
+  cacheCreationPerMillion: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
+  outputPerMillion: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The context advertised alongside the rate, when the provider supplies it. */
+  contextWindowTokens: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(1))),
+  currency: Schema.optional(TrimmedNonEmptyString),
+  source: Schema.optional(TrimmedNonEmptyString),
+});
+export type ModelPricing = typeof ModelPricing.Type;
 
 const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
+const DEVIN_DRIVER_KIND = ProviderDriverKind.make("devin");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 
@@ -154,6 +184,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CLAUDE_DRIVER_KIND]: "claude-sonnet-5",
   [CURSOR_DRIVER_KIND]: "auto",
   // Product slug, not an ACP model id. The Grok adapter treats it as "the session's current model".
+  [DEVIN_DRIVER_KIND]: "adaptive",
   [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
@@ -167,6 +198,7 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
+  [DEVIN_DRIVER_KIND]: "adaptive",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };
 
@@ -203,6 +235,7 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CODEX_DRIVER_KIND]: "Codex",
   [CLAUDE_DRIVER_KIND]: "Claude",
   [CURSOR_DRIVER_KIND]: "Cursor",
+  [DEVIN_DRIVER_KIND]: "Devin",
   [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
 };
