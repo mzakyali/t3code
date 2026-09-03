@@ -1,4 +1,5 @@
 import * as Crypto from "effect/Crypto";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -31,6 +32,11 @@ const DEVIN_TIMEOUT_MS = 180_000;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
+export interface DevinTextGenerationOptions {
+  /** Override the ACP request timeout for focused tests and local diagnostics. */
+  readonly timeout?: Duration.Input;
+}
+
 /**
  * Build a Devin text-generation closure bound to a specific `DevinSettings`
  * payload. See `makeCodexAdapter` for the overall per-instance rationale.
@@ -38,10 +44,12 @@ const isTextGenerationError = Schema.is(TextGenerationError);
 export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(function* (
   devinSettings: DevinSettings,
   environment?: NodeJS.ProcessEnv,
+  options?: DevinTextGenerationOptions,
 ) {
   const crypto = yield* Crypto.Crypto;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const resolvedEnvironment = environment ?? process.env;
+  const requestTimeout = options?.timeout ?? DEVIN_TIMEOUT_MS;
 
   const runDevinJson = <S extends Schema.Top>({
     operation,
@@ -101,7 +109,7 @@ export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(func
           prompt: [{ type: "text", text: prompt }],
         });
       }).pipe(
-        Effect.timeoutOption(DEVIN_TIMEOUT_MS),
+        Effect.timeoutOption(requestTimeout),
         Effect.flatMap(
           Option.match({
             onNone: () =>
