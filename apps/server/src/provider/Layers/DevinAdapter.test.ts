@@ -24,7 +24,7 @@ import {
 
 import { ServerConfig } from "../../config.ts";
 import { makeDevinAdapter } from "./DevinAdapter.ts";
-import { ProviderAdapterRequestError } from "../Errors.ts";
+import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
 
 const decodeDevinSettings = Schema.decodeSync(
   Schema.Struct({
@@ -122,6 +122,45 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
       ] as const) {
         assert.include(types, t);
       }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps the session ready after rejecting an empty prompt", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() => makeMockDevinWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-empty-prompt-recovery");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(error, ProviderAdapterValidationError);
+
+      const sessionsAfterRejection = yield* adapter.listSessions();
+      const sessionAfterRejection = sessionsAfterRejection.find(
+        (session) => session.threadId === threadId,
+      );
+      assert.isUndefined(sessionAfterRejection?.activeTurnId);
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "continue after rejected prompt",
+        attachments: [],
+      });
 
       yield* adapter.stopSession(threadId);
     }),
