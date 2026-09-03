@@ -99,12 +99,12 @@ describe("parseProviderModelRateTable", () => {
       cacheCreationCostPerToken: 0.5e-6,
     });
     expect(lookupRate(rates, "adaptive")?.cacheReadCostPerToken).toBeCloseTo(0.1e-6);
-    expect(lookupRate(rates, "devin/glm-5-2")).toMatchObject({
+    expect(lookupRate(rates, "glm-5-2")).toMatchObject({
       inputCostPerToken: 0.7e-6,
       outputCostPerToken: 2.2e-6,
       cacheCreationCostPerToken: 0.7e-6,
     });
-    expect(lookupRate(rates, "devin/glm-5-2")?.cacheReadCostPerToken).toBeCloseTo(0.13e-6);
+    expect(lookupRate(rates, "glm-5-2")?.cacheReadCostPerToken).toBeCloseTo(0.13e-6);
   });
 
   it("ignores malformed or incomplete pricing without crashing", () => {
