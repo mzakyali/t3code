@@ -998,6 +998,40 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("starts a new session when the agent cannot load sessions", () => {
+    const requestEvents: Array<AcpSessionRuntime.AcpSessionRequestLogEvent> = [];
+    return Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      const started = yield* runtime.start();
+
+      expect(started.sessionId).toBe("mock-session-1");
+      expect(requestEvents.some((event) => event.method === "session/load")).toBe(false);
+      expect(requestEvents.some((event) => event.method === "session/new")).toBe(true);
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          authMethodId: "test",
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_OMIT_LOAD_SESSION_CAPABILITY: "1",
+            },
+          },
+          cwd: process.cwd(),
+          resumeSessionId: "unsupported-session-id",
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              requestEvents.push(event);
+            }),
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
   it.effect("ignores session/update replay notifications during session/load", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;

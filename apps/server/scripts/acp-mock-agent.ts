@@ -41,6 +41,7 @@ const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANC
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
+const omitLoadSessionCapability = process.env.T3_ACP_OMIT_LOAD_SESSION_CAPABILITY === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
@@ -407,7 +408,10 @@ const program = Effect.gen(function* () {
       }
       return {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+        agentCapabilities: {
+          ...(omitLoadSessionCapability ? {} : { loadSession: true }),
+          sessionCapabilities: { resume: {} },
+        },
         // Grok advertises model state before any session exists; the provider
         // health check reads it from here without authenticating.
         _meta: { modelState: modelState() },
