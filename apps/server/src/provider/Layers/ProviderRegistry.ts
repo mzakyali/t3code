@@ -676,7 +676,7 @@ export const ProviderRegistryLive = Layer.effect(
           const source = buildSnapshotSource(instance);
           yield* Stream.runForEach(source.streamChanges, (provider) =>
             correlateSnapshotWithSource(source, provider).pipe(Effect.flatMap(syncProvider)),
-          ).pipe(Effect.forkScoped);
+          ).pipe(Effect.forkScoped({ startImmediately: true }));
         }
         yield* Effect.yieldNow;
 
