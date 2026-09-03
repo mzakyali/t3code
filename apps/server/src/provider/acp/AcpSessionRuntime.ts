@@ -734,7 +734,10 @@ export const make = (
             ),
           ),
         );
-      } else if (options.resumeSessionId) {
+      } else if (
+        options.resumeSessionId &&
+        initializeResult.agentCapabilities?.loadSession === true
+      ) {
         const loadPayload = {
           sessionId: options.resumeSessionId,
           cwd: options.cwd,
