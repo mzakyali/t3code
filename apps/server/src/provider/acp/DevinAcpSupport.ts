@@ -8,11 +8,7 @@ import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
-import {
-  devinModelGroupKey,
-  inferDevinContextWindowTokens,
-  parseDevinModelUid,
-} from "../Layers/DevinProvider.ts";
+import { devinModelGroupKey, parseDevinModelUid } from "../Layers/DevinProvider.ts";
 
 export { inferDevinContextWindowTokens } from "../Layers/DevinProvider.ts";
 

@@ -55,13 +55,6 @@ import {
 
 const ENVIRONMENT_VARIABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
-/** Label-left field grid for the Configuration tab: one row per field. */
-const PROVIDER_FIELD_GRID_CLASS_NAME =
-  "grid gap-x-4 gap-y-2.5 sm:grid-cols-[8rem_minmax(0,1fr)] sm:items-start";
-/** Full-width divider row that names the group of fields below it. */
-const PROVIDER_FIELD_GROUP_LABEL_CLASS_NAME =
-  "col-span-full mt-1 border-t border-border/60 pt-2.5 text-[11px] text-muted-foreground";
-
 let environmentVariableDraftId = 0;
 const nextEnvironmentVariableDraftId = () => `provider-env-${environmentVariableDraftId++}`;
 
