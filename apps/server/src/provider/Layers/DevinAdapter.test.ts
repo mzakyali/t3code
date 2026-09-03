@@ -23,10 +23,11 @@ import {
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
-import { makeDevinAdapter } from "./DevinAdapter.ts";
+import { makeDevinAdapter, makeDevinPromptLease, settleDevinPromptLease } from "./DevinAdapter.ts";
 import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
 
 const decodeDevinSettings = Schema.decodeSync(
@@ -85,6 +86,42 @@ const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeDev
 const devinModelSelection = (model: string) => ({
   instanceId: ProviderInstanceId.make("devin"),
   model,
+});
+
+it("does not let a stale prompt lease consume a newer turn's accounting", () => {
+  const firstTurnId = TurnId.make("devin-first-turn");
+  const nextTurnId = TurnId.make("devin-next-turn");
+  const staleLease = makeDevinPromptLease(firstTurnId);
+  const nextLease = makeDevinPromptLease(nextTurnId);
+  const accounting = {
+    activeTurnId: firstTurnId,
+    activePromptLeases: new Set([staleLease]),
+  };
+
+  accounting.activeTurnId = nextTurnId;
+  accounting.activePromptLeases.clear();
+  accounting.activePromptLeases.add(nextLease);
+
+  assert.isFalse(settleDevinPromptLease(accounting, staleLease));
+  assert.equal(accounting.activePromptLeases.size, 1);
+  assert.isTrue(accounting.activePromptLeases.has(nextLease));
+  assert.equal(accounting.activeTurnId, nextTurnId);
+});
+
+it("settles each steered prompt lease exactly once", () => {
+  const turnId = TurnId.make("devin-steered-turn");
+  const firstLease = makeDevinPromptLease(turnId);
+  const secondLease = makeDevinPromptLease(turnId);
+  const accounting = {
+    activeTurnId: turnId,
+    activePromptLeases: new Set([firstLease, secondLease]),
+  };
+
+  assert.isTrue(settleDevinPromptLease(accounting, firstLease));
+  assert.equal(accounting.activePromptLeases.size, 1);
+  assert.isTrue(accounting.activePromptLeases.has(secondLease));
+  assert.isFalse(settleDevinPromptLease(accounting, firstLease));
+  assert.equal(accounting.activePromptLeases.size, 1);
 });
 
 // excludeTestServices avoids the TestClock/TestConsole layers so that

@@ -195,14 +195,11 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         <span
           className={cn("flex min-w-0 flex-1 items-center", size === "xs" ? "gap-1" : "gap-1.5")}
         >
-          {ActiveModelProviderIcon ? (
-            <ActiveModelProviderIcon
-              className={cn("size-4 shrink-0", props.activeProviderIconClassName)}
-            />
-          ) : activeEntry ? (
+          {activeEntry ? (
             <ProviderInstanceIcon
               driverKind={activeEntry.driverKind}
               displayName={activeEntry.displayName}
+              {...(ActiveModelProviderIcon ? { icon: ActiveModelProviderIcon } : {})}
               accentColor={activeEntry.accentColor}
               showBadge={showInstanceBadge}
               className="size-4"
