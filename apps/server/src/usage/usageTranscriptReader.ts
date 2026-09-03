@@ -17,7 +17,7 @@
  */
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import type { Dirent } from "node:fs";
+import type * as NodeFS from "node:fs";
 
 import type { UsageProviderKind } from "@t3tools/contracts";
 
@@ -151,7 +151,7 @@ export async function listProviderEventLogFiles(
   sinceMs = Number.NEGATIVE_INFINITY,
 ): Promise<readonly TranscriptFile[]> {
   const found: TranscriptFile[] = [];
-  let entries: ReadonlyArray<Dirent>;
+  let entries: ReadonlyArray<NodeFS.Dirent>;
   try {
     entries = await NodeFSP.readdir(root, { withFileTypes: true });
   } catch {
