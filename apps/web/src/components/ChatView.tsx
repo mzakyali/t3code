@@ -340,7 +340,6 @@ import {
   deriveLatestContextWindowSnapshot,
   formatContextWindowTokens,
 } from "../lib/contextWindow";
-import { ThreadSyncStatusPill } from "./chat/ThreadSyncStatusPill";
 import {
   DRAFT_HERO_TRANSITION_ANIMATION_ID,
   DRAFT_HERO_TRANSITION_DURATION_MS,
@@ -5543,7 +5542,6 @@ function ChatViewContent(props: ChatViewProps) {
       return [
         ...systemComposerBannerItems,
         ...backgroundLivenessItems,
-        ...calmSystemItems,
         ...reinitItems,
         ...resumeCompactionItems,
         ...wokeThreadItems,
@@ -5553,7 +5551,6 @@ function ChatViewContent(props: ChatViewProps) {
     return [
       ...systemComposerBannerItems,
       ...backgroundLivenessItems,
-      ...calmSystemItems,
       ...reinitItems,
       ...resumeCompactionItems,
       ...wokeThreadItems,
