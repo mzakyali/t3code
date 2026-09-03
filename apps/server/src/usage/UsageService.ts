@@ -250,6 +250,7 @@ export const make = Effect.gen(function* () {
 
   const ratesCachePath = path.join(config.stateDir, "usage-model-rates.json");
   const scanCachePath = path.join(config.stateDir, "usage-scan-cache.json");
+  let liteLlmRates: RateTable = new Map();
   let rates: RateTable = new Map();
   let devinRates: RateTable = new Map();
   let ratesFetchedAtMs: number | null = null;
@@ -257,6 +258,10 @@ export const make = Effect.gen(function* () {
   // One fetch at a time. A burst of refreshes from several clients waits on
   // the first fetch and then sees a table young enough to skip its own.
   const ratesLock = yield* Semaphore.make(1);
+
+  const rebuildRates = () => {
+    rates = new Map([...liteLlmRates, ...devinRates]);
+  };
 
   const pricing = (): UsagePricing => ({
     status: ratesStatus,
@@ -290,7 +295,8 @@ export const make = Effect.gen(function* () {
       if (fromDisk !== null) {
         const parsed = parseRateTable(fromDisk.document);
         if (parsed.size > 0) {
-          rates = parsed;
+          liteLlmRates = parsed;
+          rebuildRates();
           ratesFetchedAtMs = fromDisk.fetchedAtMs;
           ratesStatus = "cached";
           if (now - fromDisk.fetchedAtMs < maxAgeMs) return;
@@ -307,14 +313,15 @@ export const make = Effect.gen(function* () {
     if (fetched === null) {
       // The refresh failed; whatever we are serving is now past its TTL and
       // must not keep claiming to be fresh.
-      if (rates.size > 0) ratesStatus = "cached";
+      if (liteLlmRates.size > 0) ratesStatus = "cached";
       return;
     }
 
     const parsed = parseRateTable(fetched);
     if (parsed.size === 0) return;
 
-    rates = parsed;
+    liteLlmRates = parsed;
+    rebuildRates();
     ratesFetchedAtMs = now;
     ratesStatus = "fresh";
 
@@ -355,8 +362,7 @@ export const make = Effect.gen(function* () {
       }
     }
     devinRates = merged;
-    if (devinRates.size === 0) return;
-    rates = new Map([...rates, ...devinRates]);
+    rebuildRates();
   });
 
   /**

@@ -14,12 +14,15 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Scheduler from "effect/Scheduler";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as UsageService from "./UsageService.ts";
+
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 function claudeLine(id: number, outputTokens: number): string {
   return `${JSON.stringify({
@@ -185,6 +188,64 @@ describe("UsageService", () => {
       assert.strictEqual(ratesFetches, 2);
       assert.strictEqual(refreshed.status, "fresh");
       assert.strictEqual(refreshed.knownModels, 1);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.live("keeps Devin catalog rates when LiteLLM loads on the first scan", () =>
+    Effect.gen(function* () {
+      const { transcript, settings, home } = yield* setup;
+      yield* Effect.promise(() => NodeFSP.writeFile(transcript, claudeLine(1, 5)));
+
+      yield* Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const devinCachePath = NodePath.join(config.providerStatusCacheDir, "devin.json");
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            devinCachePath,
+            encodeUnknownJson({
+              models: [
+                {
+                  slug: "devin-exclusive-model",
+                  pricing: {
+                    inputPerMillion: 0.5,
+                    cachedInputPerMillion: 0.1,
+                    outputPerMillion: 2,
+                  },
+                },
+              ],
+            }),
+          ),
+        );
+
+        const service = yield* UsageService.make;
+        const first = yield* service.readSummary(WINDOW);
+        assert.strictEqual(first.pricing.knownModels, 2);
+        assert.include(first.pricing.source, "Devin CLI model catalog");
+
+        yield* TestClock.adjust(Duration.minutes(2));
+        const refreshed = yield* service.refreshRates;
+        assert.strictEqual(refreshed.knownModels, 2);
+        assert.include(refreshed.source, "Devin CLI model catalog");
+
+        yield* Effect.promise(() => NodeFSP.rm(devinCachePath));
+        const withoutDevinCatalog = yield* service.readSummary(WINDOW);
+        assert.strictEqual(withoutDevinCatalog.pricing.knownModels, 1);
+        assert.isFalse(withoutDevinCatalog.pricing.source.includes("Devin CLI model catalog"));
+      }).pipe(
+        Effect.provide(
+          serviceLayers({
+            prefix: "usage-service-devin-rates-test",
+            home,
+            settings,
+            ratesDocument: {
+              "claude-fable-5": {
+                input_cost_per_token: 1e-5,
+                output_cost_per_token: 5e-5,
+              },
+            },
+          }),
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
   );
 
