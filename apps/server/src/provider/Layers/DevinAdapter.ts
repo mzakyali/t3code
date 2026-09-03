@@ -1123,82 +1123,15 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
     const sendTurn: DevinAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        // Preparation (turn accounting, model-change restart, config) runs
-        // under the thread lock so two concurrent sendTurn calls cannot both
-        // read promptsInFlight === 0 and open duplicate turns. The actual
-        // prompt RPC runs outside the lock so interrupts and steers can
-        // still land.
+        // Preparation (prompt validation, turn accounting, model-change
+        // restart, config) runs under the thread lock so two concurrent
+        // sendTurn calls cannot both read promptsInFlight === 0 and open
+        // duplicate turns. The actual prompt RPC runs outside the lock so
+        // interrupts and steers can still land.
         const prepared = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
-            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-            // Count this prompt immediately so a superseded in-flight prompt
-            // resolving from here on does not settle the turn; the matching
-            // decrement is the `ensuring` below.
-            ctx.promptsInFlight += 1;
-
-            const turnModelSelection =
-              input.modelSelection?.instanceId === boundInstanceId
-                ? input.modelSelection
-                : undefined;
-            const model = turnModelSelection?.model ?? ctx.session.model;
-            const resolvedModel = resolveDevinAcpBaseModelId(model);
-            const resolvedModelUid = resolveDevinModelUid(model, turnModelSelection?.options);
-
-            // If the base model changed on an existing session, restart the
-            // ACP session internally. The visible T3 thread stays the same.
-            // A reasoning-only change (same base) is applied below as a
-            // config-option tweak without a restart.
-            const previousModel = resolveDevinAcpBaseModelId(ctx.session.model);
-            if (
-              steeringTurnId === undefined &&
-              resolvedModel !== previousModel &&
-              ctx.session.model !== undefined
-            ) {
-              yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
-            }
-
-            yield* applyRequestedSessionConfiguration({
-              runtime: ctx.acp,
-              runtimeMode: ctx.session.runtimeMode,
-              interactionMode: input.interactionMode,
-              modelSelection:
-                model === undefined
-                  ? undefined
-                  : {
-                      model,
-                      options: turnModelSelection?.options,
-                    },
-              mapError: ({ cause, method }) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-            });
-            ctx.activeTurnId = turnId;
-            if (steeringTurnId === undefined) {
-              ctx.lastPlanFingerprint = undefined;
-            }
-            ctx.session = {
-              ...ctx.session,
-              activeTurnId: turnId,
-              ...(model !== undefined ? { model: resolvedModel } : {}),
-              updatedAt: yield* nowIso,
-            };
-            if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
-
-            if (steeringTurnId === undefined) {
-              yield* offerRuntimeEvent({
-                type: "turn.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: { model: resolvedModel },
-              });
-            }
 
             const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
             if (input.input?.trim()) {
@@ -1247,6 +1180,75 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 provider: PROVIDER,
                 operation: "sendTurn",
                 issue: "Turn requires non-empty text or attachments.",
+              });
+            }
+
+            // A sendTurn while a prompt is in flight is a steer: the agent
+            // folds the new prompt into the ongoing work, so the active turn
+            // id is reused instead of opening a new turn.
+            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
+
+            const turnModelSelection =
+              input.modelSelection?.instanceId === boundInstanceId
+                ? input.modelSelection
+                : undefined;
+            const model = turnModelSelection?.model ?? ctx.session.model;
+            const resolvedModel = resolveDevinAcpBaseModelId(model);
+            const resolvedModelUid = resolveDevinModelUid(model, turnModelSelection?.options);
+
+            // If the base model changed on an existing session, restart the
+            // ACP session internally. The visible T3 thread stays the same.
+            // A reasoning-only change (same base) is applied below as a
+            // config-option tweak without a restart.
+            const previousModel = resolveDevinAcpBaseModelId(ctx.session.model);
+            if (
+              steeringTurnId === undefined &&
+              resolvedModel !== previousModel &&
+              ctx.session.model !== undefined
+            ) {
+              yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
+            }
+
+            yield* applyRequestedSessionConfiguration({
+              runtime: ctx.acp,
+              runtimeMode: ctx.session.runtimeMode,
+              interactionMode: input.interactionMode,
+              modelSelection:
+                model === undefined
+                  ? undefined
+                  : {
+                      model,
+                      options: turnModelSelection?.options,
+                    },
+              mapError: ({ cause, method }) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+            });
+
+            // All fallible prompt preparation is complete. Count the prompt
+            // only once it is ready to dispatch so a rejected prompt cannot
+            // leave the next sendTurn looking like a steer.
+            ctx.promptsInFlight += 1;
+            ctx.activeTurnId = turnId;
+            if (steeringTurnId === undefined) {
+              ctx.lastPlanFingerprint = undefined;
+            }
+            ctx.session = {
+              ...ctx.session,
+              activeTurnId: turnId,
+              ...(model !== undefined ? { model: resolvedModel } : {}),
+              updatedAt: yield* nowIso,
+            };
+            if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
+
+            if (steeringTurnId === undefined) {
+              yield* offerRuntimeEvent({
+                type: "turn.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: { model: resolvedModel },
               });
             }
 

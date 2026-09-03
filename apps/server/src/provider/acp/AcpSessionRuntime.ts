@@ -583,7 +583,7 @@ export const make = (
         | EffectAcpSchema.LoadSessionResponse
         | EffectAcpSchema.NewSessionResponse
         | EffectAcpSchema.ResumeSessionResponse;
-      if (options.resumeSessionId) {
+      if (options.resumeSessionId && initializeResult.agentCapabilities?.loadSession === true) {
         const loadPayload = {
           sessionId: options.resumeSessionId,
           cwd: options.cwd,
