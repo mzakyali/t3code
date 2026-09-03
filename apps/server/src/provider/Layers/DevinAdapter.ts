@@ -1122,13 +1122,13 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       });
 
     const sendTurn: DevinAdapterShape["sendTurn"] = (input) =>
-      Effect.gen(function* () {
+      Effect.acquireUseRelease(
         // Preparation (prompt validation, turn accounting, model-change
         // restart, config) runs under the thread lock so two concurrent
         // sendTurn calls cannot both read promptsInFlight === 0 and open
-        // duplicate turns. The actual prompt RPC runs outside the lock so
-        // interrupts and steers can still land.
-        const prepared = yield* withThreadLock(
+        // duplicate turns. Keep fallible preparation interruptible even
+        // though acquireUseRelease protects the accounting handoff.
+        withThreadLock(
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
@@ -1225,138 +1225,148 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
             });
 
-            // All fallible prompt preparation is complete. Count the prompt
-            // only once it is ready to dispatch so a rejected prompt cannot
-            // leave the next sendTurn looking like a steer.
-            ctx.promptsInFlight += 1;
-            ctx.activeTurnId = turnId;
-            if (steeringTurnId === undefined) {
-              ctx.lastPlanFingerprint = undefined;
+            // Resolve every fallible value before acquiring the accounting
+            // slot. Once counted, the uninterruptible handoff publishes the
+            // start event and returns the resource as one acquisition step.
+            const updatedAt = yield* nowIso;
+            const turnStartedStamp =
+              steeringTurnId === undefined ? yield* makeEventStamp() : undefined;
+
+            return yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                ctx.promptsInFlight += 1;
+                ctx.activeTurnId = turnId;
+                if (steeringTurnId === undefined) {
+                  ctx.lastPlanFingerprint = undefined;
+                }
+                ctx.session = {
+                  ...ctx.session,
+                  activeTurnId: turnId,
+                  ...(model !== undefined ? { model: resolvedModel } : {}),
+                  updatedAt,
+                };
+                if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
+
+                if (turnStartedStamp !== undefined) {
+                  yield* offerRuntimeEvent({
+                    type: "turn.started",
+                    ...turnStartedStamp,
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    payload: { model: resolvedModel },
+                  });
+                }
+
+                return { ctx, turnId, promptParts, resolvedModel };
+              }),
+            );
+          }),
+        ).pipe(Effect.interruptible),
+        // Run the prompt outside the thread lock so interrupts and steers
+        // can still acquire it while the RPC is in flight.
+        ({ ctx, turnId, promptParts, resolvedModel }) =>
+          Effect.gen(function* () {
+            const result = yield* ctx.acp
+              .prompt({
+                prompt: promptParts,
+              })
+              .pipe(
+                // Map ACP protocol errors to adapter errors first, before the
+                // timeout wrapper adds a non-ACP error type to the channel.
+                Effect.mapError((error) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                ),
+                Effect.timeoutOption(promptTimeout),
+                Effect.flatMap((result) =>
+                  Option.match(result, {
+                    onNone: () =>
+                      Effect.gen(function* () {
+                        // Reset turn accounting so the next sendTurn opens a
+                        // fresh turn instead of steering into a timed-out one.
+                        ctx.promptsInFlight = 0;
+                        ctx.activeTurnId = undefined;
+                        ctx.session = {
+                          ...ctx.session,
+                          activeTurnId: undefined,
+                          updatedAt: yield* nowIso,
+                        };
+                        // Cancel the in-flight ACP prompt so the runtime is
+                        // ready to accept a new one.
+                        yield* Effect.ignore(
+                          ctx.acp.cancel.pipe(
+                            Effect.mapError((error) =>
+                              mapAcpToAdapterError(
+                                PROVIDER,
+                                input.threadId,
+                                "session/cancel",
+                                error,
+                              ),
+                            ),
+                          ),
+                        );
+                        return yield* mapPromptTimeout(PROVIDER, input.threadId, promptTimeout);
+                      }),
+                    onSome: Effect.succeed,
+                  }),
+                ),
+              );
+
+            // ACP prompt responses may carry cumulative token usage. Normalize
+            // it into the shared snapshot so the context meter and Usage page
+            // can consume Devin sessions just like the other providers.
+            if (result?.usage) {
+              yield* emitDevinPromptUsage(ctx, result.usage, {
+                method: "session/prompt",
+                result,
+              });
+            }
+
+            const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+            if (turnRecord) {
+              turnRecord.items.push({ prompt: promptParts, result: result ?? null });
+            } else {
+              ctx.turns.push({
+                id: turnId,
+                items: [{ prompt: promptParts, result: result ?? null }],
+              });
             }
             ctx.session = {
               ...ctx.session,
               activeTurnId: turnId,
-              ...(model !== undefined ? { model: resolvedModel } : {}),
               updatedAt: yield* nowIso,
+              model: resolvedModel,
             };
-            if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
 
-            if (steeringTurnId === undefined) {
+            // Only the last remaining prompt settles the turn — a steer-
+            // superseded prompt resolving (usually cancelled) while another is
+            // in flight or pending must leave the merged turn running.
+            if (ctx.promptsInFlight === 1) {
+              const stopReason = result?.stopReason ?? null;
               yield* offerRuntimeEvent({
-                type: "turn.started",
+                type: "turn.completed",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
                 threadId: input.threadId,
                 turnId,
-                payload: { model: resolvedModel },
+                payload: {
+                  state: stopReason === "cancelled" ? "cancelled" : "completed",
+                  stopReason,
+                },
               });
             }
 
-            return { ctx, turnId, promptParts, resolvedModel };
-          }),
-        );
-
-        // Run the prompt outside the thread lock so interrupts and steers
-        // can still acquire it while the RPC is in flight.
-        const { ctx, turnId, promptParts, resolvedModel } = prepared;
-        return yield* Effect.gen(function* () {
-          const result = yield* ctx.acp
-            .prompt({
-              prompt: promptParts,
-            })
-            .pipe(
-              // Map ACP protocol errors to adapter errors first, before the
-              // timeout wrapper adds a non-ACP error type to the channel.
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-              Effect.timeoutOption(promptTimeout),
-              Effect.flatMap((result) =>
-                Option.match(result, {
-                  onNone: () =>
-                    Effect.gen(function* () {
-                      // Reset turn accounting so the next sendTurn opens a
-                      // fresh turn instead of steering into a timed-out one.
-                      ctx.promptsInFlight = 0;
-                      ctx.activeTurnId = undefined;
-                      ctx.session = {
-                        ...ctx.session,
-                        activeTurnId: undefined,
-                        updatedAt: yield* nowIso,
-                      };
-                      // Cancel the in-flight ACP prompt so the runtime is
-                      // ready to accept a new one.
-                      yield* Effect.ignore(
-                        ctx.acp.cancel.pipe(
-                          Effect.mapError((error) =>
-                            mapAcpToAdapterError(PROVIDER, input.threadId, "session/cancel", error),
-                          ),
-                        ),
-                      );
-                      return yield* mapPromptTimeout(PROVIDER, input.threadId, promptTimeout);
-                    }),
-                  onSome: Effect.succeed,
-                }),
-              ),
-            );
-
-          // ACP prompt responses may carry cumulative token usage. Normalize
-          // it into the shared snapshot so the context meter and Usage page
-          // can consume Devin sessions just like the other providers.
-          if (result?.usage) {
-            yield* emitDevinPromptUsage(ctx, result.usage, {
-              method: "session/prompt",
-              result,
-            });
-          }
-
-          const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
-          if (turnRecord) {
-            turnRecord.items.push({ prompt: promptParts, result: result ?? null });
-          } else {
-            ctx.turns.push({
-              id: turnId,
-              items: [{ prompt: promptParts, result: result ?? null }],
-            });
-          }
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-            model: resolvedModel,
-          };
-
-          // Only the last remaining prompt settles the turn — a steer-
-          // superseded prompt resolving (usually cancelled) while another is
-          // in flight or pending must leave the merged turn running.
-          if (ctx.promptsInFlight === 1) {
-            const stopReason = result?.stopReason ?? null;
-            yield* offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
+            return {
               threadId: input.threadId,
               turnId,
-              payload: {
-                state: stopReason === "cancelled" ? "cancelled" : "completed",
-                stopReason,
-              },
-            });
-          }
-
-          return {
-            threadId: input.threadId,
-            turnId,
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
-            }),
-          ),
-        );
-      });
+              resumeCursor: ctx.session.resumeCursor,
+            };
+          }),
+        ({ ctx }) =>
+          Effect.sync(() => {
+            ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+          }),
+      );
 
     const interruptTurn: DevinAdapterShape["interruptTurn"] = (threadId) =>
       withThreadLock(
