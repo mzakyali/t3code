@@ -147,6 +147,8 @@ describe("scan cache round trip", () => {
               dedupeKey: "event-1",
             }),
           ],
+          tailRecords: [],
+          position: position(),
         },
       ],
     ]);

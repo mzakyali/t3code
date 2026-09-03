@@ -15,6 +15,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import { isHostWindows } from "@t3tools/shared/hostProcess";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
@@ -37,10 +38,15 @@ const decodeDevinSettings = Schema.decodeSync(
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
 const mockAgentCommand = process.execPath;
-const isWindows = NodeOS.platform() === "win32";
+const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
-async function makeMockDevinWrapper(extraEnv?: Record<string, string>) {
-  const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-mock-"));
+const makeMockDevinWrapper = Effect.fn("makeMockDevinWrapper")(function* (
+  extraEnv?: Record<string, string>,
+) {
+  const isWindows = yield* isHostWindows;
+  const dir = yield* Effect.promise(() =>
+    NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-mock-")),
+  );
   if (isWindows) {
     // resolveSpawnCommand detects .cmd and uses shell:true on Windows.
     const wrapperPath = NodePath.join(dir, "fake-devin.cmd");
@@ -48,21 +54,21 @@ async function makeMockDevinWrapper(extraEnv?: Record<string, string>) {
       .map(([key, value]) => `set ${key}=${value}`)
       .join("\r\n");
     const script = `@echo off\r\n${envLines}\r\n"${mockAgentCommand}" "${mockAgentPath}" %*\r\n`;
-    await NodeFSP.writeFile(wrapperPath, script, "utf8");
+    yield* Effect.promise(() => NodeFSP.writeFile(wrapperPath, script, "utf8"));
     return wrapperPath;
   }
   const wrapperPath = NodePath.join(dir, "fake-devin.sh");
   const envExports = Object.entries(extraEnv ?? {})
-    .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
+    .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
     .join("\n");
   const script = `#!/bin/sh
 ${envExports}
-exec ${JSON.stringify(mockAgentCommand)} ${JSON.stringify(mockAgentPath)} "$@"
+exec ${shellQuote(mockAgentCommand)} ${shellQuote(mockAgentPath)} "$@"
 `;
-  await NodeFSP.writeFile(wrapperPath, script, "utf8");
-  await NodeFSP.chmod(wrapperPath, 0o755);
+  yield* Effect.promise(() => NodeFSP.writeFile(wrapperPath, script, "utf8"));
+  yield* Effect.promise(() => NodeFSP.chmod(wrapperPath, 0o755));
   return wrapperPath;
-}
+});
 
 const devinAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-devin-adapter-test-",
@@ -85,7 +91,7 @@ const devinModelSelection = (model: string) => ({
 it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive", (it) => {
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() => makeMockDevinWrapper());
+      const wrapperPath = yield* makeMockDevinWrapper();
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-mock-thread");
 
@@ -129,7 +135,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("keeps the session ready after rejecting an empty prompt", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() => makeMockDevinWrapper());
+      const wrapperPath = yield* makeMockDevinWrapper();
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-empty-prompt-recovery");
 
@@ -168,9 +174,9 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("prompt timeout surfaces a clear error and resets the session", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1" }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+      });
       const adapter = yield* makeTestAdapter(wrapperPath, {
         promptTimeout: "2 seconds",
       });
@@ -223,9 +229,9 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("cancelling a stuck request recovers so the next prompt works", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1" }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+      });
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-cancel-recover");
 
@@ -287,9 +293,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("concurrent sendTurn calls do not create duplicate turns", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_PROMPT_DELAY_MS: "500" }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({ T3_ACP_PROMPT_DELAY_MS: "500" });
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-concurrent-send");
 
@@ -332,9 +336,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("emits context-window and per-turn usage for ACP telemetry", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_EMIT_USAGE_UPDATE: "1" }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({ T3_ACP_EMIT_USAGE_UPDATE: "1" });
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-usage-telemetry");
       const runtimeEvents: ProviderRuntimeEvent[] = [];
@@ -376,7 +378,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
 
   it.effect("reinitializes the ACP session when the model changes mid-thread", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() => makeMockDevinWrapper());
+      const wrapperPath = yield* makeMockDevinWrapper();
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-model-change-restart");
 
@@ -454,9 +456,9 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-reqlog-")),
       );
       const requestLogPath = NodePath.join(requestLogDir, "requests.log");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      });
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-image-replay");
 
@@ -611,9 +613,9 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-reqlog-img-")),
       );
       const requestLogPath = NodePath.join(requestLogDir, "requests.log");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDevinWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
-      );
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      });
       const adapter = yield* makeTestAdapter(wrapperPath);
       const threadId = ThreadId.make("devin-image-after-restart");
 
