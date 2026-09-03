@@ -7,11 +7,13 @@ import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -167,6 +169,86 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         input: "continue after rejected prompt",
         attachments: [],
       });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("recovers when turn event id generation fails", () =>
+    Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto;
+      const uuidError = PlatformError.systemError({
+        _tag: "Unknown",
+        module: "Crypto",
+        method: "randomUUIDv4",
+        description: "UUID generation unavailable",
+      });
+      let successfulUuidsBeforeFailure: number | undefined;
+      const wrapperPath = yield* makeMockDevinWrapper();
+      const adapter = yield* makeTestAdapter(wrapperPath).pipe(
+        Effect.provideService(Crypto.Crypto, {
+          ...crypto,
+          randomUUIDv4: Effect.suspend(() => {
+            if (successfulUuidsBeforeFailure === undefined) {
+              return crypto.randomUUIDv4;
+            }
+            if (successfulUuidsBeforeFailure > 0) {
+              successfulUuidsBeforeFailure -= 1;
+              return crypto.randomUUIDv4;
+            }
+            successfulUuidsBeforeFailure = undefined;
+            return Effect.fail(uuidError);
+          }),
+        }),
+      );
+      const threadId = ThreadId.make("devin-turn-event-id-recovery");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const turnEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.started" || event.type === "turn.completed"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+
+      // The first UUID opens the turn; the second stamps turn.started.
+      successfulUuidsBeforeFailure = 1;
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "fail while opening the turn",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(error, ProviderAdapterRequestError);
+
+      const sessionsAfterFailure = yield* adapter.listSessions();
+      const sessionAfterFailure = sessionsAfterFailure.find(
+        (session) => session.threadId === threadId,
+      );
+      assert.isUndefined(sessionAfterFailure?.activeTurnId);
+
+      const recovered = yield* adapter.sendTurn({
+        threadId,
+        input: "continue after event id failure",
+        attachments: [],
+      });
+      const turnEvents = Array.from(
+        yield* Fiber.join(turnEventsFiber).pipe(Effect.timeout("5 seconds")),
+      );
+      assert.deepStrictEqual(
+        turnEvents.map((event) => event.type),
+        ["turn.started", "turn.completed"],
+      );
+      assert.equal(turnEvents[0]?.turnId, recovered.turnId);
+      assert.equal(turnEvents[1]?.turnId, recovered.turnId);
 
       yield* adapter.stopSession(threadId);
     }),
