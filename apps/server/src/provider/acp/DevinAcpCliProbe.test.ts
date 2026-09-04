@@ -4,22 +4,46 @@
  * Set T3_DEVIN_BINARY_PATH when `devin` is not on PATH.
  *
  * Set T3_DEVIN_LIVE_TURN=1 to send a real prompt. This consumes Devin usage.
+ * Set T3_DEVIN_MCP_SMOKE=1 to drive a real turn through the local T3 MCP server.
  * The regular Devin adapter tests use the local ACP fixture for permissions,
  * cancellation, image input, and failure recovery; these checks validate the
  * installed CLI's command and ACP compatibility at the opt-in boundary.
  */
+// @effect-diagnostics nodeBuiltinImport:off - the opt-in smoke test creates and removes an isolated real workspace.
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as Schema from "effect/Schema";
-import { DevinSettings } from "@t3tools/contracts";
+import {
+  DevinSettings,
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  ThreadId,
+} from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { HttpBody, HttpClient, HttpRouter } from "effect/unstable/http";
 import { describe, expect } from "vite-plus/test";
 
+import * as ServerConfig from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as McpHttpServer from "../../mcp/McpHttpServer.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
+import { makeDevinAdapter } from "../Layers/DevinAdapter.ts";
 import { checkDevinProviderStatus } from "../Layers/DevinProvider.ts";
 import { spawnAndCollect } from "../providerSnapshot.ts";
 import { makeDevinAcpRuntime } from "./DevinAcpSupport.ts";
@@ -135,5 +159,189 @@ describe.runIf(process.env.T3_DEVIN_ACP_PROBE === "1")("Devin ACP CLI probe", ()
         expect(chunks.join("")).toContain("T3_DEVIN_OK");
         yield* Fiber.interrupt(events);
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+const DevinMcpSmokeLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3-devin-mcp-smoke-",
+}).pipe(Layer.provideMerge(NodeHttpServer.layerTest.pipe(Layer.provideMerge(NodeServices.layer))));
+
+describe.runIf(process.env.T3_DEVIN_MCP_SMOKE === "1")("Devin MCP smoke", () => {
+  it.effect(
+    "runs a real Devin ACP turn through the T3 MCP server",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const environmentId = EnvironmentId.make("devin-mcp-smoke-environment");
+          const threadId = ThreadId.make("devin-mcp-smoke-thread");
+          const providerInstanceId = ProviderInstanceId.make("devin");
+          const workspace = yield* Effect.promise(() =>
+            NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-mcp-workspace-")),
+          );
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => NodeFSP.rm(workspace, { recursive: true, force: true })),
+          );
+
+          const serverEnvironmentLayer = Layer.succeed(
+            ServerEnvironment.ServerEnvironment,
+            ServerEnvironment.ServerEnvironment.of({
+              getEnvironmentId: Effect.succeed(environmentId),
+              getDescriptor: Effect.die("Devin MCP smoke does not read the environment descriptor"),
+            }),
+          );
+          const mcpContext = yield* Layer.build(
+            Layer.mergeAll(
+              McpSessionRegistry.layer.pipe(Layer.provideMerge(serverEnvironmentLayer)),
+              PreviewAutomationBroker.layer,
+            ),
+          );
+          yield* HttpRouter.serve(
+            McpHttpServer.layer.pipe(Layer.provide(Layer.succeedContext(mcpContext))),
+            { disableListenLog: true, disableLogger: true },
+          ).pipe(Layer.build);
+
+          const registry = Context.get(mcpContext, McpSessionRegistry.McpSessionRegistry);
+          const broker = Context.get(mcpContext, PreviewAutomationBroker.PreviewAutomationBroker);
+          const issued = yield* registry.issue({ threadId, providerInstanceId });
+          yield* Effect.addFinalizer(() =>
+            registry.revokeProviderSession(issued.config.providerSessionId),
+          );
+          McpProviderSession.setMcpProviderSession(issued.config);
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+          );
+
+          const httpClient = yield* HttpClient.HttpClient;
+          const postMcp = (body: Readonly<Record<string, unknown>>, mcpSessionId?: string) =>
+            httpClient.post("/mcp", {
+              headers: {
+                accept: "application/json, text/event-stream",
+                authorization: issued.config.authorizationHeader,
+                "content-type": "application/json",
+                ...(mcpSessionId === undefined
+                  ? {}
+                  : {
+                      "mcp-session-id": mcpSessionId,
+                      "mcp-protocol-version": "2025-06-18",
+                    }),
+              },
+              body: HttpBody.text(JSON.stringify(body), "application/json"),
+            });
+
+          const initializeResponse = yield* postMcp({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "t3-devin-mcp-smoke", version: "0.0.0" },
+            },
+          });
+          const mcpSessionId = initializeResponse.headers["mcp-session-id"];
+          expect(initializeResponse.status).toBe(200);
+          expect(mcpSessionId).toBeTruthy();
+          if (!mcpSessionId) return;
+          yield* Effect.addFinalizer(() =>
+            httpClient
+              .del("/mcp", {
+                headers: {
+                  authorization: issued.config.authorizationHeader,
+                  "mcp-session-id": mcpSessionId,
+                },
+              })
+              .pipe(Effect.ignore),
+          );
+
+          yield* postMcp(
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            mcpSessionId,
+          );
+          const toolsResponse = yield* postMcp(
+            { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+            mcpSessionId,
+          );
+          expect(toolsResponse.status).toBe(200);
+          const toolsBody = (yield* toolsResponse.json) as {
+            readonly result?: { readonly tools?: ReadonlyArray<{ readonly name?: string }> };
+          };
+          expect(toolsBody.result?.tools?.some((tool) => tool.name === "preview_status")).toBe(
+            true,
+          );
+
+          const requests: Array<{ readonly threadId: ThreadId; readonly operation: string }> = [];
+          const hostEvents = yield* broker.connect({
+            clientId: "devin-mcp-smoke-preview-host",
+            environmentId,
+            supportedOperations: ["status"],
+          });
+          yield* Stream.runForEach(hostEvents, (event) => {
+            if (event.type === "connected") return Effect.void;
+            requests.push({ threadId: event.request.threadId, operation: event.request.operation });
+            return broker.respond({
+              clientId: "devin-mcp-smoke-preview-host",
+              connectionId: event.connectionId,
+              requestId: event.request.requestId,
+              ok: true,
+              result: {
+                available: true,
+                visible: false,
+                tabId: null,
+                url: null,
+                title: null,
+                loading: false,
+              },
+            });
+          }).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+
+          const adapter = yield* makeDevinAdapter(makeProbeSettings(), {
+            environment: process.env,
+            promptTimeout: Duration.seconds(180),
+          });
+          yield* Effect.addFinalizer(() => adapter.stopSession(threadId).pipe(Effect.ignore));
+          const runtimeEvents: ProviderRuntimeEvent[] = [];
+          const turnCompleted = yield* Deferred.make<void>();
+          yield* Stream.runForEach(adapter.streamEvents, (event) => {
+            if (event.threadId !== threadId) return Effect.void;
+            runtimeEvents.push(event);
+            return event.type === "turn.completed"
+              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+              : Effect.void;
+          }).pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+
+          yield* adapter.startSession({
+            threadId,
+            provider: ProviderDriverKind.make("devin"),
+            cwd: workspace,
+            runtimeMode: "full-access",
+            modelSelection: { instanceId: providerInstanceId, model: "adaptive" },
+          });
+          yield* adapter.sendTurn({
+            threadId,
+            input:
+              "Use the T3 Code MCP tool preview_status exactly once. After the tool succeeds, reply exactly T3_DEVIN_MCP_OK and do not use any other tool.",
+          });
+          yield* Deferred.await(turnCompleted);
+
+          const assistantText = runtimeEvents
+            .filter((event) => event.type === "content.delta")
+            .map((event) => event.payload.delta)
+            .join("");
+          expect(assistantText).toContain("T3_DEVIN_MCP_OK");
+          expect(
+            requests.some(
+              (request) => request.threadId === threadId && request.operation === "status",
+            ),
+          ).toBe(true);
+          expect(
+            requests.every(
+              (request) => request.threadId === threadId && request.operation === "status",
+            ),
+          ).toBe(true);
+        }),
+      ).pipe(Effect.provide(DevinMcpSmokeLayer)),
+    { timeout: 190_000 },
   );
 });
