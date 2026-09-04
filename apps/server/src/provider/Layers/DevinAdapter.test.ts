@@ -19,6 +19,7 @@ import * as Stream from "effect/Stream";
 
 import { isHostWindows } from "@t3tools/shared/hostProcess";
 import {
+  EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
@@ -27,6 +28,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { makeDevinAdapter, makeDevinPromptLease, settleDevinPromptLease } from "./DevinAdapter.ts";
 import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
 
@@ -169,6 +171,77 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
       }
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("passes the current T3 MCP server to a new Devin ACP session", () =>
+    Effect.gen(function* () {
+      const requestLogDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(requestLogDir, "requests.log");
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-t3-mcp");
+      const endpoint = "http://127.0.0.1:43123/mcp";
+      const authorizationHeader = "Bearer devin-mcp-test-token";
+
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("devin-mcp-test-environment"),
+          threadId,
+          providerSessionId: "devin-mcp-test-session",
+          providerInstanceId: ProviderInstanceId.make("devin"),
+          endpoint,
+          authorizationHeader,
+        }),
+      );
+
+      yield* Effect.gen(function* () {
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("devin"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          modelSelection: devinModelSelection("default"),
+        });
+
+        const logContents = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+        const requests = logContents
+          .split("\n")
+          .filter((line) => line.trim().length > 0)
+          .map((line): { method?: string; params?: unknown } | undefined => {
+            try {
+              return JSON.parse(line) as { method?: string; params?: unknown };
+            } catch {
+              return undefined;
+            }
+          })
+          .filter(
+            (value): value is { method: string; params: unknown } =>
+              value !== undefined && typeof value.method === "string",
+          );
+        const newSessionRequest = requests.find((request) => request.method === "session/new");
+        assert.isDefined(newSessionRequest);
+        const params = newSessionRequest!.params as { mcpServers?: unknown };
+        assert.deepEqual(params.mcpServers, [
+          {
+            type: "http",
+            name: "t3-code",
+            url: endpoint,
+            headers: [{ name: "Authorization", value: authorizationHeader }],
+          },
+        ]);
+      }).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            yield* adapter.stopSession(threadId).pipe(Effect.ignore);
+            yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+          }),
+        ),
+      );
     }),
   );
 
