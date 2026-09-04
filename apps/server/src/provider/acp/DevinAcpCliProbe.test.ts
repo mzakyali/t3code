@@ -248,6 +248,7 @@ describe.runIf(process.env.T3_DEVIN_MCP_SMOKE === "1")("Devin MCP smoke", () => 
                 headers: {
                   authorization: issued.config.authorizationHeader,
                   "mcp-session-id": mcpSessionId,
+                  "mcp-protocol-version": "2025-06-18",
                 },
               })
               .pipe(Effect.ignore),
@@ -330,6 +331,7 @@ describe.runIf(process.env.T3_DEVIN_MCP_SMOKE === "1")("Devin MCP smoke", () => 
             .map((event) => event.payload.delta)
             .join("");
           expect(assistantText).toContain("T3_DEVIN_MCP_OK");
+          expect(requests).toHaveLength(1);
           expect(
             requests.some(
               (request) => request.threadId === threadId && request.operation === "status",
