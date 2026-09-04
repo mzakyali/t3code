@@ -286,6 +286,12 @@ separate from token/cost buckets. Standard ACP does not define a child-agent eve
 Agents panel displays only provider-supplied structured activity and labels child-agent telemetry
 as unavailable when the transport does not advertise it.
 
+To run the Devin MCP smoke test, use `vp run test:devin-smoke`. It starts an isolated loopback
+T3 MCP server, uses the real authenticated Devin CLI, verifies `tools/list` and `preview_status`,
+and consumes one Devin turn. The smoke test is opt-in and skips during normal tests. If `devin` is
+not on `PATH`, set `T3_DEVIN_BINARY_PATH` to the CLI binary. It uses the developer's existing Devin
+login but does not perform login itself.
+
 ## Model manifest
 
 The model picker's legacy section is driven by `apps/server/src/provider/model-manifest.json`, which
