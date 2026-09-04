@@ -44,6 +44,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   type ProviderAdapterError,
   ProviderAdapterProcessError,
@@ -745,6 +746,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         const effectiveDevinSettings = options?.resolveSettings
           ? yield* options.resolveSettings
           : devinSettings;
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
 
         const acp = yield* makeDevinAcpRuntime({
           devinSettings: effectiveDevinSettings,
@@ -753,6 +755,23 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           cwd: input.cwd,
           ...(input.resumeSessionId ? { resumeSessionId: input.resumeSessionId } : {}),
           clientInfo: { name: "t3-code", version: "0.0.0" },
+          ...(mcpSession
+            ? {
+                mcpServers: [
+                  {
+                    type: "http" as const,
+                    name: "t3-code",
+                    url: mcpSession.endpoint,
+                    headers: [
+                      {
+                        name: "Authorization",
+                        value: mcpSession.authorizationHeader,
+                      },
+                    ],
+                  },
+                ],
+              }
+            : {}),
           ...acpNativeLoggers,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
