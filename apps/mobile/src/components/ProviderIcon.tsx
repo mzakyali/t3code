@@ -76,7 +76,7 @@ export function ProviderIcon(props: ProviderIconProps) {
     }
   }
 
-  if (props.provider === "antigravity") {
+  if (props.provider?.trim().toLowerCase() === "antigravity") {
     return (
       <Image
         source={require("../../assets/antigravity.png")}
