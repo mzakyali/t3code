@@ -515,8 +515,9 @@ function workEntryIsActiveTurnActivity(entry: WorkLogEntry): boolean {
 }
 
 /**
- * Settled turns fold activity before their terminal assistant message behind
- * a "Worked for ..." row. Work that lands after that message stays visible so
+ * Settled turns keep their first and terminal assistant messages visible.
+ * Activity and any additional narration between them folds behind a "Worked
+ * for ..." row. Work that lands after the terminal message stays visible so
  * failed or interrupted turns do not hide their trailing tool-call summary.
  */
 function deriveTurnFolds(input: {
@@ -591,8 +592,11 @@ function deriveTurnFolds(input: {
     const terminalEntryIndex = group.terminalEntry
       ? group.entries.findIndex((entry) => entry.id === group.terminalEntry?.id)
       : group.entries.length;
+    const firstAssistantEntry = group.entries.find(
+      (entry): entry is Extract<TimelineEntry, { kind: "message" }> => entry.kind === "message",
+    );
     for (const [index, entry] of group.entries.entries()) {
-      if (entry.id === group.terminalEntry?.id) {
+      if (entry.id === firstAssistantEntry?.id || entry.id === group.terminalEntry?.id) {
         continue;
       }
       if (index > terminalEntryIndex) {
