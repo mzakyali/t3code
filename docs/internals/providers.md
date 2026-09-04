@@ -290,7 +290,9 @@ To run the Devin MCP smoke test, use `vp run test:devin-smoke`. It starts an iso
 T3 MCP server, uses the real authenticated Devin CLI, verifies `tools/list` and `preview_status`,
 and consumes one Devin turn. The smoke test is opt-in and skips during normal tests. If `devin` is
 not on `PATH`, set `T3_DEVIN_BINARY_PATH` to the CLI binary. It uses the developer's existing Devin
-login but does not perform login itself.
+login but does not perform login itself. The installed authenticated Devin runtime must accept and
+expose the ACP-provided `t3-code` MCP server; if it does not, the strict tool-call assertion should
+remain a failure rather than being weakened.
 
 ## Model manifest
 

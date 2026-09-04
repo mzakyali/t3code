@@ -11,6 +11,7 @@
  */
 // @effect-diagnostics nodeBuiltinImport:off - the opt-in smoke test creates and removes an isolated real workspace.
 import * as NodeFSP from "node:fs/promises";
+import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { NodeHttpServer } from "@effect/platform-node";
@@ -34,7 +35,13 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
-import { HttpBody, HttpClient, HttpRouter } from "effect/unstable/http";
+import {
+  FetchHttpClient,
+  HttpBody,
+  HttpClient,
+  HttpRouter,
+  HttpServer,
+} from "effect/unstable/http";
 import { describe, expect } from "vite-plus/test";
 
 import * as ServerConfig from "../../config.ts";
@@ -164,7 +171,23 @@ describe.runIf(process.env.T3_DEVIN_ACP_PROBE === "1")("Devin ACP CLI probe", ()
 
 const DevinMcpSmokeLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-devin-mcp-smoke-",
-}).pipe(Layer.provideMerge(NodeHttpServer.layerTest.pipe(Layer.provideMerge(NodeServices.layer))));
+}).pipe(
+  Layer.provideMerge(
+    HttpServer.layerTestClient.pipe(
+      Layer.provide(
+        Layer.fresh(FetchHttpClient.layer).pipe(
+          Layer.provide(Layer.succeed(FetchHttpClient.RequestInit)({ keepalive: false })),
+        ),
+      ),
+      Layer.provideMerge(
+        NodeHttpServer.layer(NodeHttp.createServer, {
+          host: "127.0.0.1",
+          port: 0,
+        }),
+      ),
+    ),
+  ),
+);
 
 describe.runIf(process.env.T3_DEVIN_MCP_SMOKE === "1")("Devin MCP smoke", () => {
   it.effect(
