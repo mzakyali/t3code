@@ -35,7 +35,7 @@ export const DEVIN_SKILLS_PROBE_TIMEOUT_MS = 20_000;
 /** Skill catalogs are small; anything past this is treated as a runaway. */
 export const DEVIN_SKILLS_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
-export class DevinSkillsProbeError extends Schema.TaggedErrorClass<DevinSkillsProbeError>()(
+export class DevinSkillsProbeError extends Schema.TaggedError<DevinSkillsProbeError>()(
   "DevinSkillsProbeError",
   {
     stage: Schema.Literals(["spawn", "timeout", "exit", "output-limit", "decode"]),
