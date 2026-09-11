@@ -18,6 +18,7 @@ import { resolveMarkdownFileIcon } from "@t3tools/mobile-markdown-text/links";
 import { MOBILE_TYPOGRAPHY } from "../lib/typography";
 import { useNativePaste } from "../lib/useNativePaste";
 import { useFontFamily } from "../lib/useFontFamily";
+import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
 import { useUniwindTheme } from "../lib/useUniwindTheme";
 import {
   acknowledgeComposerNativeEvent,
@@ -211,7 +212,9 @@ export function ComposerEditor({
     },
     [],
   );
+  const { systemColorsActive } = useAppearancePreferences();
   const themeJson = JSON.stringify({
+    selection: systemColorsActive ? theme["--color-primary"] : null,
     text: theme["--color-foreground"],
     placeholder: theme["--color-placeholder"],
     chipBackground: theme["--color-subtle"],
@@ -248,7 +251,7 @@ export function ComposerEditor({
         }
         contentInsetVertical={contentInsetVertical}
         singleLineCentered={props.singleLineCentered ?? false}
-        editable={props.editable ?? true}
+        editable={(props.editable ?? true) && !(props.readOnly ?? false)}
         scrollEnabled={props.scrollEnabled ?? true}
         autoFocus={props.autoFocus ?? false}
         autoCorrect={props.autoCorrect ?? true}

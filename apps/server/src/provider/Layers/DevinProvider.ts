@@ -911,7 +911,7 @@ export function buildDevinModelsFromPayload(
         ...(key === "adaptive" ? { isDefault: true } : {}),
         capabilities: createModelCapabilities({
           optionDescriptors,
-          ...(overrides ?? {}),
+          ...overrides,
         }),
         ...(defaultPricing ? { pricing: defaultPricing } : {}),
         ...(modelPricingRecord(pricingEntries)

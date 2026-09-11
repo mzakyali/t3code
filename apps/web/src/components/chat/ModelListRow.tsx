@@ -119,30 +119,36 @@ export const ModelListRow = memo(function ModelListRow(props: {
             </Badge>
           ) : null}
           {showReasoningPill && props.reasoningLabel ? (
-            <button
-              type="button"
-              className={cn(
-                "shrink-0 rounded border border-border/70 bg-muted/60 px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground transition-colors",
-                props.onReasoningLevelChange &&
-                  "cursor-pointer hover:border-border hover:bg-muted hover:text-foreground",
-              )}
-              onClick={(event) => {
-                event.stopPropagation();
-                cycleReasoningLevel();
-              }}
-              onKeyDown={(event) => {
-                event.stopPropagation();
-              }}
-              disabled={!props.onReasoningLevelChange}
-              aria-label={`Reasoning: ${props.reasoningLabel}`}
-              title={
-                props.onReasoningLevelChange
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    className={cn(
+                      "shrink-0 rounded border border-border/70 bg-muted/60 px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground transition-colors",
+                      props.onReasoningLevelChange &&
+                        "cursor-pointer hover:border-border hover:bg-muted hover:text-foreground",
+                    )}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      cycleReasoningLevel();
+                    }}
+                    onKeyDown={(event) => {
+                      event.stopPropagation();
+                    }}
+                    disabled={!props.onReasoningLevelChange}
+                    aria-label={`Reasoning: ${props.reasoningLabel}`}
+                  >
+                    {props.reasoningLabel}
+                  </button>
+                }
+              />
+              <TooltipPopup side="top" align="center">
+                {props.onReasoningLevelChange
                   ? `Reasoning: ${props.reasoningLabel}. Click to change.`
-                  : `Reasoning: ${props.reasoningLabel}`
-              }
-            >
-              {props.reasoningLabel}
-            </button>
+                  : `Reasoning: ${props.reasoningLabel}`}
+              </TooltipPopup>
+            </Tooltip>
           ) : null}
         </div>
         {props.showProvider && (

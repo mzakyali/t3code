@@ -48,6 +48,14 @@ configured. Sessions outside T3 remain visible in Devin's Billing/Session Insigh
 Provider event logs are retained for a limited period by the server's observability policy. Export
 or review a Usage window before rotating logs if you need a longer local record.
 
+## Capability limits
+
+Devin sessions use T3's shared ACP integration paths. The current Devin CLI does not provide
+a supported child-agent event stream or elicitation flow, and T3 preserves supported resource
+metadata through the generic activity path; live Devin resource emission/rendering has not been
+verified because the installed CLI emitted no resource blocks. These capabilities are therefore not
+available as Devin-specific controls in T3 Code.
+
 ## Remote servers
 
 When you pair a phone or hosted web app with a remote T3 server, Devin runs on the remote machine.

@@ -286,10 +286,10 @@ describe("Devin model catalog fallbacks", () => {
     expect(payload?.families).toHaveLength(1);
     expect(payload?.families[0]?.variants).toHaveLength(3);
     expect(payload?.families[0]?.variants[1]?.contextWindow).toBe(200_000);
-    expect(
-      (payload?.families[0]?.variants[1]?.pricing as { outputPerMillion?: number })
-        .outputPerMillion,
-    ).toBe(2.2);
+    const variantPricing = payload?.families[0]?.variants[1]?.pricing as
+      | { outputPerMillion?: number }
+      | undefined;
+    expect(variantPricing?.outputPerMillion).toBe(2.2);
 
     const glm = buildDevinModelsFromPayload(payload!)[0]!;
     expect(glm.slug).toBe("glm-5-2");

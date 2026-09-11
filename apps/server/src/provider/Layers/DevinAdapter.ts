@@ -10,6 +10,7 @@ import {
   type ProviderOptionSelection,
   EventId,
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -44,6 +45,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   type ProviderAdapterError,
   ProviderAdapterProcessError,
@@ -51,7 +53,7 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -63,11 +65,20 @@ import {
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import {
+  type AcpToolCallState,
   type AcpSessionMode,
   type AcpSessionModeState,
   parsePermissionRequest,
 } from "../acp/AcpRuntimeModel.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
+import {
+  DEVIN_RESOURCE_TEXT_MAX_CHARS,
+  normalizeDevinResourceContent,
+} from "../acp/DevinResourceSupport.ts";
+import {
+  DEVIN_MCP_SERVER_NAME,
+  installDevinWorkspaceMcpServer,
+} from "../Drivers/DevinMcpConfig.ts";
 import {
   applyDevinAcpModelSelection,
   inferDevinContextWindowTokens,
@@ -76,6 +87,8 @@ import {
   resolveDevinAcpBaseModelId,
 } from "../acp/DevinAcpSupport.ts";
 import { type DevinAdapterShape } from "../Services/DevinAdapter.ts";
+import { hasCandidateSkillMention, planDevinSkillDispatch } from "../Drivers/DevinSkillDispatch.ts";
+import { discoverDevinSkills } from "../Drivers/DevinSkills.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
@@ -85,6 +98,38 @@ const ACP_PLAN_MODE_ALIASES = ["plan"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["accept-edits", "smart", "bypass"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
 const DEFAULT_PROMPT_TIMEOUT = Duration.seconds(300);
+
+export interface DevinPromptAccountingState {
+  activeTurnId: TurnId | undefined;
+  readonly activePromptLeases: Set<DevinPromptLease>;
+}
+
+export interface DevinPromptLease {
+  readonly turnId: TurnId;
+}
+
+export const makeDevinPromptLease = (turnId: TurnId): DevinPromptLease => ({
+  turnId,
+});
+
+export const isDevinPromptLeaseCurrent = (
+  state: DevinPromptAccountingState,
+  lease: DevinPromptLease,
+): boolean => state.activeTurnId === lease.turnId && state.activePromptLeases.has(lease);
+
+/**
+ * Releases one prompt slot only while its turn still owns the accounting
+ * state. Interrupts and timeouts clear the active turn before a replacement
+ * turn starts, so a delayed finalizer from the old turn becomes a no-op.
+ */
+export const settleDevinPromptLease = (
+  state: DevinPromptAccountingState,
+  lease: DevinPromptLease,
+): boolean => {
+  const wasCurrent = isDevinPromptLeaseCurrent(state, lease);
+  state.activePromptLeases.delete(lease);
+  return wasCurrent;
+};
 
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
@@ -119,6 +164,7 @@ export interface DevinAdapterLiveOptions {
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
   readonly kind: string | "unknown";
+  readonly options: EffectAcpSchema.RequestPermissionRequest["options"];
 }
 
 interface PendingUserInput {
@@ -136,10 +182,10 @@ interface DevinSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
-  /** Number of sendTurn prompts currently in flight or being prepared.
-   * >0 means a turn is actively running, so a new sendTurn is a steer that
-   * continues it, and only the last remaining prompt settles the turn. */
-  promptsInFlight: number;
+  /** Prompt leases currently in flight or being prepared. A non-empty set
+   * means a turn is actively running, so a new sendTurn steers that turn.
+   * Lease identity prevents stale finalizers from consuming newer prompts. */
+  readonly activePromptLeases: Set<DevinPromptLease>;
   /** Latest ACP-reported context window values. */
   lastContextWindowUsed: number | undefined;
   lastContextWindowSize: number | undefined;
@@ -233,6 +279,155 @@ function settlePendingUserInputsAsEmptyAnswers(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isDevinResourceContent(value: unknown): boolean {
+  if (!isRecord(value) || value.type !== "content" || !isRecord(value.content)) {
+    return false;
+  }
+  return value.content.type === "resource_link" || value.content.type === "resource";
+}
+
+function sanitizeDevinToolCall(toolCall: AcpToolCallState): AcpToolCallState {
+  const content = toolCall.data.content;
+  if (!Array.isArray(content)) {
+    return toolCall;
+  }
+  let changed = false;
+  let resource = toolCall.data.resource;
+  const retainedContent: Array<unknown> = [];
+  for (const entry of content) {
+    if (!isDevinResourceContent(entry)) {
+      retainedContent.push(entry);
+      continue;
+    }
+    changed = true;
+    if (resource !== undefined) continue;
+    const normalized = normalizeDevinResourceContent(entry);
+    if (normalized.kind === "resource") {
+      resource = normalized.resource;
+    }
+  }
+  if (!changed) {
+    return toolCall;
+  }
+  const data: Record<string, unknown> = { ...toolCall.data };
+  if (retainedContent.length > 0) {
+    data.content = retainedContent;
+  } else {
+    delete data.content;
+  }
+  if (resource !== undefined) {
+    data.resource = resource;
+  } else {
+    delete data.resource;
+  }
+  return { ...toolCall, data };
+}
+
+const DEVIN_TOOL_CALL_RAW_METADATA_FIELDS = [
+  "sessionUpdate",
+  "toolCallId",
+  "title",
+  "kind",
+  "status",
+] as const;
+
+function boundedDevinMetadata(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= DEVIN_RESOURCE_TEXT_MAX_CHARS
+    ? value
+    : undefined;
+}
+
+function sanitizeDevinToolCallRawPayload(rawPayload: unknown, toolCall: AcpToolCallState): unknown {
+  if (!isRecord(rawPayload) || !isRecord(rawPayload.update)) {
+    return rawPayload;
+  }
+  const rawUpdate = rawPayload.update;
+  const hasRawResource =
+    Array.isArray(rawUpdate.content) && rawUpdate.content.some(isDevinResourceContent);
+  if (!hasRawResource && toolCall.data.resource === undefined) {
+    return rawPayload;
+  }
+  const update: Record<string, unknown> = {};
+  for (const field of DEVIN_TOOL_CALL_RAW_METADATA_FIELDS) {
+    const value = boundedDevinMetadata(rawUpdate[field]);
+    if (value !== undefined) {
+      update[field] = value;
+    }
+  }
+  if (toolCall.data.resource !== undefined) {
+    update.resource = toolCall.data.resource;
+  }
+  const sessionId = boundedDevinMetadata(rawPayload.sessionId);
+  return {
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    update,
+  };
+}
+
+function sanitizeDevinPermissionRequest(params: EffectAcpSchema.RequestPermissionRequest) {
+  const permissionRequest = parsePermissionRequest(params);
+  if (!params.toolCall.content?.some(isDevinResourceContent)) {
+    return { permissionRequest, payload: params };
+  }
+  const toolCall = permissionRequest.toolCall
+    ? sanitizeDevinToolCall(permissionRequest.toolCall)
+    : undefined;
+  const metadata: Record<string, unknown> = {};
+  for (const field of DEVIN_TOOL_CALL_RAW_METADATA_FIELDS) {
+    const value = boundedDevinMetadata(Reflect.get(params.toolCall, field));
+    if (value !== undefined) metadata[field] = value;
+  }
+  if (toolCall?.data.resource !== undefined) metadata.resource = toolCall.data.resource;
+  const detail = boundedDevinMetadata(permissionRequest.detail);
+  return {
+    permissionRequest: {
+      kind: permissionRequest.kind,
+      ...(detail !== undefined ? { detail } : {}),
+    },
+    payload: {
+      sessionId: boundedDevinMetadata(params.sessionId),
+      toolCall: metadata,
+      options: params.options.map(({ optionId, name, kind }) => ({
+        optionId: boundedDevinMetadata(optionId),
+        name: boundedDevinMetadata(name),
+        kind,
+      })),
+    },
+  };
+}
+
+function selectDevinPermissionOptionId(
+  options: EffectAcpSchema.RequestPermissionRequest["options"],
+  decision: ProviderApprovalDecision,
+): string | undefined {
+  const kind =
+    decision === "acceptForSession" || decision === "acceptAlways"
+      ? "allow_always"
+      : decision === "accept"
+        ? "allow_once"
+        : decision === "decline"
+          ? "reject_once"
+          : undefined;
+  return options.find((option) => option.kind === kind)?.optionId;
+}
+
+function devinApprovalOptions(
+  options: EffectAcpSchema.RequestPermissionRequest["options"],
+): ReadonlyArray<ProviderApprovalOption> {
+  const approvals: ProviderApprovalOption[] = [];
+  for (const decision of ["accept", "acceptForSession", "decline"] as const) {
+    const optionId = selectDevinPermissionOptionId(options, decision);
+    const option = options.find((entry) => entry.optionId === optionId);
+    const label = boundedDevinMetadata(option?.name)?.trim();
+    if (option?.optionId.trim() && label) {
+      approvals.push({ decision, label });
+    }
+  }
+  // ACP cancellation is always supported, even without a selectable native option.
+  approvals.push({ decision: "cancel", label: "Cancel" });
+  return approvals;
 }
 
 function parseDevinResume(raw: unknown): { sessionId: string } | undefined {
@@ -361,17 +556,10 @@ function applyRequestedSessionConfiguration<E>(input: {
 function selectAutoApprovedPermissionOption(
   request: EffectAcpSchema.RequestPermissionRequest,
 ): string | undefined {
-  const allowAlwaysOption = request.options.find((option) => option.kind === "allow_always");
-  if (typeof allowAlwaysOption?.optionId === "string" && allowAlwaysOption.optionId.trim()) {
-    return allowAlwaysOption.optionId.trim();
-  }
-
-  const allowOnceOption = request.options.find((option) => option.kind === "allow_once");
-  if (typeof allowOnceOption?.optionId === "string" && allowOnceOption.optionId.trim()) {
-    return allowOnceOption.optionId.trim();
-  }
-
-  return undefined;
+  return (
+    selectDevinPermissionOptionId(request.options, "acceptForSession") ??
+    selectDevinPermissionOptionId(request.options, "accept")
+  );
 }
 
 function mapPromptTimeout(
@@ -410,6 +598,12 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
     const sessions = new Map<ThreadId, DevinSessionContext>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    /**
+     * Successful lazy skill discoveries, keyed by the session workspace cwd.
+     * Failures are never cached: a failed probe retries on the next turn that
+     * carries a candidate `$skill` token.
+     */
+    const skillNamesByCwd = new Map<string, ReadonlySet<string>>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -441,6 +635,53 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+
+    /**
+     * Best-effort lazy skill discovery for the session workspace. Successful
+     * catalogs are cached per cwd for the adapter's lifetime; any failure is
+     * logged at debug level without environment or prompt contents and left
+     * uncached so a later turn can retry.
+     */
+    const resolveSkillNamesForCwd = (cwd: string, settings: DevinSettings) => {
+      const cached = skillNamesByCwd.get(cwd);
+      if (cached) {
+        return Effect.succeed(cached);
+      }
+      return discoverDevinSkills(settings, options?.environment ?? process.env, cwd).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+        Effect.provideService(Path.Path, path),
+        Effect.map((skills) => {
+          const names = new Set(
+            skills
+              .filter((skill) => skill.enabled && skill.userInvocable !== false)
+              .map((skill) => skill.name),
+          );
+          skillNamesByCwd.set(cwd, names);
+          return names;
+        }),
+        Effect.tapError((cause) =>
+          Effect.logDebug("devin skill discovery failed; sending prompt unchanged", {
+            stage: cause.stage,
+          }),
+        ),
+        Effect.catch(() => Effect.succeed(new Set<string>() as ReadonlySet<string>)),
+      );
+    };
+
+    /**
+     * Translate known `$skill` mentions into Devin's native `@skills:name`
+     * syntax. Discovery runs lazily — only when the prompt carries a candidate
+     * token — and a failure leaves the prompt unchanged so the turn still goes
+     * out.
+     */
+    const dispatchDevinSkills = (prompt: string, cwd: string, settings: DevinSettings) =>
+      hasCandidateSkillMention(prompt)
+        ? resolveSkillNamesForCwd(cwd, settings).pipe(
+            Effect.map(
+              (skillNames) => planDevinSkillDispatch(prompt, skillNames)?.prompt ?? prompt,
+            ),
+          )
+        : Effect.succeed(prompt);
 
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -564,7 +805,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       rawPayload: unknown,
     ) =>
       Effect.gen(function* () {
-        const usedTokens = Math.max(nonNegativeInteger(update.used), ctx.totalProcessedTokens);
+        const usedTokens = nonNegativeInteger(update.used);
         const reportedMaxTokens = nonNegativeInteger(update.size);
         const maxTokens =
           reportedMaxTokens > 0
@@ -586,6 +827,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
         const usage: ThreadTokenUsageSnapshot = {
           usedTokens,
+          ...(ctx.totalProcessedTokens > 0
+            ? { totalProcessedTokens: ctx.totalProcessedTokens }
+            : {}),
           ...(maxTokens > 0 ? { maxTokens } : {}),
           ...((ctx.activeModelUid ?? ctx.session.model)
             ? { model: ctx.activeModelUid ?? ctx.session.model }
@@ -627,7 +871,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         ctx.totalProcessedTokens = totalProcessedTokens;
         ctx.lastAcpUsage = current;
 
-        const usedTokens = Math.max(ctx.lastContextWindowUsed ?? 0, current.totalTokens);
+        const usedTokens = ctx.lastContextWindowUsed ?? 0;
         const maxTokens = ctx.lastContextWindowSize;
         const usage: ThreadTokenUsageSnapshot = {
           usedTokens,
@@ -683,10 +927,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
       });
 
-    // Spawns a new ACP runtime, wires handlers, starts it, and forks the
-    // notification consumer. Returns the started result and the new scope.
+    // Spawns and starts a runtime in the caller's scope. The caller retains
+    // cleanup ownership until configuration and notification setup succeed.
     // Shared by startSession and the model-change restart path.
     const createAcpRuntime = (input: {
+      readonly scope: Scope.Closeable;
       readonly threadId: ThreadId;
       readonly cwd: string;
       readonly runtimeMode: RuntimeMode;
@@ -698,12 +943,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       {
         readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
         readonly started: AcpSessionRuntime.AcpSessionRuntimeStartResult;
-        readonly scope: Scope.Closeable;
       },
       ProviderAdapterError
     > =>
       Effect.gen(function* () {
-        const sessionScope = yield* Scope.make("sequential");
+        const sessionScope = input.scope;
         const acpNativeLoggers = makeAcpNativeLoggers({
           nativeEventLogger,
           provider: PROVIDER,
@@ -713,6 +957,35 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         const effectiveDevinSettings = options?.resolveSettings
           ? yield* options.resolveSettings
           : devinSettings;
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+
+        // `devin acp` ignores session/new mcpServers (it advertises
+        // mcpCapabilities {http:false, sse:false}) and merges the
+        // workspace-local .devin/mcp_config.local.json at process start
+        // instead, so the per-thread T3 server is installed there before
+        // spawn and restored when the session scope closes. The toolset is
+        // optional — a failed install warns and leaves the session without
+        // it rather than blocking the start.
+        if (mcpSession) {
+          yield* installDevinWorkspaceMcpServer({
+            cwd: input.cwd,
+            scope: sessionScope,
+            server: {
+              name: DEVIN_MCP_SERVER_NAME,
+              url: mcpSession.endpoint,
+              authorizationHeader: mcpSession.authorizationHeader,
+            },
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.catch((cause) =>
+              Effect.logWarning(
+                "Could not install the T3 MCP server into the Devin workspace config; the session will run without it.",
+                { cause },
+              ),
+            ),
+          );
+        }
 
         const acp = yield* makeDevinAcpRuntime({
           devinSettings: effectiveDevinSettings,
@@ -721,6 +994,23 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           cwd: input.cwd,
           ...(input.resumeSessionId ? { resumeSessionId: input.resumeSessionId } : {}),
           clientInfo: { name: "t3-code", version: "0.0.0" },
+          ...(mcpSession
+            ? {
+                mcpServers: [
+                  {
+                    type: "http" as const,
+                    name: "t3-code",
+                    url: mcpSession.endpoint,
+                    headers: [
+                      {
+                        name: "Authorization",
+                        value: mcpSession.authorizationHeader,
+                      },
+                    ],
+                  },
+                ],
+              }
+            : {}),
           ...acpNativeLoggers,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
@@ -747,10 +1037,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           yield* acp.handleRequestPermission((params) =>
             mapExtensionFailure(
               Effect.gen(function* () {
+                const { permissionRequest, payload } = sanitizeDevinPermissionRequest(params);
                 yield* logNative(
                   input.threadId,
                   "session/request_permission",
-                  params,
+                  payload,
                   "acp.jsonrpc",
                 );
                 if (input.runtimeMode === "full-access") {
@@ -764,14 +1055,15 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                     };
                   }
                 }
-                const permissionRequest = parsePermissionRequest(params);
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const runtimeRequestId = RuntimeRequestId.make(requestId);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                input.pendingApprovals.set(requestId, {
+                const pending = {
                   decision,
                   kind: permissionRequest.kind,
-                });
+                  options: params.options,
+                };
+                input.pendingApprovals.set(requestId, pending);
                 yield* offerRuntimeEvent(
                   makeAcpRequestOpenedEvent({
                     stamp: yield* makeEventStamp(),
@@ -780,14 +1072,15 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                     turnId: input.ctxRef.current?.activeTurnId,
                     requestId: runtimeRequestId,
                     permissionRequest,
+                    approvalOptions: devinApprovalOptions(params.options),
                     detail:
                       permissionRequest.detail ??
-                      encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
+                      encodeJsonStringForDiagnostics(payload)?.slice(0, 2000) ??
                       "[unserializable params]",
-                    args: params,
+                    args: payload,
                     source: "acp.jsonrpc",
                     method: "session/request_permission",
-                    rawPayload: params,
+                    rawPayload: payload,
                   }),
                 );
                 const resolved = yield* Deferred.await(decision);
@@ -803,13 +1096,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                     decision: resolved,
                   }),
                 );
+                const optionId = selectDevinPermissionOptionId(pending.options, resolved);
                 return {
                   outcome:
-                    resolved === "cancel"
+                    optionId === undefined
                       ? ({ outcome: "cancelled" } as const)
                       : {
                           outcome: "selected" as const,
-                          optionId: acpPermissionOutcome(resolved),
+                          optionId,
                         },
                 };
               }),
@@ -822,7 +1116,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           ),
         );
 
-        return { acp, started, scope: sessionScope };
+        return { acp, started };
       });
 
     // Forks the notification consumer into the session scope. The ctx must
@@ -872,17 +1166,21 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 );
                 return;
               case "ToolCallUpdated":
-                yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
-                yield* offerRuntimeEvent(
-                  makeAcpToolCallEvent({
-                    stamp: yield* makeEventStamp(),
-                    provider: PROVIDER,
-                    threadId: ctx.threadId,
-                    turnId: ctx.activeTurnId,
-                    toolCall: event.toolCall,
-                    rawPayload: event.rawPayload,
-                  }),
-                );
+                {
+                  const toolCall = sanitizeDevinToolCall(event.toolCall);
+                  const rawPayload = sanitizeDevinToolCallRawPayload(event.rawPayload, toolCall);
+                  yield* logNative(ctx.threadId, "session/update", rawPayload, "acp.jsonrpc");
+                  yield* offerRuntimeEvent(
+                    makeAcpToolCallEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: ctx.threadId,
+                      turnId: ctx.activeTurnId,
+                      toolCall,
+                      rawPayload,
+                    }),
+                  );
+                }
                 return;
               case "ContentDelta":
                 yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
@@ -942,13 +1240,15 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
           const ctxRef: { current: DevinSessionContext | undefined } = { current: undefined };
+          const sessionScope = yield* Scope.make("sequential");
+          let sessionScopeTransferred = false;
+          yield* Effect.addFinalizer(() =>
+            sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
+          );
 
           const resumeSessionId = parseDevinResume(input.resumeCursor)?.sessionId;
-          const {
-            acp,
-            started,
+          const { acp, started } = yield* createAcpRuntime({
             scope: sessionScope,
-          } = yield* createAcpRuntime({
             threadId: input.threadId,
             cwd,
             runtimeMode: input.runtimeMode,
@@ -995,7 +1295,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             turns: [],
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
-            promptsInFlight: 0,
+            activePromptLeases: new Set(),
             lastContextWindowUsed: undefined,
             lastContextWindowSize: undefined,
             lastAcpUsage: undefined,
@@ -1012,6 +1312,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           const nf = yield* startNotificationFiber(ctx);
           ctx.notificationFiber = nf;
           sessions.set(input.threadId, ctx);
+          sessionScopeTransferred = true;
 
           yield* offerRuntimeEvent({
             type: "session.started",
@@ -1060,12 +1361,17 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
         yield* teardownAcpRuntime(ctx);
 
+        const newScope = yield* Scope.make("sequential");
+        let sessionScopeTransferred = false;
+        yield* Effect.addFinalizer(() => {
+          if (sessionScopeTransferred) return Effect.void;
+          ctx.stopped = true;
+          sessions.delete(ctx.threadId);
+          return Scope.close(newScope, Exit.void);
+        });
         const ctxRef: { current: DevinSessionContext | undefined } = { current: ctx };
-        const {
-          acp,
-          started,
+        const { acp, started } = yield* createAcpRuntime({
           scope: newScope,
-        } = yield* createAcpRuntime({
           threadId: ctx.threadId,
           cwd: ctx.session.cwd ?? process.cwd(),
           runtimeMode: ctx.session.runtimeMode,
@@ -1075,15 +1381,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           pendingApprovals: ctx.pendingApprovals,
           pendingUserInputs: ctx.pendingUserInputs,
           ctxRef,
-        }).pipe(
-          Effect.mapError((error) => {
-            // If restart fails, the session is in a bad state — mark it
-            // stopped so the user gets a clear error on next use.
-            ctx.stopped = true;
-            sessions.delete(ctx.threadId);
-            return error;
-          }),
-        );
+        });
 
         // Apply the new model to the fresh session. `newModel` is the base
         // (group) slug; the reasoning option is folded in to form the full
@@ -1111,6 +1409,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
         const nf = yield* startNotificationFiber(ctx);
         ctx.notificationFiber = nf;
+        sessionScopeTransferred = true;
 
         yield* offerRuntimeEvent({
           type: "session.state.changed",
@@ -1119,90 +1418,35 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           threadId: ctx.threadId,
           payload: { state: "ready", reason: "Devin session ready after model change" },
         });
-      });
+      }).pipe(Effect.scoped);
 
     const sendTurn: DevinAdapterShape["sendTurn"] = (input) =>
-      Effect.gen(function* () {
-        // Preparation (turn accounting, model-change restart, config) runs
-        // under the thread lock so two concurrent sendTurn calls cannot both
-        // read promptsInFlight === 0 and open duplicate turns. The actual
-        // prompt RPC runs outside the lock so interrupts and steers can
-        // still land.
-        const prepared = yield* withThreadLock(
+      Effect.acquireUseRelease(
+        // Preparation (prompt validation, turn accounting, model-change
+        // restart, config) runs under the thread lock so two concurrent
+        // sendTurn calls cannot both observe no active leases and open
+        // duplicate turns. Keep fallible preparation interruptible even
+        // though acquireUseRelease protects the accounting handoff.
+        withThreadLock(
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
-            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-            // Count this prompt immediately so a superseded in-flight prompt
-            // resolving from here on does not settle the turn; the matching
-            // decrement is the `ensuring` below.
-            ctx.promptsInFlight += 1;
 
-            const turnModelSelection =
-              input.modelSelection?.instanceId === boundInstanceId
-                ? input.modelSelection
-                : undefined;
-            const model = turnModelSelection?.model ?? ctx.session.model;
-            const resolvedModel = resolveDevinAcpBaseModelId(model);
-            const resolvedModelUid = resolveDevinModelUid(model, turnModelSelection?.options);
-
-            // If the base model changed on an existing session, restart the
-            // ACP session internally. The visible T3 thread stays the same.
-            // A reasoning-only change (same base) is applied below as a
-            // config-option tweak without a restart.
-            const previousModel = resolveDevinAcpBaseModelId(ctx.session.model);
-            if (
-              steeringTurnId === undefined &&
-              resolvedModel !== previousModel &&
-              ctx.session.model !== undefined
-            ) {
-              yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
-            }
-
-            yield* applyRequestedSessionConfiguration({
-              runtime: ctx.acp,
-              runtimeMode: ctx.session.runtimeMode,
-              interactionMode: input.interactionMode,
-              modelSelection:
-                model === undefined
-                  ? undefined
-                  : {
-                      model,
-                      options: turnModelSelection?.options,
-                    },
-              mapError: ({ cause, method }) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-            });
-            ctx.activeTurnId = turnId;
-            if (steeringTurnId === undefined) {
-              ctx.lastPlanFingerprint = undefined;
-            }
-            ctx.session = {
-              ...ctx.session,
-              activeTurnId: turnId,
-              ...(model !== undefined ? { model: resolvedModel } : {}),
-              updatedAt: yield* nowIso,
-            };
-            if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
-
-            if (steeringTurnId === undefined) {
-              yield* offerRuntimeEvent({
-                type: "turn.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: { model: resolvedModel },
-              });
-            }
+            const effectiveDevinSettings = options?.resolveSettings
+              ? yield* options.resolveSettings
+              : devinSettings;
+            // Known `$skill` mentions become Devin's native `@skills:name`
+            // before the prompt is built. Discovery is lazy (a candidate token
+            // is required) and best-effort: a failure leaves the prompt as-is.
+            const trimmedInput = input.input?.trim();
+            const dispatchedInput =
+              trimmedInput && ctx.session.cwd
+                ? yield* dispatchDevinSkills(trimmedInput, ctx.session.cwd, effectiveDevinSettings)
+                : trimmedInput;
 
             const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-            if (input.input?.trim()) {
-              promptParts.push({ type: "text", text: input.input.trim() });
+            if (dispatchedInput) {
+              promptParts.push({ type: "text", text: dispatchedInput });
             }
             if (input.attachments && input.attachments.length > 0) {
               for (const attachment of input.attachments) {
@@ -1250,111 +1494,222 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               });
             }
 
-            return { ctx, turnId, promptParts, resolvedModel };
-          }),
-        );
+            // A sendTurn while a prompt is in flight is a steer: the agent
+            // folds the new prompt into the ongoing work, so the active turn
+            // id is reused instead of opening a new turn.
+            const steeringTurnId = ctx.activePromptLeases.size > 0 ? ctx.activeTurnId : undefined;
+            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
 
+            const turnModelSelection =
+              input.modelSelection?.instanceId === boundInstanceId
+                ? input.modelSelection
+                : undefined;
+            const model = turnModelSelection?.model ?? ctx.session.model;
+            const resolvedModel = resolveDevinAcpBaseModelId(model);
+            const resolvedModelUid = resolveDevinModelUid(model, turnModelSelection?.options);
+
+            // If the base model changed on an existing session, restart the
+            // ACP session internally. The visible T3 thread stays the same.
+            // A reasoning-only change (same base) is applied below as a
+            // config-option tweak without a restart.
+            const previousModel = resolveDevinAcpBaseModelId(ctx.session.model);
+            if (
+              steeringTurnId === undefined &&
+              resolvedModel !== previousModel &&
+              ctx.session.model !== undefined
+            ) {
+              yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
+            }
+
+            yield* applyRequestedSessionConfiguration({
+              runtime: ctx.acp,
+              runtimeMode: ctx.session.runtimeMode,
+              interactionMode: input.interactionMode,
+              modelSelection:
+                model === undefined
+                  ? undefined
+                  : {
+                      model,
+                      options: turnModelSelection?.options,
+                    },
+              mapError: ({ cause, method }) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+            });
+
+            // Resolve every fallible value before acquiring the accounting
+            // slot. Once counted, the uninterruptible handoff publishes the
+            // start event and returns the resource as one acquisition step.
+            const updatedAt = yield* nowIso;
+            const turnStartedStamp =
+              steeringTurnId === undefined ? yield* makeEventStamp() : undefined;
+            const lease = makeDevinPromptLease(turnId);
+
+            return yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                ctx.activePromptLeases.add(lease);
+                ctx.activeTurnId = turnId;
+                if (steeringTurnId === undefined) {
+                  ctx.lastPlanFingerprint = undefined;
+                }
+                ctx.session = {
+                  ...ctx.session,
+                  activeTurnId: turnId,
+                  ...(model !== undefined ? { model: resolvedModel } : {}),
+                  updatedAt,
+                };
+                if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
+
+                if (turnStartedStamp !== undefined) {
+                  yield* offerRuntimeEvent({
+                    type: "turn.started",
+                    ...turnStartedStamp,
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    payload: { model: resolvedModel },
+                  });
+                }
+
+                return { ctx, turnId, promptParts, resolvedModel, lease };
+              }),
+            );
+          }),
+        ).pipe(Effect.interruptible),
         // Run the prompt outside the thread lock so interrupts and steers
         // can still acquire it while the RPC is in flight.
-        const { ctx, turnId, promptParts, resolvedModel } = prepared;
-        return yield* Effect.gen(function* () {
-          const result = yield* ctx.acp
-            .prompt({
-              prompt: promptParts,
-            })
-            .pipe(
-              // Map ACP protocol errors to adapter errors first, before the
-              // timeout wrapper adds a non-ACP error type to the channel.
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-              Effect.timeoutOption(promptTimeout),
-              Effect.flatMap((result) =>
-                Option.match(result, {
-                  onNone: () =>
-                    Effect.gen(function* () {
-                      // Reset turn accounting so the next sendTurn opens a
-                      // fresh turn instead of steering into a timed-out one.
-                      ctx.promptsInFlight = 0;
-                      ctx.activeTurnId = undefined;
-                      ctx.session = {
-                        ...ctx.session,
-                        activeTurnId: undefined,
-                        updatedAt: yield* nowIso,
-                      };
-                      // Cancel the in-flight ACP prompt so the runtime is
-                      // ready to accept a new one.
-                      yield* Effect.ignore(
-                        ctx.acp.cancel.pipe(
-                          Effect.mapError((error) =>
-                            mapAcpToAdapterError(PROVIDER, input.threadId, "session/cancel", error),
-                          ),
-                        ),
-                      );
-                      return yield* mapPromptTimeout(PROVIDER, input.threadId, promptTimeout);
-                    }),
-                  onSome: Effect.succeed,
-                }),
-              ),
+        ({ ctx, turnId, promptParts, resolvedModel, lease }) =>
+          Effect.gen(function* () {
+            const result = yield* ctx.acp
+              .prompt({
+                prompt: promptParts,
+              })
+              .pipe(
+                // Map ACP protocol errors to adapter errors first, before the
+                // timeout wrapper adds a non-ACP error type to the channel.
+                Effect.mapError((error) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                ),
+                Effect.timeoutOption(promptTimeout),
+                Effect.flatMap((result) =>
+                  Option.match(result, {
+                    onNone: () =>
+                      withThreadLock(
+                        input.threadId,
+                        Effect.gen(function* () {
+                          // A timeout from an invalidated turn must not reset
+                          // or cancel a replacement prompt on the same ACP
+                          // session.
+                          if (!isDevinPromptLeaseCurrent(ctx, lease)) {
+                            settleDevinPromptLease(ctx, lease);
+                            return;
+                          }
+
+                          const updatedAt = yield* nowIso;
+                          ctx.activePromptLeases.clear();
+                          ctx.activeTurnId = undefined;
+                          ctx.session = {
+                            ...ctx.session,
+                            activeTurnId: undefined,
+                            updatedAt,
+                          };
+                          // Keep cancellation under the thread lock so a new
+                          // prompt cannot become active between the reset and
+                          // the session-wide cancel notification.
+                          yield* Effect.ignore(
+                            ctx.acp.cancel.pipe(
+                              Effect.mapError((error) =>
+                                mapAcpToAdapterError(
+                                  PROVIDER,
+                                  input.threadId,
+                                  "session/cancel",
+                                  error,
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
+                      ).pipe(
+                        Effect.andThen(mapPromptTimeout(PROVIDER, input.threadId, promptTimeout)),
+                      ),
+                    onSome: Effect.succeed,
+                  }),
+                ),
+              );
+
+            // Keep result projection and prompt accounting atomic with
+            // interrupt, timeout, and replacement-turn acquisition.
+            yield* withThreadLock(
+              input.threadId,
+              Effect.gen(function* () {
+                if (!isDevinPromptLeaseCurrent(ctx, lease)) {
+                  settleDevinPromptLease(ctx, lease);
+                  return;
+                }
+
+                // ACP prompt responses may carry cumulative token usage.
+                if (result?.usage) {
+                  yield* emitDevinPromptUsage(ctx, result.usage, {
+                    method: "session/prompt",
+                    result,
+                  });
+                }
+
+                const updatedAt = yield* nowIso;
+                const completesTurn = ctx.activePromptLeases.size === 1;
+                const stopReason = result?.stopReason ?? null;
+                const completionStamp = completesTurn ? yield* makeEventStamp() : undefined;
+
+                yield* Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+                    if (turnRecord) {
+                      turnRecord.items.push({ prompt: promptParts, result: result ?? null });
+                    } else {
+                      ctx.turns.push({
+                        id: turnId,
+                        items: [{ prompt: promptParts, result: result ?? null }],
+                      });
+                    }
+                    ctx.session = {
+                      ...ctx.session,
+                      activeTurnId: turnId,
+                      updatedAt,
+                      model: resolvedModel,
+                    };
+
+                    settleDevinPromptLease(ctx, lease);
+                    if (completionStamp !== undefined) {
+                      yield* offerRuntimeEvent({
+                        type: "turn.completed",
+                        ...completionStamp,
+                        provider: PROVIDER,
+                        threadId: input.threadId,
+                        turnId,
+                        payload: {
+                          state: stopReason === "cancelled" ? "cancelled" : "completed",
+                          stopReason,
+                        },
+                      });
+                    }
+                  }),
+                );
+              }),
             );
 
-          // ACP prompt responses may carry cumulative token usage. Normalize
-          // it into the shared snapshot so the context meter and Usage page
-          // can consume Devin sessions just like the other providers.
-          if (result?.usage) {
-            yield* emitDevinPromptUsage(ctx, result.usage, {
-              method: "session/prompt",
-              result,
-            });
-          }
-
-          const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
-          if (turnRecord) {
-            turnRecord.items.push({ prompt: promptParts, result: result ?? null });
-          } else {
-            ctx.turns.push({
-              id: turnId,
-              items: [{ prompt: promptParts, result: result ?? null }],
-            });
-          }
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-            model: resolvedModel,
-          };
-
-          // Only the last remaining prompt settles the turn — a steer-
-          // superseded prompt resolving (usually cancelled) while another is
-          // in flight or pending must leave the merged turn running.
-          if (ctx.promptsInFlight === 1) {
-            const stopReason = result?.stopReason ?? null;
-            yield* offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
+            return {
               threadId: input.threadId,
               turnId,
-              payload: {
-                state: stopReason === "cancelled" ? "cancelled" : "completed",
-                stopReason,
-              },
-            });
-          }
-
-          return {
-            threadId: input.threadId,
-            turnId,
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }).pipe(
-          Effect.ensuring(
+              resumeCursor: ctx.session.resumeCursor,
+            };
+          }),
+        ({ ctx, lease }) =>
+          withThreadLock(
+            input.threadId,
             Effect.sync(() => {
-              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              settleDevinPromptLease(ctx, lease);
             }),
           ),
-        );
-      });
+      );
 
     const interruptTurn: DevinAdapterShape["interruptTurn"] = (threadId) =>
       withThreadLock(
@@ -1365,9 +1720,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
           // Reset turn accounting so the next sendTurn opens a fresh turn
           // instead of steering into a stuck one. Without this, a cancelled
-          // stuck prompt leaves promptsInFlight > 0 and the session never
+          // stuck prompt leaves an active lease and the session never
           // recovers.
-          ctx.promptsInFlight = 0;
+          ctx.activePromptLeases.clear();
           ctx.activeTurnId = undefined;
           ctx.session = {
             ...ctx.session,
@@ -1399,6 +1754,16 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             detail: `Unknown pending approval request: ${requestId}`,
           });
         }
+        if (
+          decision !== "cancel" &&
+          selectDevinPermissionOptionId(pending.options, decision) === undefined
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/request_permission",
+            detail: `Devin did not advertise an option for approval decision '${decision}'.`,
+          });
+        }
         yield* Deferred.succeed(pending.decision, decision);
       });
 
@@ -1426,20 +1791,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         return { threadId, turns: ctx.turns };
       });
 
-    const rollbackThread: DevinAdapterShape["rollbackThread"] = (threadId, numTurns) =>
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
-          });
-        }
-        const nextLength = Math.max(0, ctx.turns.length - numTurns);
-        ctx.turns.splice(nextLength);
-        return { threadId, turns: ctx.turns };
-      });
+    const rollbackThread: DevinAdapterShape["rollbackThread"] = () =>
+      Effect.fail(
+        new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Devin does not support conversation rewind. Start a new thread instead.",
+        }),
+      );
 
     const stopSession: DevinAdapterShape["stopSession"] = (threadId) =>
       withThreadLock(
@@ -1476,7 +1835,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session" },
+      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
       startSession,
       sendTurn,
       interruptTurn,

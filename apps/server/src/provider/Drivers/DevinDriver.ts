@@ -18,6 +18,7 @@ import {
 } from "../Layers/DevinProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import { discoverDevinSkills } from "./DevinSkills.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -25,11 +26,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import {
-  makeManualOnlyProviderMaintenanceCapabilities,
-  makeStaticProviderMaintenanceResolver,
-  resolveProviderMaintenanceCapabilitiesEffect,
-} from "../providerMaintenance.ts";
+import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
@@ -38,12 +35,10 @@ import {
 
 const decodeDevinSettings = Schema.decodeSync(DevinSettings);
 const DRIVER_KIND = ProviderDriverKind.make("devin");
-const UPDATE = makeStaticProviderMaintenanceResolver(
-  makeManualOnlyProviderMaintenanceCapabilities({
-    provider: DRIVER_KIND,
-    packageName: null,
-  }),
-);
+const MAINTENANCE_CAPABILITIES = makeManualOnlyProviderMaintenanceCapabilities({
+  provider: DRIVER_KIND,
+  packageName: null,
+});
 
 export type DevinDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
@@ -85,6 +80,7 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
+      const path = yield* Path.Path;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -97,10 +93,6 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies DevinSettings;
-      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
-        binaryPath: effectiveConfig.binaryPath,
-        env: processEnv,
-      });
 
       const adapter = yield* makeDevinAdapter(effectiveConfig, {
         environment: processEnv,
@@ -115,7 +107,7 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
       );
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<DevinSettings>>({
-        maintenanceCapabilities,
+        resolveMaintenance: () => Effect.succeed(MAINTENANCE_CAPABILITIES),
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
@@ -133,6 +125,25 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
             }),
         ),
       );
+      const snapshotForCwd = (workspaceCwd: string) =>
+        !effectiveConfig.enabled
+          ? snapshot.getSnapshot
+          : Effect.all([
+              snapshot.getSnapshot,
+              discoverDevinSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.provideService(Path.Path, path),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderDriverError({
+                      driver: DRIVER_KIND,
+                      instanceId,
+                      detail: `Failed to discover Devin skills for '${workspaceCwd}'`,
+                      cause,
+                    }),
+                ),
+              ),
+            ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
 
       return {
         instanceId,
@@ -142,6 +153,7 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
+        snapshotForCwd,
         adapter,
         textGeneration,
       } satisfies ProviderInstance;
