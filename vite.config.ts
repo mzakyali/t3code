@@ -1,6 +1,28 @@
 import "vite-plus/test/config";
 import { defineConfig } from "vite-plus";
+import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+
+const repoRoot = NodeURL.fileURLToPath(new URL(".", import.meta.url));
+
+// Mirrors fmt.ignorePatterns below, matched against repo-relative staged paths.
+// `vp staged` chunks the raw staged list and runs one `vp fmt` per ~4k of argv,
+// all chunks concurrently — a merge that stages thousands of vendored .repos
+// files fans out into dozens of simultaneous formatter spawns and stalls on
+// Windows. These paths can never produce formatted output, so filter them out
+// before building the command line instead of paying a spawn per chunk.
+const stagedFmtIgnores = [
+  /^\.repos\//,
+  /(?:^|\/)\.alchemy(?:\/|$)/,
+  /(?:^|\/)(?:dist|dist-electron|node_modules)\//,
+  /(?:^|\/)pnpm-lock\.yaml$/,
+  /\.tsbuildinfo$/,
+  /(?:^|\/)routeTree\.gen\.ts$/,
+  /^apps\/mobile\/android\//,
+  /^apps\/mobile\/ios\//,
+  /^apps\/mobile\/uniwind-types\.d\.ts$/,
+  /(?:^|\/)[^/]*\.icon\//,
+];
 
 export default defineConfig({
   resolve: {
@@ -27,7 +49,19 @@ export default defineConfig({
   },
   staged: {
     // Formatter only for now — no lint or typecheck on commit.
-    "*": "vp fmt --no-error-on-unmatched-pattern",
+    // Function task so the file list can be filtered before it reaches the
+    // command line; returned strings are spawned without lint-staged appending
+    // the staged paths again.
+    "*": (files) => {
+      const targets = files.filter((file) => {
+        const rel = NodePath.relative(repoRoot, file).split(NodePath.sep).join("/");
+        return !stagedFmtIgnores.some((pattern) => pattern.test(rel));
+      });
+      if (targets.length === 0) return [];
+      return `vp fmt --no-error-on-unmatched-pattern ${targets
+        .map((file) => `"${file.split(NodePath.sep).join("/")}"`)
+        .join(" ")}`;
+    },
   },
   fmt: {
     ignorePatterns: [
