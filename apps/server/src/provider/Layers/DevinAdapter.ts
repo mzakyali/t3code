@@ -76,6 +76,10 @@ import {
   normalizeDevinResourceContent,
 } from "../acp/DevinResourceSupport.ts";
 import {
+  DEVIN_MCP_SERVER_NAME,
+  installDevinWorkspaceMcpServer,
+} from "../Drivers/DevinMcpConfig.ts";
+import {
   applyDevinAcpModelSelection,
   inferDevinContextWindowTokens,
   makeDevinAcpRuntime,
@@ -954,6 +958,34 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           ? yield* options.resolveSettings
           : devinSettings;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+
+        // `devin acp` ignores session/new mcpServers (it advertises
+        // mcpCapabilities {http:false, sse:false}) and merges the
+        // workspace-local .devin/mcp_config.local.json at process start
+        // instead, so the per-thread T3 server is installed there before
+        // spawn and restored when the session scope closes. The toolset is
+        // optional — a failed install warns and leaves the session without
+        // it rather than blocking the start.
+        if (mcpSession) {
+          yield* installDevinWorkspaceMcpServer({
+            cwd: input.cwd,
+            scope: sessionScope,
+            server: {
+              name: DEVIN_MCP_SERVER_NAME,
+              url: mcpSession.endpoint,
+              authorizationHeader: mcpSession.authorizationHeader,
+            },
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.catch((cause) =>
+              Effect.logWarning(
+                "Could not install the T3 MCP server into the Devin workspace config; the session will run without it.",
+                { cause },
+              ),
+            ),
+          );
+        }
 
         const acp = yield* makeDevinAcpRuntime({
           devinSettings: effectiveDevinSettings,

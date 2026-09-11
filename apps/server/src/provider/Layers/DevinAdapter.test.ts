@@ -571,6 +571,9 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-mcp-")),
       );
       const requestLogPath = NodePath.join(requestLogDir, "requests.log");
+      const workspace = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-mcp-ws-")),
+      );
       const wrapperPath = yield* makeMockDevinWrapper({
         T3_ACP_REQUEST_LOG_PATH: requestLogPath,
       });
@@ -590,11 +593,12 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         }),
       );
 
+      const localMcpConfigPath = NodePath.join(workspace, ".devin", "mcp_config.local.json");
       yield* Effect.gen(function* () {
         yield* adapter.startSession({
           threadId,
           provider: ProviderDriverKind.make("devin"),
-          cwd: process.cwd(),
+          cwd: workspace,
           runtimeMode: "full-access",
           modelSelection: devinModelSelection("default"),
         });
@@ -605,7 +609,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
           .filter((line) => line.trim().length > 0)
           .map((line): { method?: string; params?: unknown } | undefined => {
             try {
-              return JSON.parse(line) as { method?: string; params?: unknown };
+              return JSON.parse(line) as { method?: string; params: unknown };
             } catch {
               return undefined;
             }
@@ -625,11 +629,34 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
             headers: [{ name: "Authorization", value: authorizationHeader }],
           },
         ]);
+
+        // `devin acp` ignores session/new mcpServers; the workspace-local
+        // config file is what the real CLI merges at process start.
+        const localConfig = yield* decodeUnknownJson(
+          yield* Effect.promise(() => NodeFSP.readFile(localMcpConfigPath, "utf8")),
+        ).pipe(Effect.orDie);
+        assert.deepEqual(
+          (localConfig as { mcpServers?: Record<string, unknown> }).mcpServers?.["t3-code"],
+          {
+            url: endpoint,
+            transport: "http",
+            headers: { Authorization: authorizationHeader },
+          },
+        );
       }).pipe(
         Effect.ensuring(
           Effect.gen(function* () {
             yield* adapter.stopSession(threadId).pipe(Effect.ignore);
             yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+            // The adapter created the file, so stopping the session removes
+            // it rather than leaving a revoked token behind.
+            const remaining = yield* Effect.promise(() =>
+              NodeFSP.readFile(localMcpConfigPath, "utf8").then(
+                (contents) => contents,
+                () => undefined,
+              ),
+            );
+            assert.isUndefined(remaining);
           }),
         ),
       );
