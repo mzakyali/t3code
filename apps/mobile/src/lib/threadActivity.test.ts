@@ -289,6 +289,7 @@ function makeThread(
     interactionMode: "default",
     branch: null,
     worktreePath: null,
+    pullRequests: [],
     latestTurn: null,
     createdAt: "2026-04-01T00:00:00.000Z",
     updatedAt: "2026-04-01T00:00:00.000Z",
@@ -332,7 +333,10 @@ describe("buildThreadFeed", () => {
           {
             id: "user-input-requested",
             icon: "message",
-            workEntry: { sourceActivityKind: "user-input.requested" },
+            workEntry: {
+              sourceActivityKind: "user-input.answer-submitted",
+              questionAnswer: { requestId: "req-user-input" },
+            },
           },
         ],
       },
