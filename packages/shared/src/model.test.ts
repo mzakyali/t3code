@@ -4,6 +4,7 @@ import { ProviderDriverKind, ProviderInstanceId, type ModelCapabilities } from "
 import {
   applyClaudePromptEffortPrefix,
   buildExplicitProviderOptionSelectionsFromDescriptors,
+  buildProviderOptionSelectionsForModel,
   buildProviderOptionSelectionsFromDescriptors,
   createModelCapabilities,
   createModelSelection,
@@ -17,6 +18,8 @@ import {
   getProviderOptionStringSelectionValue,
   normalizeCustomModelSlug,
   normalizeModelSlug,
+  normalizeProviderOptionSelections,
+  PROVIDER_OPTION_VARIANT_SELECTION_ID,
 } from "./model.ts";
 
 const codexCaps: ModelCapabilities = createModelCapabilities({
@@ -165,6 +168,151 @@ describe("descriptor helpers", () => {
     ).toBeUndefined();
     expect(getModelSelectionStringOptionValue(selection, "reasoningEffort")).toBe("high");
     expect(getModelSelectionBooleanOptionValue(selection, "fastMode")).toBe(true);
+  });
+});
+
+describe("variant-constrained options", () => {
+  const fusionCaps = createModelCapabilities({
+    optionDescriptors: [
+      {
+        id: "fusionLead",
+        label: "Lead",
+        type: "select",
+        options: [
+          { id: "lead-a", label: "Lead A", isDefault: true },
+          { id: "lead-b", label: "Lead B" },
+        ],
+      },
+      {
+        id: "fusionEffort",
+        label: "Effort",
+        type: "select",
+        options: [
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+        ],
+      },
+      {
+        id: "fusionSidekick",
+        label: "Sidekick",
+        type: "select",
+        options: [
+          { id: "swe-2-medium", label: "SWE-2 Medium", isDefault: true },
+          { id: "glm-5-2", label: "GLM-5.2" },
+        ],
+      },
+      { id: "fastMode", label: "Fast Mode", type: "boolean", currentValue: false },
+    ],
+    optionVariants: [
+      {
+        model: "fusion-lead-a-medium-sidekick-swe-2-medium",
+        selections: [
+          { id: "fusionLead", value: "lead-a" },
+          { id: "fusionEffort", value: "medium" },
+          { id: "fusionSidekick", value: "swe-2-medium" },
+          { id: "fastMode", value: false },
+        ],
+      },
+      {
+        model: "fusion-lead-b-high-fast-sidekick-glm-5-2",
+        selections: [
+          { id: "fusionLead", value: "lead-b" },
+          { id: "fusionEffort", value: "high" },
+          { id: "fusionSidekick", value: "glm-5-2" },
+          { id: "fastMode", value: true },
+        ],
+      },
+    ],
+  });
+
+  it("filters choices and retains the exact selected variant", () => {
+    const descriptors = getProviderOptionDescriptors({ caps: fusionCaps });
+    const next = descriptors.map((descriptor) =>
+      descriptor.id === "fusionLead" && descriptor.type === "select"
+        ? { ...descriptor, currentValue: "lead-b" }
+        : descriptor,
+    );
+    const selections = buildProviderOptionSelectionsForModel({
+      caps: fusionCaps,
+      descriptors: next,
+    });
+
+    expect(selections).toEqual([
+      { id: "fusionLead", value: "lead-b" },
+      { id: "fusionEffort", value: "high" },
+      { id: "fusionSidekick", value: "glm-5-2" },
+      { id: "fastMode", value: true },
+      { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+    ]);
+  });
+
+  it("uses a deterministic valid variant for stale visible values", () => {
+    const normalized = normalizeProviderOptionSelections({
+      caps: fusionCaps,
+      selections: [
+        { id: "fusionLead", value: "missing-lead" },
+        { id: "__providerVariant", value: "fusion-no-longer-in-catalog" },
+      ],
+    });
+
+    expect(normalized?.at(-1)).toEqual({
+      id: "__providerVariant",
+      value: "fusion-lead-a-medium-sidekick-swe-2-medium",
+    });
+  });
+
+  it("keeps independent options unchanged when no variants exist", () => {
+    const descriptors = getProviderOptionDescriptors({
+      caps: codexCaps,
+      selections: [
+        { id: "reasoningEffort", value: "high" },
+        { id: "fastMode", value: true },
+      ],
+    });
+
+    expect(buildProviderOptionSelectionsForModel({ caps: codexCaps, descriptors })).toEqual(
+      buildProviderOptionSelectionsFromDescriptors(descriptors),
+    );
+    expect(
+      normalizeProviderOptionSelections({
+        caps: codexCaps,
+        selections: [
+          { id: "reasoningEffort", value: "xhigh" },
+          { id: "unrelatedProviderOption", value: "kept" },
+        ],
+      }),
+    ).toEqual([
+      { id: "reasoningEffort", value: "xhigh" },
+      { id: "unrelatedProviderOption", value: "kept" },
+    ]);
+  });
+
+  it("filters descriptor choices to compatible variants without exposing the internal id", () => {
+    const descriptors = getProviderOptionDescriptors({ caps: fusionCaps });
+    expect(
+      descriptors.some((descriptor) => descriptor.id === PROVIDER_OPTION_VARIANT_SELECTION_ID),
+    ).toBe(false);
+
+    const lead = descriptors.find((descriptor) => descriptor.id === "fusionLead");
+    if (lead?.type !== "select") throw new Error("expected a select descriptor");
+    expect(lead.options).toEqual([{ id: "lead-a", label: "Lead A", isDefault: true }]);
+    expect(lead.currentValue).toBe("lead-a");
+    expect(descriptors.find((descriptor) => descriptor.id === "fastMode")?.currentValue).toBe(
+      false,
+    );
+
+    const normalized = normalizeProviderOptionSelections({
+      caps: fusionCaps,
+      selections: [
+        { id: "unrelatedProviderOption", value: "kept" },
+        { id: "fusionLead", value: "lead-b" },
+      ],
+    });
+    expect(normalized?.at(0)).toEqual({ id: "unrelatedProviderOption", value: "kept" });
+    expect(normalized?.at(-1)).toEqual({
+      id: PROVIDER_OPTION_VARIANT_SELECTION_ID,
+      value: "fusion-lead-b-high-fast-sidekick-glm-5-2",
+    });
   });
 });
 
