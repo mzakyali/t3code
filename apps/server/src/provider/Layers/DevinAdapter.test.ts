@@ -22,6 +22,7 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { isHostWindows } from "@t3tools/shared/hostProcess";
+import { PROVIDER_OPTION_VARIANT_SELECTION_ID } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
   EnvironmentId,
@@ -1056,6 +1057,124 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
         (event) => event.type === "session.exited" && String(event.threadId) === String(threadId),
       );
       assert.lengthOf(exitedEvents, 0);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  // A Fusion pairing change keeps the same `fusion` session base, so the
+  // adapter applies it in-session via session/set_config_option instead of
+  // taking the standalone model-change restart path. The mock advertises the
+  // exact Fusion UIDs via T3_ACP_EXTRA_MODEL_VALUES so the runtime's
+  // client-side select-value validation accepts them.
+  it.effect("switches Fusion variants in the same ACP session without a restart", () =>
+    Effect.gen(function* () {
+      const FUSION_UID_A = "fusion-claude-fable-5-1-high-sidekick-swe-2-medium";
+      const FUSION_UID_B = "fusion-claude-fable-5-1-low-sidekick-swe-2-medium";
+      const requestLogDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-fusion-")),
+      );
+      const requestLogPath = NodePath.join(requestLogDir, "requests.log");
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        T3_ACP_EXTRA_MODEL_VALUES: `${FUSION_UID_A},${FUSION_UID_B}`,
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-fusion-variant-change");
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const fusionSelection = (uid: string) => ({
+        instanceId: ProviderInstanceId.make("devin"),
+        model: "fusion",
+        options: [{ id: PROVIDER_OPTION_VARIANT_SELECTION_ID, value: uid }],
+      });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: fusionSelection(FUSION_UID_A),
+      });
+
+      // First turn runs under the Fusion pairing chosen at session start.
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello with the first fusion pairing",
+        attachments: [],
+      });
+
+      // The second turn keeps the `fusion` base but selects a different
+      // pairing: same session, applied through setModel.
+      yield* adapter.sendTurn({
+        threadId,
+        input: "now with the second fusion pairing",
+        attachments: [],
+        modelSelection: fusionSelection(FUSION_UID_B),
+      });
+
+      const sessions = yield* adapter.listSessions();
+      const session = sessions.find((s) => s.threadId === threadId);
+      assert.equal(session?.status, "ready");
+      assert.equal(session?.model, "fusion");
+
+      // No standalone model-change restart transition and no session.exited.
+      const stateChanges = runtimeEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "session.state.changed" }> =>
+          event.type === "session.state.changed" && String(event.threadId) === String(threadId),
+      );
+      assert.lengthOf(
+        stateChanges.filter((e) => e.payload.reason?.includes("model change")),
+        0,
+      );
+      assert.lengthOf(
+        runtimeEvents.filter(
+          (event) => event.type === "session.exited" && String(event.threadId) === String(threadId),
+        ),
+        0,
+      );
+
+      // The request log proves the switch used the in-session config path:
+      // one session/new, no session/load, and session/set_config_option calls
+      // carrying the exact Fusion UIDs.
+      const logContents = yield* Effect.promise(() =>
+        NodeFSP.readFile(requestLogPath, "utf8").catch(() => ""),
+      );
+      const requests = logContents
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line): { method?: string; params?: unknown } | undefined => {
+          try {
+            return JSON.parse(line) as { method?: string; params?: unknown };
+          } catch {
+            return undefined;
+          }
+        })
+        .filter(
+          (value): value is { method: string; params: unknown } =>
+            value !== undefined && typeof value.method === "string",
+        );
+      assert.lengthOf(
+        requests.filter((r) => r.method === "session/new"),
+        1,
+      );
+      assert.lengthOf(
+        requests.filter((r) => r.method === "session/load"),
+        0,
+      );
+      const modelConfigValues = requests
+        .filter((r) => r.method === "session/set_config_option")
+        .map((r) => r.params as { configId?: string; value?: unknown })
+        .filter((params) => params.configId === "model")
+        .map((params) => params.value);
+      assert.deepEqual(modelConfigValues, [FUSION_UID_A, FUSION_UID_B]);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);

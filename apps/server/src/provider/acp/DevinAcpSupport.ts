@@ -1,4 +1,5 @@
 import { type DevinSettings, type ProviderOptionSelection } from "@t3tools/contracts";
+import { PROVIDER_OPTION_VARIANT_SELECTION_ID } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -91,9 +92,10 @@ export function applyDevinAcpModelSelection<E>(input: {
   readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "setModel">;
   readonly model: string | null | undefined;
   readonly selections?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  readonly fallbackModelUid?: string | null | undefined;
   readonly mapError: (context: DevinAcpModelSelectionErrorContext) => E;
 }): Effect.Effect<void, E> {
-  const model = resolveDevinModelUid(input.model, input.selections);
+  const model = resolveDevinModelUid(input.model, input.selections, input.fallbackModelUid);
   const reasoning = input.selections?.find((option) => option.id === "reasoning")?.value;
   const context = input.selections?.find((option) => option.id === "contextWindow")?.value;
   const speed = input.selections?.find((option) => option.id === "speed")?.value;
@@ -104,8 +106,12 @@ export function applyDevinAcpModelSelection<E>(input: {
     typeof context === "string" && context.trim()
       ? `${separator}${isUpper ? context.toUpperCase() : context.toLowerCase()}`
       : "";
+  // Fusion UIDs are exact pairings: a rejected variant must surface the typed
+  // error rather than retry a generic slug that would silently select another
+  // pairing. The `reasoning=none` fallback candidates only apply to standalone
+  // model families.
   const fallbackCandidates =
-    reasoning === "none" && (speed === undefined || speed === "standard")
+    base !== "fusion" && reasoning === "none" && (speed === undefined || speed === "standard")
       ? [contextSuffix.length > 0 ? `${base}${contextSuffix}` : null, base].filter(
           (candidate): candidate is string => candidate !== null && candidate !== model,
         )
@@ -144,6 +150,9 @@ export function applyDevinAcpModelSelection<E>(input: {
 export function resolveDevinAcpBaseModelId(model: string | null | undefined): string {
   const trimmed = model?.trim();
   if (!trimmed) return "adaptive";
+  // Every concrete `fusion-*` UID shares the `fusion` session base, so a
+  // pairing change is a config-option tweak rather than a model swap.
+  if (trimmed === "fusion" || trimmed.startsWith("fusion-")) return "fusion";
   return devinModelGroupKey(parseDevinModelUid(trimmed));
 }
 
@@ -160,8 +169,27 @@ export function resolveDevinAcpBaseModelId(model: string | null | undefined): st
 export function resolveDevinModelUid(
   model: string | null | undefined,
   options?: ReadonlyArray<ProviderOptionSelection> | null,
+  fallbackModelUid?: string | null,
 ): string {
-  const groupSlug = resolveDevinAcpBaseModelId(model);
+  const base = resolveDevinAcpBaseModelId(model);
+  // Fusion UIDs name an exact lead/sidekick pairing and never go through the
+  // generic reasoning/context/speed recombination below. Precedence: the
+  // internal `__providerVariant` selection, then a concrete `fusion-*` model
+  // slug, then the session's active Fusion UID (an active client may omit the
+  // variant), then the bare family slug.
+  if (base === "fusion") {
+    const internal = options?.find(
+      (option) =>
+        option.id === PROVIDER_OPTION_VARIANT_SELECTION_ID && typeof option.value === "string",
+    )?.value;
+    if (typeof internal === "string" && /^fusion-.+/u.test(internal.trim())) {
+      return internal.trim();
+    }
+    if (model?.trim().startsWith("fusion-")) return model.trim();
+    if (fallbackModelUid?.trim().startsWith("fusion-")) return fallbackModelUid.trim();
+    return "fusion";
+  }
+  const groupSlug = base;
   const reasoning = options?.find((option) => option.id === "reasoning")?.value;
   if (typeof reasoning !== "string" || !reasoning.trim()) {
     return groupSlug;
@@ -173,13 +201,13 @@ export function resolveDevinModelUid(
   // The group slug is `base + sep + speed` (or just base). Split the speed
   // tier off so the reasoning level can be inserted before it.
   const speedParts = stripTrailingSpeed(groupSlug);
-  const base = speedParts?.base ?? groupSlug;
+  const modelBase = speedParts?.base ?? groupSlug;
   const selectedSpeed = options?.find((option) => option.id === "speed")?.value;
   const speed =
     typeof selectedSpeed === "string" && selectedSpeed !== "standard"
       ? selectedSpeed
       : speedParts?.speed;
-  const isUpper = base.includes("_") && /[A-Z]/.test(base);
+  const isUpper = modelBase.includes("_") && /[A-Z]/.test(modelBase);
   const sep = isUpper ? "_" : "-";
   const reasoningSuffix = isUpper ? reasoning.toUpperCase() : reasoning;
   const speedSuffix = speed ? (isUpper ? `_${speed.toUpperCase()}` : `-${speed}`) : "";
@@ -188,7 +216,7 @@ export function resolveDevinModelUid(
   // appends only the context suffix for 1M variants. The reasoning level is
   // encoded for None/Max, while High is the family default (`glm-5-2`).
   // It is never `glm-5-2-high-200k` (or another `-200k` UID).
-  const isGlm52 = base.toLowerCase() === "glm-5-2";
+  const isGlm52 = modelBase.toLowerCase() === "glm-5-2";
   if (isGlm52 && (reasoning ?? "").toLowerCase() === "high") {
     return context === "1m" ? "glm-5-2-1m" : "glm-5-2";
   }
@@ -200,5 +228,5 @@ export function resolveDevinModelUid(
     typeof context === "string" && context.trim()
       ? `${sep}${isUpper ? context.toUpperCase() : context.toLowerCase()}`
       : "";
-  return `${base}${sep}${reasoningSuffix}${speedSuffix}${contextSuffix}`;
+  return `${modelBase}${sep}${reasoningSuffix}${speedSuffix}${contextSuffix}`;
 }

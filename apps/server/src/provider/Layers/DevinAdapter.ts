@@ -514,6 +514,7 @@ function applyRequestedSessionConfiguration<E>(input: {
         readonly options?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
       }
     | undefined;
+  readonly fallbackModelUid?: string | undefined;
   readonly mapError: (context: {
     readonly cause: import("effect-acp/errors").AcpError;
     readonly method: "session/set_config_option" | "session/set_mode";
@@ -525,6 +526,7 @@ function applyRequestedSessionConfiguration<E>(input: {
         runtime: input.runtime,
         model: input.modelSelection.model,
         selections: input.modelSelection.options,
+        fallbackModelUid: input.fallbackModelUid,
         mapError: ({ cause }) =>
           input.mapError({
             cause,
@@ -1348,6 +1350,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       ctx: DevinSessionContext,
       newModel: string,
       options?: ReadonlyArray<ProviderOptionSelection> | null,
+      fallbackModelUid?: string,
     ) =>
       Effect.gen(function* () {
         const previousSessionId = parseDevinResume(ctx.session.resumeCursor)?.sessionId;
@@ -1385,11 +1388,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
         // Apply the new model to the fresh session. `newModel` is the base
         // (group) slug; the reasoning option is folded in to form the full
-        // UID Devin's backend expects.
+        // UID Devin's backend expects. For a Fusion target the caller passes
+        // the turn's resolved `fusion-*` UID so a concrete pairing survives
+        // the base-slug restart handoff.
         yield* applyDevinAcpModelSelection({
           runtime: acp,
           model: newModel,
           selections: options,
+          fallbackModelUid,
           mapError: ({ cause }) =>
             mapAcpToAdapterError(PROVIDER, ctx.threadId, "session/set_config_option", cause),
         });
@@ -1405,7 +1411,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           },
           updatedAt: yield* nowIso,
         };
-        ctx.activeModelUid = resolveDevinModelUid(newModel, options);
+        ctx.activeModelUid = resolveDevinModelUid(newModel, options, fallbackModelUid);
 
         const nf = yield* startNotificationFiber(ctx);
         ctx.notificationFiber = nf;
@@ -1506,11 +1512,17 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 : undefined;
             const model = turnModelSelection?.model ?? ctx.session.model;
             const resolvedModel = resolveDevinAcpBaseModelId(model);
-            const resolvedModelUid = resolveDevinModelUid(model, turnModelSelection?.options);
+            // An active Fusion session retains its concrete `fusion-*` UID when
+            // the client selects the bare `fusion` family without a variant.
+            const resolvedModelUid = resolveDevinModelUid(
+              model,
+              turnModelSelection?.options,
+              ctx.activeModelUid,
+            );
 
             // If the base model changed on an existing session, restart the
             // ACP session internally. The visible T3 thread stays the same.
-            // A reasoning-only change (same base) is applied below as a
+            // A same-family option change (same base) is applied below as a
             // config-option tweak without a restart.
             const previousModel = resolveDevinAcpBaseModelId(ctx.session.model);
             if (
@@ -1518,7 +1530,12 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               resolvedModel !== previousModel &&
               ctx.session.model !== undefined
             ) {
-              yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
+              yield* restartForModelChange(
+                ctx,
+                resolvedModel,
+                turnModelSelection?.options,
+                resolvedModelUid,
+              );
             }
 
             yield* applyRequestedSessionConfiguration({
@@ -1532,6 +1549,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                       model,
                       options: turnModelSelection?.options,
                     },
+              fallbackModelUid: ctx.activeModelUid,
               mapError: ({ cause, method }) =>
                 mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
             });

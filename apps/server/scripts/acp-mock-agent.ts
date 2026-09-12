@@ -58,6 +58,14 @@ const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+// Extra model values (comma-separated) appended to the advertised model
+// select options so tests can drive exact model UIDs (e.g. Devin Fusion
+// pairings) through session/set_config_option validation.
+const extraModelOptions = (process.env.T3_ACP_EXTRA_MODEL_VALUES ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter((value) => value.length > 0)
+  .map((value) => ({ value, name: value }));
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -162,6 +170,7 @@ function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
           { value: "composer-2", name: "Composer 2" },
           { value: "gpt-5.4", name: "GPT-5.4" },
           { value: "claude-opus-4-6", name: "Opus 4.6" },
+          ...extraModelOptions,
         ],
       },
     ];
@@ -262,6 +271,7 @@ function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
         { value: "composer-2", name: "Composer 2" },
         { value: "composer-2[fast=true]", name: "Composer 2 Fast" },
         { value: "gpt-5.3-codex[reasoning=medium,fast=false]", name: "Codex 5.3" },
+        ...extraModelOptions,
       ],
     },
   ];
