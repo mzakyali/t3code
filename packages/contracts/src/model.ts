@@ -52,6 +52,12 @@ export const ProviderOptionSelection = Schema.Struct({
 });
 export type ProviderOptionSelection = typeof ProviderOptionSelection.Type;
 
+export const ProviderOptionVariant = Schema.Struct({
+  model: TrimmedNonEmptyString,
+  selections: Schema.Array(ProviderOptionSelection),
+});
+export type ProviderOptionVariant = typeof ProviderOptionVariant.Type;
+
 /**
  * Legacy on-disk shape for provider option selections, kept readable by the
  * decoder so we can tolerate stored data written before the v3 array shape.
@@ -124,6 +130,7 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
+  optionVariants: Schema.optional(Schema.Array(ProviderOptionVariant)),
   /**
    * Per-model input modalities. All default to `true` when absent so providers
    * that do not populate them keep their existing attachment behavior. Text is
