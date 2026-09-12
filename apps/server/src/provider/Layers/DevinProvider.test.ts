@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   buildDevinModelsFromPayload,
   inferDevinContextWindowTokens,
+  parseDevinFusionModelUid,
   parseDevinHumanModelList,
   parseDevinModelUid,
 } from "./DevinProvider.ts";
@@ -360,5 +361,220 @@ describe("parseDevinModelUid", () => {
       reasoning: undefined,
       speed: undefined,
     });
+  });
+});
+
+describe("parseDevinFusionModelUid", () => {
+  it("parses lead, effort, sidekick variant, and standard mode", () => {
+    expect(parseDevinFusionModelUid("fusion-claude-fable-5-1-high-sidekick-swe-2-medium")).toEqual({
+      leadModel: "claude-fable-5-1",
+      leadEffort: "high",
+      sidekick: "swe-2-medium",
+      fastMode: false,
+    });
+  });
+
+  it("parses Fast Mode from the lead fast marker and sidekick priority marker", () => {
+    expect(
+      parseDevinFusionModelUid("fusion-gpt-5-6-sol-high-fast-sidekick-swe-2-medium")?.fastMode,
+    ).toBe(true);
+    expect(
+      parseDevinFusionModelUid(
+        "fusion-claude-fable-5-1-medium-fast-sidekick-gpt-5-6-luna-high-priority",
+      ),
+    ).toEqual({
+      leadModel: "claude-fable-5-1",
+      leadEffort: "medium",
+      sidekick: "gpt-5-6-luna-high",
+      fastMode: true,
+    });
+  });
+
+  it("rejects UIDs outside the Fusion grammar", () => {
+    expect(parseDevinFusionModelUid("claude-opus-5-medium")).toBeNull();
+    expect(parseDevinFusionModelUid("fusion-claude-fable-5-1")).toBeNull();
+    expect(parseDevinFusionModelUid("fusion-claude-fable-5-1-sidekick-swe-2-medium")).toBeNull();
+    expect(
+      parseDevinFusionModelUid("fusion-claude-fable-5-1-ultra-sidekick-swe-2-medium"),
+    ).toBeNull();
+    expect(parseDevinFusionModelUid("fusion-claude-fable-5-1-high-sidekick-")).toBeNull();
+    expect(parseDevinFusionModelUid("fusion--sidekick-swe-2-medium")).toBeNull();
+  });
+});
+
+describe("Devin Fusion catalog", () => {
+  const fusionFamily = {
+    family_label: "Fusion",
+    family_uid: "fusion",
+    variants: [
+      {
+        model_uid: "fusion-claude-fable-5-1-high-sidekick-swe-2-medium",
+        label: "Fable 5.1 High + SWE-2 Medium",
+      },
+      {
+        model_uid: "fusion-gpt-5-6-sol-high-fast-sidekick-swe-2-medium",
+        label: "GPT Sol High Fast + SWE-2 Medium",
+      },
+    ],
+  };
+
+  it("emits one Fusion model with exact valid variants", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [fusionFamily],
+    });
+
+    expect(models).toHaveLength(1);
+    expect(models[0]?.slug).toBe("fusion");
+    expect(models[0]?.capabilities?.optionVariants).toHaveLength(2);
+    expect(models[0]?.capabilities?.optionDescriptors?.map((descriptor) => descriptor.id)).toEqual([
+      "fusionLead",
+      "fusionEffort",
+      "fusionSidekick",
+      "fastMode",
+    ]);
+  });
+
+  it("emits Fusion descriptors and variant selections keyed by exact UID", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [fusionFamily],
+    });
+
+    const fusion = models[0]!;
+    expect(fusion.name).toBe("Fusion");
+    expect(fusion.subProvider).toBe("Fusion");
+    expect(fusion.capabilities?.inputAudio).toBe(false);
+
+    const descriptors = fusion.capabilities?.optionDescriptors ?? [];
+    expect(descriptors.map((descriptor) => descriptor.type)).toEqual([
+      "select",
+      "select",
+      "select",
+      "boolean",
+    ]);
+    expect(descriptors.some((descriptor) => descriptor.id === "reasoning")).toBe(false);
+    expect(descriptors.some((descriptor) => descriptor.id === "speed")).toBe(false);
+
+    expect(fusion.capabilities?.optionVariants).toEqual([
+      {
+        model: "fusion-claude-fable-5-1-high-sidekick-swe-2-medium",
+        selections: [
+          { id: "fusionLead", value: "claude-fable-5-1" },
+          { id: "fusionEffort", value: "high" },
+          { id: "fusionSidekick", value: "swe-2-medium" },
+          { id: "fastMode", value: false },
+        ],
+      },
+      {
+        model: "fusion-gpt-5-6-sol-high-fast-sidekick-swe-2-medium",
+        selections: [
+          { id: "fusionLead", value: "gpt-5-6-sol" },
+          { id: "fusionEffort", value: "high" },
+          { id: "fusionSidekick", value: "swe-2-medium" },
+          { id: "fastMode", value: true },
+        ],
+      },
+    ]);
+  });
+
+  it("marks the first catalog row's values as the descriptor defaults", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [fusionFamily],
+    });
+
+    const descriptors = models[0]?.capabilities?.optionDescriptors ?? [];
+    const defaultFor = (id: string) => {
+      const descriptor = descriptors.find((candidate) => candidate.id === id);
+      if (descriptor?.type === "boolean") return descriptor.currentValue;
+      if (descriptor?.type === "select") {
+        return descriptor.options.find((option) => option.isDefault)?.id;
+      }
+      return undefined;
+    };
+    expect(defaultFor("fusionLead")).toBe("claude-fable-5-1");
+    expect(defaultFor("fusionEffort")).toBe("high");
+    expect(defaultFor("fusionSidekick")).toBe("swe-2-medium");
+    expect(defaultFor("fastMode")).toBe(false);
+  });
+
+  it("skips malformed Fusion records without dropping valid pairings", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Fusion",
+          family_uid: "fusion",
+          variants: [
+            {
+              model_uid: "fusion-claude-fable-5-1-high-sidekick-swe-2-medium",
+              label: "Fable 5.1 High + SWE-2 Medium",
+            },
+            {
+              model_uid: "fusion-claude-fable-5-1-ultra-sidekick-swe-2-medium",
+              label: "Fable 5.1 Ultra + SWE-2 Medium",
+            },
+            { model_uid: "fusion-missing-boundary", label: "Broken" },
+            { model_uid: "claude-opus-5-medium", label: "Not a Fusion UID" },
+            {
+              model_uid: "fusion-claude-fable-5-1-high-sidekick-swe-2-medium",
+              label: "Duplicate row",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(models).toHaveLength(1);
+    expect(models[0]?.slug).toBe("fusion");
+    expect(models[0]?.capabilities?.optionVariants?.map((variant) => variant.model)).toEqual([
+      "fusion-claude-fable-5-1-high-sidekick-swe-2-medium",
+    ]);
+  });
+
+  it("omits the Fusion row when every record is malformed", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Fusion",
+          family_uid: "fusion",
+          variants: [{ model_uid: "fusion-no-effort-sidekick-swe-2", label: "Broken" }],
+        },
+      ],
+    });
+
+    expect(models).toHaveLength(0);
+  });
+
+  it("keeps ordinary Devin families on the generic path alongside Fusion", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        fusionFamily,
+        {
+          family_label: "GLM-5.2",
+          family_uid: "glm-5.2",
+          variants: [
+            {
+              model_uid: "glm-5-2",
+              label: "GLM-5.2 High",
+              context_window: 200_000,
+              pricing: { inputPerMillion: 0, outputPerMillion: 0 },
+            },
+            {
+              model_uid: "glm-5-2-1m",
+              label: "GLM-5.2 High 1M",
+              context_window: 1_000_000,
+              pricing: { inputPerMillion: 0.7, outputPerMillion: 2.2 },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(models.map((model) => model.slug)).toEqual(["fusion", "glm-5-2"]);
+    const glm = models[1]!;
+    expect(glm.name).toBe("GLM-5.2");
+    expect(glm.capabilities?.optionDescriptors?.map((descriptor) => descriptor.id)).toContain(
+      "reasoning",
+    );
+    expect(glm.contextWindowTokens).toBe(1_000_000);
+    expect(glm.pricingByVariant?.["glm-5-2-1m"]?.outputPerMillion).toBe(2.2);
   });
 });

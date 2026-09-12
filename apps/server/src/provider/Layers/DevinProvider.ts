@@ -3,6 +3,8 @@ import {
   type ModelCapabilities,
   type ModelPricing,
   type ProviderOptionChoice,
+  type ProviderOptionDescriptor,
+  type ProviderOptionVariant,
   type SelectProviderOptionDescriptor,
   type ServerProviderModel,
 } from "@t3tools/contracts";
@@ -31,9 +33,11 @@ import {
  * provider registry uses this marker to prevent an older flattened snapshot
  * from being merged into the parent/family catalog. v3 invalidates snapshots
  * written by the first grouped implementation so the picker cannot retain
- * rows such as `Max 1M`, `Fast`, or `Priority` as standalone models.
+ * rows such as `Max 1M`, `Fast`, or `Priority` as standalone models. v4
+ * introduces the Fusion pairing family, whose variants are addressed by exact
+ * model_uid through `optionVariants` rather than by reasoning/speed suffixes.
  */
-export const DEVIN_MODEL_CATALOG_VERSION = "devin-model-catalog-v3";
+export const DEVIN_MODEL_CATALOG_VERSION = "devin-model-catalog-v4";
 
 const DEVIN_PRESENTATION = {
   displayName: "Devin",
@@ -244,6 +248,77 @@ export function parseDevinModelUid(uid: string): {
  */
 export function devinModelGroupKey(parsed: { base: string; speed?: string | undefined }): string {
   return parsed.base;
+}
+
+/**
+ * Fusion model UIDs encode a lead/effort/sidekick pairing rather than the
+ * ordinary reasoning/speed suffixes:
+ * `fusion-<lead>-<effort>[-fast]-sidekick-<sidekick>[-priority]`.
+ * The lead's `-fast` marker and a trailing `-priority` on the sidekick both
+ * mean Devin's Fast Mode. The remaining sidekick identifier (which may carry
+ * its own effort suffix such as `swe-2-medium`) stays intact as the sidekick
+ * choice value. A UID outside this grammar returns null so the caller can skip
+ * the catalog record instead of falling back to the generic parser.
+ */
+const FUSION_UID_PREFIX = "fusion-";
+const FUSION_SIDEKICK_BOUNDARY = "-sidekick-";
+const FUSION_LEAD_FAST_SUFFIX = "-fast";
+const FUSION_SIDEKICK_PRIORITY_SUFFIX = "-priority";
+
+function parseDevinFusionUidParts(uid: string): {
+  leadModel: string;
+  leadEffort: string;
+  leadFast: boolean;
+  sidekick: string;
+  sidekickPriority: boolean;
+  fastMode: boolean;
+} | null {
+  const trimmed = uid.trim();
+  if (!trimmed.startsWith(FUSION_UID_PREFIX)) return null;
+  const body = trimmed.slice(FUSION_UID_PREFIX.length);
+  const boundary = body.indexOf(FUSION_SIDEKICK_BOUNDARY);
+  if (boundary <= 0) return null;
+  let lead = body.slice(0, boundary);
+  let sidekick = body.slice(boundary + FUSION_SIDEKICK_BOUNDARY.length);
+
+  const leadFast = lead.endsWith(FUSION_LEAD_FAST_SUFFIX);
+  if (leadFast) lead = lead.slice(0, lead.length - FUSION_LEAD_FAST_SUFFIX.length);
+  // Fusion lead efforts reuse the generic reasoning vocabulary.
+  const effortMatch = lead.match(LOWER_REASONING_SUFFIX);
+  if (!effortMatch) return null;
+  const leadModel = lead.slice(0, lead.length - effortMatch[0].length);
+  if (leadModel.length === 0) return null;
+
+  const sidekickPriority = sidekick.endsWith(FUSION_SIDEKICK_PRIORITY_SUFFIX);
+  if (sidekickPriority) {
+    sidekick = sidekick.slice(0, sidekick.length - FUSION_SIDEKICK_PRIORITY_SUFFIX.length);
+  }
+  if (sidekick.length === 0) return null;
+
+  return {
+    leadModel,
+    leadEffort: effortMatch[1]!.toLowerCase(),
+    leadFast,
+    sidekick,
+    sidekickPriority,
+    fastMode: leadFast || sidekickPriority,
+  };
+}
+
+export function parseDevinFusionModelUid(uid: string): {
+  leadModel: string;
+  leadEffort: string;
+  sidekick: string;
+  fastMode: boolean;
+} | null {
+  const parsed = parseDevinFusionUidParts(uid);
+  if (!parsed) return null;
+  return {
+    leadModel: parsed.leadModel,
+    leadEffort: parsed.leadEffort,
+    sidekick: parsed.sidekick,
+    fastMode: parsed.fastMode,
+  };
 }
 
 /**
@@ -475,6 +550,12 @@ const DevinModelVariant = Schema.Struct({
   label: Schema.String,
   context_window: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
   contextWindow: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  // Structured flags some CLI releases attach to Fusion pairing rows. The
+  // Fusion builder prefers them over the markers baked into the model_uid.
+  fast_mode: Schema.optional(Schema.Boolean),
+  fastMode: Schema.optional(Schema.Boolean),
+  is_default: Schema.optional(Schema.Boolean),
+  isDefault: Schema.optional(Schema.Boolean),
   input_per_million: Schema.optional(Schema.Number),
   output_per_million: Schema.optional(Schema.Number),
   cached_input_per_million: Schema.optional(Schema.Number),
@@ -638,6 +719,194 @@ function runDevinCommand(
   });
 }
 
+/**
+ * The catalog lists each Fusion pairing as "<lead> <effort> [Fast] +
+ * <sidekick>". Splitting at the first "+" recovers the provider's own labels;
+ * the lead part still carries the effort (and fast marker) words, which are
+ * stripped so the picker's Lead label does not duplicate the Effort control.
+ */
+function splitFusionVariantLabel(label: string): { lead: string; sidekick: string } | undefined {
+  const plus = label.indexOf("+");
+  if (plus === -1) return undefined;
+  const lead = label.slice(0, plus).trim();
+  const sidekick = label.slice(plus + 1).trim();
+  return lead.length > 0 && sidekick.length > 0 ? { lead, sidekick } : undefined;
+}
+
+function stripFusionLabelSuffix(label: string, suffix: string): string {
+  if (!label.toLowerCase().endsWith(suffix.toLowerCase())) return label;
+  const stripped = label.slice(0, label.length - suffix.length).trim();
+  return stripped.length > 0 ? stripped : label;
+}
+
+function humanizeFusionChoiceId(id: string): string {
+  return id
+    .split("-")
+    .filter((word) => word.length > 0)
+    .map(capitalize)
+    .join(" ");
+}
+
+/** Slug of the single Fusion model row; also the family_uid Devin reports. */
+const DEVIN_FUSION_SLUG = "fusion";
+
+/**
+ * Builds the single `fusion` model row from the Fusion family. Every valid
+ * catalog row becomes one `ProviderOptionVariant` keyed by its exact
+ * model_uid, with `fusionLead`/`fusionEffort`/`fusionSidekick`/`fastMode`
+ * selections. Malformed rows are skipped; choices and UIDs deduplicate in
+ * catalog order and the first provider-declared (or first valid) row supplies
+ * the descriptor defaults.
+ */
+function buildDevinFusionModel(
+  family: typeof DevinModelFamily.Type,
+): ServerProviderModel | undefined {
+  const subProvider = family.family_label.trim() || "Fusion";
+  const leadChoices = new Map<string, string>();
+  const effortChoices = new Map<string, string>();
+  const sidekickChoices = new Map<string, string>();
+  const optionVariants: ProviderOptionVariant[] = [];
+  const pricingByVariant = new Map<string, ModelPricing>();
+  const seenUids = new Set<string>();
+  const declaredContexts = new Set<number>();
+  let sawMissingContext = false;
+  let defaultRow:
+    | {
+        leadModel: string;
+        leadEffort: string;
+        sidekick: string;
+        fastMode: boolean;
+        declared: boolean;
+      }
+    | undefined;
+  let defaultPricing: ModelPricing | undefined;
+
+  for (const variant of family.variants) {
+    const uid = variant.model_uid.trim();
+    const label = variant.label.trim();
+    if (!uid || !label || seenUids.has(uid)) continue;
+    const parsed = parseDevinFusionUidParts(uid);
+    if (!parsed) continue;
+    seenUids.add(uid);
+
+    const rawVariant = variant as unknown as Record<string, unknown>;
+    const structuredFast = variant.fast_mode ?? variant.fastMode;
+    const fastMode = structuredFast ?? parsed.fastMode;
+    const explicitContextTokens = parseContextWindowTokens(
+      rawVariant.context_window ?? rawVariant.contextWindow,
+    );
+    const variantPricing = pricingWithContext(
+      parseDevinVariantPricing(rawVariant),
+      explicitContextTokens,
+    );
+    if (variantPricing) pricingByVariant.set(uid, variantPricing);
+    if (explicitContextTokens !== undefined) {
+      declaredContexts.add(explicitContextTokens);
+    } else {
+      sawMissingContext = true;
+    }
+
+    const labelParts = splitFusionVariantLabel(label);
+    const leadLabel = (() => {
+      if (!labelParts) return humanizeFusionChoiceId(parsed.leadModel);
+      let text = labelParts.lead;
+      if (parsed.leadFast) text = stripFusionLabelSuffix(text, "Fast");
+      text = stripFusionLabelSuffix(
+        text,
+        DEVIN_REASONING_LABELS[parsed.leadEffort] ?? parsed.leadEffort,
+      );
+      if (parsed.leadEffort === "none") text = stripFusionLabelSuffix(text, "No Thinking");
+      return text;
+    })();
+    if (!leadChoices.has(parsed.leadModel)) leadChoices.set(parsed.leadModel, leadLabel);
+    if (!effortChoices.has(parsed.leadEffort)) {
+      effortChoices.set(
+        parsed.leadEffort,
+        DEVIN_REASONING_LABELS[parsed.leadEffort] ?? capitalize(parsed.leadEffort),
+      );
+    }
+    if (!sidekickChoices.has(parsed.sidekick)) {
+      sidekickChoices.set(
+        parsed.sidekick,
+        labelParts?.sidekick ?? humanizeFusionChoiceId(parsed.sidekick),
+      );
+    }
+
+    optionVariants.push({
+      model: uid,
+      selections: [
+        { id: "fusionLead", value: parsed.leadModel },
+        { id: "fusionEffort", value: parsed.leadEffort },
+        { id: "fusionSidekick", value: parsed.sidekick },
+        { id: "fastMode", value: fastMode },
+      ],
+    });
+
+    const declared = variant.is_default === true || variant.isDefault === true;
+    if (defaultRow === undefined || (declared && !defaultRow.declared)) {
+      defaultRow = { ...parsed, fastMode, declared };
+      defaultPricing = variantPricing;
+    }
+  }
+
+  if (optionVariants.length === 0 || !defaultRow) return undefined;
+
+  const toChoices = (choices: Map<string, string>, defaultId: string): ProviderOptionChoice[] =>
+    [...choices.entries()].map(([id, choiceLabel]) => ({
+      id,
+      label: choiceLabel,
+      ...(id === defaultId ? { isDefault: true } : {}),
+    }));
+  const optionDescriptors: ProviderOptionDescriptor[] = [
+    {
+      id: "fusionLead",
+      label: "Lead",
+      type: "select",
+      options: toChoices(leadChoices, defaultRow.leadModel),
+    },
+    {
+      id: "fusionEffort",
+      label: "Effort",
+      type: "select",
+      options: toChoices(effortChoices, defaultRow.leadEffort),
+    },
+    {
+      id: "fusionSidekick",
+      label: "Sidekick",
+      type: "select",
+      options: toChoices(sidekickChoices, defaultRow.sidekick),
+    },
+    { id: "fastMode", label: "Fast Mode", type: "boolean", currentValue: defaultRow.fastMode },
+  ];
+
+  // The context meter may only show the lead's limit, so a value is reported
+  // only when every row declares the same context or when the family shares a
+  // single known lead; a sidekick's limit is never reported as the lead's.
+  const declaredContext = declaredContexts.size === 1 ? [...declaredContexts][0] : undefined;
+  const contextWindowTokens =
+    !sawMissingContext && declaredContext !== undefined
+      ? declaredContext
+      : declaredContexts.size === 0 && leadChoices.size === 1
+        ? inferDevinContextWindowTokens([...leadChoices.keys()][0])
+        : undefined;
+
+  const pricingRecord = modelPricingRecord(pricingByVariant);
+  return {
+    slug: DEVIN_FUSION_SLUG,
+    name: subProvider,
+    subProvider,
+    isCustom: false,
+    capabilities: createModelCapabilities({
+      optionDescriptors,
+      optionVariants,
+      inputAudio: false,
+    }),
+    ...(defaultPricing ? { pricing: defaultPricing } : {}),
+    ...(pricingRecord ? { pricingByVariant: pricingRecord } : {}),
+    ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+  } satisfies ServerProviderModel;
+}
+
 export function buildDevinModelsFromPayload(
   payload: typeof DevinModelsPayload.Type,
 ): ReadonlyArray<ServerProviderModel> {
@@ -645,6 +914,15 @@ export function buildDevinModelsFromPayload(
   const models: ServerProviderModel[] = [];
 
   for (const family of payload.families) {
+    if (family.family_uid.trim().toLowerCase() === DEVIN_FUSION_SLUG) {
+      if (seen.has(DEVIN_FUSION_SLUG)) continue;
+      const fusionModel = buildDevinFusionModel(family);
+      if (fusionModel) {
+        seen.add(DEVIN_FUSION_SLUG);
+        models.push(fusionModel);
+      }
+      continue;
+    }
     const subProvider = family.family_label.trim() || family.family_uid.trim();
     const parsedFamilyVariants = family.variants
       .map((candidate) => ({
