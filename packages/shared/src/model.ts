@@ -185,11 +185,13 @@ export const PROVIDER_OPTION_VARIANT_SELECTION_ID = "__providerVariant";
 /**
  * Chooses the catalog variant that best preserves the supplied visible
  * selections. A stored `__providerVariant` wins only when every visible
- * selection still matches that row. Otherwise a supplied value pins the
- * choice only when it departs from the descriptor's catalog default and at
- * least one variant supports it, so a deliberate change beats incidental
- * matches. Ties break on total matches with previous selections, then on how
- * many catalog-declared defaults a variant keeps, then catalog order.
+ * selection still matches that row. Otherwise supplied values that diverge
+ * from the stored row pin the choice — that divergence is the newly changed
+ * control — falling back to divergence from the catalog-declared defaults
+ * when no stored row exists. A pin only counts when at least one variant
+ * supports the value, so a deliberate change beats incidental matches. Ties
+ * break on total matches with previous selections, then on how many
+ * catalog-declared defaults a variant keeps, then catalog order.
  */
 function resolveProviderOptionVariant(input: {
   readonly caps: ModelCapabilities | null | undefined;
@@ -210,16 +212,15 @@ function resolveProviderOptionVariant(input: {
   const internal = input.selections?.find(
     (selection) => selection.id === PROVIDER_OPTION_VARIANT_SELECTION_ID,
   )?.value;
-  const exact =
+  const stored =
     typeof internal === "string"
-      ? variants.find(
-          (variant) =>
-            variant.model === internal &&
-            variant.selections.every((selection) => current.get(selection.id) === selection.value),
-        )
+      ? variants.find((variant) => variant.model === internal)
       : undefined;
-  if (exact) {
-    return exact;
+  if (
+    stored &&
+    stored.selections.every((selection) => current.get(selection.id) === selection.value)
+  ) {
+    return stored;
   }
 
   const catalogDefaults = new Map(
@@ -231,9 +232,12 @@ function resolveProviderOptionVariant(input: {
       return value === undefined ? [] : [[descriptor.id, value] as const];
     }),
   );
+  const reference = stored
+    ? new Map(stored.selections.map((selection) => [selection.id, selection.value] as const))
+    : catalogDefaults;
   const pinned = [...current.entries()].filter(
     ([id, value]) =>
-      catalogDefaults.get(id) !== value &&
+      reference.get(id) !== value &&
       variants.some((variant) =>
         variant.selections.some((selection) => selection.id === id && selection.value === value),
       ),

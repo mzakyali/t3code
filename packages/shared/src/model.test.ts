@@ -314,6 +314,85 @@ describe("variant-constrained options", () => {
       value: "fusion-lead-b-high-fast-sidekick-glm-5-2",
     });
   });
+
+  it("preserves a revert to the catalog default over the stored variant", () => {
+    const normalized = normalizeProviderOptionSelections({
+      caps: fusionCaps,
+      selections: [
+        { id: "fusionLead", value: "lead-a" },
+        { id: "fusionEffort", value: "high" },
+        { id: "fusionSidekick", value: "glm-5-2" },
+        { id: "fastMode", value: true },
+        { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+      ],
+    });
+
+    expect(normalized).toEqual([
+      { id: "fusionLead", value: "lead-a" },
+      { id: "fusionEffort", value: "medium" },
+      { id: "fusionSidekick", value: "swe-2-medium" },
+      { id: "fastMode", value: false },
+      { id: "__providerVariant", value: "fusion-lead-a-medium-sidekick-swe-2-medium" },
+    ]);
+  });
+
+  it("replaces a stored variant id whose visible selections diverged", () => {
+    const normalized = normalizeProviderOptionSelections({
+      caps: fusionCaps,
+      selections: [
+        { id: "fusionLead", value: "lead-a" },
+        { id: "fusionEffort", value: "medium" },
+        { id: "fusionSidekick", value: "swe-2-medium" },
+        { id: "fastMode", value: false },
+        { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+      ],
+    });
+
+    expect(normalized?.at(-1)).toEqual({
+      id: "__providerVariant",
+      value: "fusion-lead-a-medium-sidekick-swe-2-medium",
+    });
+  });
+
+  it("retains a stored variant id whose visible selections still match", () => {
+    const normalized = normalizeProviderOptionSelections({
+      caps: fusionCaps,
+      selections: [
+        { id: "fusionLead", value: "lead-b" },
+        { id: "fusionEffort", value: "high" },
+        { id: "fusionSidekick", value: "glm-5-2" },
+        { id: "fastMode", value: true },
+        { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+      ],
+    });
+
+    expect(normalized).toEqual([
+      { id: "fusionLead", value: "lead-b" },
+      { id: "fusionEffort", value: "high" },
+      { id: "fusionSidekick", value: "glm-5-2" },
+      { id: "fastMode", value: true },
+      { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+    ]);
+  });
+
+  it("emits only explicit selections while retaining the internal variant id", () => {
+    const descriptors = getProviderOptionDescriptors({ caps: fusionCaps }).map((descriptor) =>
+      descriptor.id === "fusionLead" && descriptor.type === "select"
+        ? { ...descriptor, currentValue: "lead-b" }
+        : descriptor,
+    );
+
+    const selections = buildProviderOptionSelectionsForModel({
+      caps: fusionCaps,
+      descriptors,
+      explicitSelections: [{ id: "fusionLead", value: "lead-b" }],
+    });
+
+    expect(selections).toEqual([
+      { id: "fusionLead", value: "lead-b" },
+      { id: "__providerVariant", value: "fusion-lead-b-high-fast-sidekick-glm-5-2" },
+    ]);
+  });
 });
 
 describe("model slug normalization", () => {
