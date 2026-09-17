@@ -26,7 +26,8 @@ import {
   ComposerControlChevron,
   type ComposerControlSize,
 } from "./ComposerControl";
-import { composerFloatingLayerProps } from "./composerEventScope";
+import { useComposerMenuProps } from "./composerEventScope";
+import { shortcutLabelForCommand } from "../../keybindings";
 
 export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   /**
@@ -35,6 +36,8 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
    */
   activeInstanceId: ProviderInstanceId;
   model: string;
+  selectedModels?: ReadonlyArray<{ instanceId: ProviderInstanceId; model: string }>;
+  onToggleModel?: (instanceId: ProviderInstanceId, model: string) => void;
   lockedProvider: ProviderDriverKind | null;
   lockedContinuationGroupKey?: string | null;
   /** Instance entries rendered in the sidebar + used to resolve display name. */
@@ -50,6 +53,8 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   open?: boolean;
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
+  /** Aggregate settings can show a neutral value without claiming one provider is selected. */
+  triggerLabel?: string;
   triggerAriaLabel?: string;
   onOpenChange?: (open: boolean) => void;
   onOpenProviderSetup?: (instanceId: ProviderInstanceId) => void;
@@ -63,6 +68,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   activeModelOptions?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
   onModelOptionsChange?: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => void;
 }) {
+  const composerFloatingLayerProps = useComposerMenuProps();
   const [uncontrolledIsMenuOpen, setUncontrolledIsMenuOpen] = useState(false);
   const isMenuOpen = props.open ?? uncontrolledIsMenuOpen;
   const size = props.size ?? "sm";
@@ -164,6 +170,41 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
     setIsMenuOpen(false);
   };
 
+  const shortcutLabel = props.keybindings
+    ? shortcutLabelForCommand(props.keybindings, "modelPicker.toggle")
+    : null;
+  const selectedEntries = props.selectedModels?.map((selection) => {
+    const entry = props.instanceEntries.find(
+      (candidate) => candidate.instanceId === selection.instanceId,
+    );
+    const model = resolveModelPickerSelectedModel({
+      driverKind: entry?.driverKind,
+      model: selection.model,
+      options: props.modelOptionsByInstance.get(selection.instanceId) ?? [],
+    });
+    return {
+      ...selection,
+      entry,
+      label: model
+        ? `${getTriggerDisplayModelName(model)}${model.isUnavailable ? " (Unavailable)" : ""}`
+        : selection.model,
+    };
+  });
+  const multipleLabel = selectedEntries
+    ? selectedEntries.length === 0
+      ? "Choose models"
+      : `${selectedEntries
+          .slice(0, 2)
+          .map((selection) => selection.label)
+          .join(", ")}${selectedEntries.length > 2 ? `, ${selectedEntries.length - 2} more` : ""}`
+    : undefined;
+  const allModelNames = selectedEntries
+    ? selectedEntries.map((selection) => selection.label).join(", ") || "Choose models"
+    : undefined;
+  const triggerTooltipContent = shortcutLabel
+    ? `${props.triggerLabel ?? allModelNames ?? triggerLabel} · ${shortcutLabel}`
+    : (props.triggerLabel ?? allModelNames ?? triggerLabel);
+
   return (
     <Popover
       open={isMenuOpen}
@@ -178,7 +219,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
       <PopoverTrigger
         render={
           <ComposerControl
-            aria-label={props.triggerAriaLabel}
+            aria-label={props.triggerAriaLabel ?? allModelNames}
             variant={props.triggerVariant ?? "ghost"}
             size={size}
             data-chat-provider-model-picker="true"
@@ -194,7 +235,29 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         <span
           className={cn("flex min-w-0 flex-1 items-center", size === "xs" ? "gap-1" : "gap-1.5")}
         >
-          {activeEntry ? (
+          {selectedEntries && props.triggerLabel === undefined ? (
+            <span className="flex shrink-0 items-center -space-x-1" aria-hidden="true">
+              {selectedEntries
+                .slice(0, 3)
+                .map((selection) =>
+                  selection.entry ? (
+                    <ProviderInstanceIcon
+                      key={`${selection.instanceId}:${selection.model}`}
+                      driverKind={selection.entry.driverKind}
+                      displayName={selection.entry.displayName}
+                      accentColor={selection.entry.accentColor}
+                      className="size-4 rounded-full bg-[var(--chat-composer-glass-surface,var(--background))] ring-2 ring-[var(--chat-composer-glass-surface,var(--background))]"
+                      iconClassName="size-4"
+                    />
+                  ) : null,
+                )}
+              {selectedEntries.length > 3 ? (
+                <span className="relative z-30 flex size-4 items-center justify-center rounded-full bg-[var(--chat-composer-glass-surface,var(--background))] text-[9px] ring-2 ring-[var(--chat-composer-glass-surface,var(--background))]">
+                  +{selectedEntries.length - 3}
+                </span>
+              ) : null}
+            </span>
+          ) : activeEntry && props.triggerLabel === undefined ? (
             <ProviderInstanceIcon
               driverKind={activeEntry.driverKind}
               displayName={activeEntry.displayName}
@@ -219,11 +282,11 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
                 />
               }
             >
-              {triggerTitle}
+              {props.triggerLabel ?? multipleLabel ?? triggerTitle}
             </TooltipTrigger>
-            <TooltipPopup side="top">{triggerLabel}</TooltipPopup>
+            <TooltipPopup side="top">{triggerTooltipContent}</TooltipPopup>
           </Tooltip>
-          {selectedModel?.isUnavailable ? (
+          {selectedModel?.isUnavailable && !selectedEntries && props.triggerLabel === undefined ? (
             <Badge variant="outline" size="sm">
               Unavailable
             </Badge>
@@ -242,6 +305,14 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         <ModelPickerContent
           activeInstanceId={activeInstanceId}
           model={props.model}
+          {...(props.selectedModels !== undefined ? { selectedModels: props.selectedModels } : {})}
+          {...(props.onToggleModel
+            ? {
+                onToggleModel: (instanceId: ProviderInstanceId, model: string) => {
+                  if (!props.disabled) props.onToggleModel?.(instanceId, model);
+                },
+              }
+            : {})}
           lockedProvider={props.lockedProvider}
           lockedContinuationGroupKey={props.lockedContinuationGroupKey ?? null}
           instanceEntries={props.instanceEntries}

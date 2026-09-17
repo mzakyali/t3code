@@ -44,11 +44,16 @@ import {
 } from "effect/unstable/http";
 import { describe, expect } from "vite-plus/test";
 
+import * as Option from "effect/Option";
+
 import * as ServerConfig from "../../config.ts";
+import * as DeviceService from "../../device/DeviceService.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as McpHttpServer from "../../mcp/McpHttpServer.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
 import { makeDevinAdapter } from "../Layers/DevinAdapter.ts";
 import { checkDevinProviderStatus } from "../Layers/DevinProvider.ts";
@@ -254,14 +259,31 @@ describe.runIf(process.env.T3_DEVIN_MCP_SMOKE === "1")("Devin MCP smoke", () => 
               PreviewAutomationBroker.layer,
             ),
           );
+          // The full MCP server also registers device and pull-request
+          // toolkits; this smoke only calls preview_status, so mocks satisfy
+          // the extra services without wiring real orchestration.
+          const unusedToolkitServices = Layer.mergeAll(
+            Layer.mock(DeviceService.DeviceService)({}),
+            Layer.mock(OrchestrationEngineService)({}),
+            Layer.mock(ProjectionSnapshotQuery)({
+              getThreadShellById: () => Effect.succeed(Option.none()),
+            }),
+          );
           yield* HttpRouter.serve(
-            McpHttpServer.layer.pipe(Layer.provide(Layer.succeedContext(mcpContext))),
+            McpHttpServer.layer.pipe(
+              Layer.provide(Layer.succeedContext(mcpContext)),
+              Layer.provide(unusedToolkitServices),
+            ),
             { disableListenLog: true, disableLogger: true },
           ).pipe(Layer.build);
 
           const registry = Context.get(mcpContext, McpSessionRegistry.McpSessionRegistry);
           const broker = Context.get(mcpContext, PreviewAutomationBroker.PreviewAutomationBroker);
-          const issued = yield* registry.issue({ threadId, providerInstanceId });
+          const issued = yield* registry.issue({
+            threadId,
+            providerInstanceId,
+            capabilities: new Set(["preview"]),
+          });
           const issuedToken = issued.config.authorizationHeader.slice("Bearer ".length);
           yield* Effect.addFinalizer(() =>
             registry.revokeProviderSession(issued.config.providerSessionId).pipe(

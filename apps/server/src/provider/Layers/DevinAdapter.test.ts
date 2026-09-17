@@ -590,6 +590,7 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
           providerInstanceId: ProviderInstanceId.make("devin"),
           endpoint,
           authorizationHeader,
+          capabilities: new Set(["preview"]),
         }),
       );
 
