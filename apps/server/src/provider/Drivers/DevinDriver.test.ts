@@ -84,7 +84,7 @@ it.layer(testLayer)("DevinDriver snapshotForCwd", (it) => {
           ),
         );
         const instance = yield* createInstance("devin-unused", false).pipe(Effect.provide(noSpawn));
-        const snapshot = yield* instance.snapshotForCwd!("/workspace");
+        const snapshot = yield* instance.snapshotForCwd!(process.cwd());
 
         expect(snapshot.skills).toEqual([]);
         expect(snapshot.enabled).toBe(false);
@@ -104,7 +104,7 @@ it.layer(testLayer)("DevinDriver snapshotForCwd", (it) => {
         ]),
       });
       const instance = yield* createInstance(binaryPath, true);
-      const snapshot = yield* instance.snapshotForCwd!("/workspace");
+      const snapshot = yield* instance.snapshotForCwd!(process.cwd());
 
       expect(snapshot.skills).toHaveLength(1);
       expect(snapshot.skills[0]).toMatchObject({ name: "deploy", enabled: true });
@@ -120,7 +120,7 @@ it.layer(testLayer)("DevinDriver snapshotForCwd", (it) => {
           skillsExitCode: 3,
         });
         const instance = yield* createInstance(binaryPath, true);
-        const exit = yield* Effect.exit(instance.snapshotForCwd!("/workspace"));
+        const exit = yield* Effect.exit(instance.snapshotForCwd!(process.cwd()));
 
         expect(Exit.isFailure(exit)).toBe(true);
       }),
