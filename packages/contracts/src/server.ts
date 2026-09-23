@@ -72,7 +72,7 @@ export const ServerProviderModel = Schema.Struct({
   shortName: Schema.optional(TrimmedNonEmptyString),
   subProvider: Schema.optional(TrimmedNonEmptyString),
   aliases: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
-  badge: Schema.optional(Schema.Literal("new")),
+  badge: Schema.optional(Schema.Literals(["new", "beta"])),
   isCustom: Schema.Boolean,
   isDefault: Schema.optional(Schema.Boolean),
   isLegacy: Schema.optional(Schema.Boolean),
@@ -83,6 +83,14 @@ export const ServerProviderModel = Schema.Struct({
   pricingByVariant: Schema.optional(Schema.Record(Schema.String, ModelPricing)),
   /** Provider-advertised context size for a standalone model. */
   contextWindowTokens: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(1))),
+  /** Provider-advertised output-token limit for a standalone model. */
+  maxOutputTokens: Schema.optional(Schema.Number.check(Schema.isGreaterThanOrEqualTo(1))),
+  /**
+   * Provider-advertised qualitative cost band (e.g. "High", "Med", "Low",
+   * "Free") when the provider reports a tier instead of or alongside numeric
+   * rates. Displayed as-is; not used for usage math.
+   */
+  costTier: Schema.optional(TrimmedNonEmptyString),
 });
 export type ServerProviderModel = typeof ServerProviderModel.Type;
 
@@ -121,11 +129,28 @@ export const ServerProviderSkill = Schema.Struct({
 });
 export type ServerProviderSkill = typeof ServerProviderSkill.Type;
 
+/**
+ * A provider-reported always-on rule (Devin's `rules` surface — Windsurf,
+ * Cursor, CLAUDE.md, AGENTS.md style instruction files the agent loads
+ * automatically). Discovery metadata only; contents are not transferred.
+ */
+export const ServerProviderRule = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  /** The ecosystem the rule file belongs to (e.g. "Windsurf", "Cursor"). */
+  provider: Schema.optional(TrimmedNonEmptyString),
+  /** How the provider applies it (e.g. "always-on"). */
+  activation: Schema.optional(TrimmedNonEmptyString),
+  /** Absolute path when the provider reports one. */
+  path: Schema.optional(TrimmedNonEmptyString),
+});
+export type ServerProviderRule = typeof ServerProviderRule.Type;
+
 export const ServerProviderWorkspaceSnapshot = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   checkedAt: IsoDateTime,
   slashCommands: Schema.Array(ServerProviderSlashCommand),
   skills: Schema.Array(ServerProviderSkill),
+  rules: Schema.optionalKey(Schema.Array(ServerProviderRule)),
 });
 export type ServerProviderWorkspaceSnapshot = typeof ServerProviderWorkspaceSnapshot.Type;
 
@@ -258,6 +283,8 @@ export const ServerProvider = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
   skills: Schema.Array(ServerProviderSkill).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  /** Rules discovered for the provider's most recently probed workspace. */
+  rules: Schema.optionalKey(Schema.Array(ServerProviderRule)),
   workspaceSnapshots: Schema.optionalKey(Schema.Array(ServerProviderWorkspaceSnapshot)),
   // Absent when the driver has no notion of subscription usage.
   usageLimits: Schema.optional(ServerProviderUsageLimits),

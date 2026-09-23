@@ -1,5 +1,6 @@
 import type {
   EnvironmentId,
+  ModelCapabilities,
   ModelSelection,
   ProviderInstanceId,
   ProviderOptionDescriptor,
@@ -240,6 +241,8 @@ type ThreadSettingsSessionProps = {
   readonly selectedModel: ModelSelection | null;
   readonly onSelectModel: (option: ModelOption) => void;
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
+  /** Capabilities of the applied selection's model; pending picks use their own. */
+  readonly optionCapabilities?: ModelCapabilities | null;
   readonly onUpdateOptionSelections: (selections: ReadonlyArray<ProviderOptionSelection>) => void;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
@@ -404,7 +407,8 @@ function ThreadSettingsSessionProvider(
 
   const applyOptionChange = useCallback(
     (id: string, value: string | boolean) => {
-      const next = applyProviderOptionSelection(displayedDescriptors, { id, value });
+      const capabilities = pendingModel ? pendingModel.capabilities : props.optionCapabilities;
+      const next = applyProviderOptionSelection(displayedDescriptors, { id, value }, capabilities);
       if (!next) {
         return;
       }
@@ -417,7 +421,7 @@ function ThreadSettingsSessionProvider(
         props.onUpdateOptionSelections(next);
       }
     },
-    [displayedDescriptors, pendingModel, props.onUpdateOptionSelections],
+    [displayedDescriptors, pendingModel, props.onUpdateOptionSelections, props.optionCapabilities],
   );
 
   const toggleProvider = useCallback((providerKey: string) => {
@@ -1375,6 +1379,7 @@ export function NewTaskThreadSettingsRouteScreen() {
       selectedModel={flow.selectedModel}
       onSelectModel={(option) => flow.setSelectedModelKey(option.key, option.selection.options)}
       optionDescriptors={optionDescriptors}
+      optionCapabilities={flow.selectedModelOption?.capabilities}
       onUpdateOptionSelections={flow.setSelectedModelOptions}
       runtimeMode={flow.runtimeMode}
       onUpdateRuntimeMode={flow.setRuntimeMode}

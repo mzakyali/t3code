@@ -34,7 +34,7 @@ export type ModelEsque = {
   subProvider?: string | undefined;
   aliases?: ReadonlyArray<string> | undefined;
   isDefault?: boolean | undefined;
-  badge?: "new" | undefined;
+  badge?: "new" | "beta" | undefined;
   isLegacy?: boolean | undefined;
   isUnavailable?: boolean | undefined;
 };

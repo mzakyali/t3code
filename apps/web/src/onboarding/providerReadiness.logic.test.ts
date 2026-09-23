@@ -25,6 +25,7 @@ const readyCodex: ServerProvider = {
   models: [],
   slashCommands: [],
   skills: [],
+  rules: [],
 };
 
 describe("getOnboardingProviderState", () => {

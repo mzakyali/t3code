@@ -3,6 +3,7 @@ import {
   type ProviderInstanceId,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
+  PROVIDER_VARIANT_SELECTION_ID,
   type ScopedThreadRef,
   type ServerProviderModel,
 } from "@t3tools/contracts";
@@ -60,22 +61,24 @@ function savedOptionLabel(id: string): string {
 export function buildUnavailableModelOptionDescriptors(
   selections: ProviderOptions | null | undefined,
 ): ReadonlyArray<ProviderOptionDescriptor> {
-  return (selections ?? []).map((selection) =>
-    typeof selection.value === "boolean"
-      ? {
-          id: selection.id,
-          label: savedOptionLabel(selection.id),
-          type: "boolean" as const,
-          currentValue: selection.value,
-        }
-      : {
-          id: selection.id,
-          label: savedOptionLabel(selection.id),
-          type: "select" as const,
-          options: [{ id: selection.value, label: selection.value }],
-          currentValue: selection.value,
-        },
-  );
+  return (selections ?? [])
+    .filter((selection) => selection.id !== PROVIDER_VARIANT_SELECTION_ID)
+    .map((selection) =>
+      typeof selection.value === "boolean"
+        ? {
+            id: selection.id,
+            label: savedOptionLabel(selection.id),
+            type: "boolean" as const,
+            currentValue: selection.value,
+          }
+        : {
+            id: selection.id,
+            label: savedOptionLabel(selection.id),
+            type: "select" as const,
+            options: [{ id: selection.value, label: selection.value }],
+            currentValue: selection.value,
+          },
+    );
 }
 
 type TraitsPersistence =
@@ -311,6 +314,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     [instanceId, model, persistence, provider, setProviderModelOptions],
   );
   const {
+    caps,
     descriptors,
     selectDescriptors,
     booleanDescriptors,
@@ -328,8 +332,16 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     allowPromptInjectedEffort,
     planModeEnabled,
   });
-  const updateDescriptors = (nextDescriptors: ReadonlyArray<ProviderOptionDescriptor>) => {
-    updateModelOptions(buildProviderOptionSelectionsFromDescriptors(nextDescriptors));
+  const updateDescriptors = (
+    nextDescriptors: ReadonlyArray<ProviderOptionDescriptor>,
+    changedDescriptorId?: string,
+  ) => {
+    updateModelOptions(
+      buildProviderOptionSelectionsFromDescriptors(nextDescriptors, {
+        caps,
+        ...(changedDescriptorId ? { pinnedIds: [changedDescriptorId] } : {}),
+      }),
+    );
   };
 
   const handleSelectChange = (
@@ -350,7 +362,10 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
       const stripped = prompt.replace(/^Ultrathink:\s*/i, "");
       onPromptChange(stripped);
     }
-    updateDescriptors(replaceDescriptorCurrentValue(descriptors, descriptor.id, value));
+    updateDescriptors(
+      replaceDescriptorCurrentValue(descriptors, descriptor.id, value),
+      descriptor.id,
+    );
   };
 
   if (!hasAnyControls) {
@@ -454,6 +469,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
                 onValueChange={(value) => {
                   updateDescriptors(
                     replaceDescriptorCurrentValue(descriptors, descriptor.id, value === "on"),
+                    descriptor.id,
                   );
                 }}
               >

@@ -24,6 +24,7 @@ function providerEntry(instanceId: string, driver: string) {
     models: [],
     slashCommands: [],
     skills: [],
+    rules: [],
   };
   return deriveProviderInstanceEntries([provider])[0]!;
 }

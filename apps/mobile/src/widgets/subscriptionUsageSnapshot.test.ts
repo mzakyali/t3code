@@ -39,6 +39,7 @@ function provider(overrides: Partial<ServerProvider> = {}): ServerProvider {
     skills: [],
     usageLimits: limits,
     ...overrides,
+    rules: overrides.rules ?? [],
   };
 }
 function presentations(providers: readonly ServerProvider[] = [provider()]) {

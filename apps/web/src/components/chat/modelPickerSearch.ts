@@ -12,6 +12,8 @@ type ModelPickerSearchableModel = {
   name: string;
   shortName?: string;
   subProvider?: string;
+  /** Provider-declared alternate names (e.g. Devin's `/model` aliases). */
+  aliases?: ReadonlyArray<string>;
   isFavorite?: boolean;
 };
 
@@ -22,6 +24,7 @@ function getModelPickerSearchFields(model: ModelPickerSearchableModel): string[]
     normalizeSearchQuery(model.name),
     ...(model.shortName ? [normalizeSearchQuery(model.shortName)] : []),
     ...(model.subProvider ? [normalizeSearchQuery(model.subProvider)] : []),
+    ...(model.aliases ?? []).map((alias) => normalizeSearchQuery(alias)),
     normalizeSearchQuery(model.driverKind),
     normalizeSearchQuery(model.providerDisplayName),
     buildModelPickerSearchText(model),
@@ -46,7 +49,14 @@ function scoreModelPickerSearchToken(
 
 export function buildModelPickerSearchText(model: ModelPickerSearchableModel): string {
   return normalizeSearchQuery(
-    [model.name, model.shortName, model.subProvider, model.driverKind, model.providerDisplayName]
+    [
+      model.name,
+      model.shortName,
+      model.subProvider,
+      ...(model.aliases ?? []),
+      model.driverKind,
+      model.providerDisplayName,
+    ]
       .filter((value): value is string => typeof value === "string" && value.length > 0)
       .join(" "),
   );

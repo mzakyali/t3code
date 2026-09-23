@@ -39,13 +39,17 @@ const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 const makeSkillsBinary = Effect.fn("makeDevinSkillsBinary")(function* (options: {
   readonly skillsJson: string;
   readonly skillsExitCode?: number;
+  readonly rulesOutput?: string;
+  readonly rulesExitCode?: number;
 }) {
   const dir = yield* Effect.promise(() =>
     NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-driver-skills-")),
   );
   const binaryPath = NodePath.join(dir, "fake-devin.sh");
   const skillsJsonPath = NodePath.join(dir, "skills.json");
+  const rulesPath = NodePath.join(dir, "rules.txt");
   yield* Effect.promise(() => NodeFSP.writeFile(skillsJsonPath, options.skillsJson, "utf8"));
+  yield* Effect.promise(() => NodeFSP.writeFile(rulesPath, options.rulesOutput ?? "", "utf8"));
   const script = `#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "devin 1.0.0"
@@ -54,6 +58,10 @@ fi
 if [ "$1" = "skills" ]; then
   cat '${skillsJsonPath}'
   exit ${options.skillsExitCode ?? 0}
+fi
+if [ "$1" = "rules" ]; then
+  cat '${rulesPath}'
+  exit ${options.rulesExitCode ?? 0}
 fi
 echo "unexpected command: $*" >&2
 exit 1
@@ -109,6 +117,41 @@ it.layer(testLayer)("DevinDriver snapshotForCwd", (it) => {
       expect(snapshot.skills).toHaveLength(1);
       expect(snapshot.skills[0]).toMatchObject({ name: "deploy", enabled: true });
     }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "includes discovered rules alongside skills in the workspace snapshot",
+    () =>
+      Effect.gen(function* () {
+        const binaryPath = yield* makeSkillsBinary({
+          skillsJson: "[]",
+          rulesOutput:
+            "Available Rules\n\n  global_rules [Windsurf] always-on\n  AGENTS [Standard] always-on\n",
+        });
+        const instance = yield* createInstance(binaryPath, true);
+        const snapshot = yield* instance.snapshotForCwd!(process.cwd());
+
+        expect(snapshot.rules).toEqual([
+          { name: "AGENTS", provider: "Standard", activation: "always-on" },
+          { name: "global_rules", provider: "Windsurf", activation: "always-on" },
+        ]);
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "degrades to an empty rules list when the CLI does not support rules",
+    () =>
+      Effect.gen(function* () {
+        const binaryPath = yield* makeSkillsBinary({
+          skillsJson: encodeUnknownJson([{ name: "deploy", base_dir: "/tmp/skills/deploy" }]),
+          rulesExitCode: 2,
+        });
+        const instance = yield* createInstance(binaryPath, true);
+        const snapshot = yield* instance.snapshotForCwd!(process.cwd());
+
+        expect(snapshot.rules).toEqual([]);
+        expect(snapshot.skills).toHaveLength(1);
+      }),
   );
 
   it.effect.skipIf(windowsHost)(

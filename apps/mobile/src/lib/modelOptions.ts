@@ -52,6 +52,7 @@ function normalizeSelectionOptions(
       selections: selection.options,
     }),
     selection.options,
+    capabilities,
   );
   return options
     ? { ...selection, options }

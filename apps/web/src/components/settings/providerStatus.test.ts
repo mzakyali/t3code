@@ -15,6 +15,7 @@ const provider: ServerProvider = {
   models: [],
   slashCommands: [],
   skills: [],
+  rules: [],
 };
 
 describe("getProviderSummary", () => {

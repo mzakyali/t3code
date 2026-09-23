@@ -97,6 +97,7 @@ describe("deriveProviderModelsForDisplay", () => {
       models: [],
       slashCommands: [],
       skills: [],
+      rules: [],
     };
 
     const markup = renderToStaticMarkup(
@@ -138,6 +139,7 @@ describe("deriveProviderModelsForDisplay", () => {
       models: [],
       slashCommands: [],
       skills: [],
+      rules: [],
       message,
     };
     const props = {

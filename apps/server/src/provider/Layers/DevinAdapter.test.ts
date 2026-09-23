@@ -24,6 +24,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { isHostWindows } from "@t3tools/shared/hostProcess";
 import {
   ApprovalRequestId,
+  DevinSettings,
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -38,13 +39,7 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { makeDevinAdapter, makeDevinPromptLease, settleDevinPromptLease } from "./DevinAdapter.ts";
 import { ProviderAdapterRequestError, ProviderAdapterValidationError } from "../Errors.ts";
 
-const decodeDevinSettings = Schema.decodeSync(
-  Schema.Struct({
-    enabled: Schema.Boolean,
-    binaryPath: Schema.String,
-    customModels: Schema.Array(Schema.String),
-  }),
-);
+const decodeDevinSettings = Schema.decodeSync(DevinSettings);
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");

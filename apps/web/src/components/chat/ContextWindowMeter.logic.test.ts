@@ -28,6 +28,7 @@ function claudeProvider(input: {
     models: [],
     slashCommands: [{ name: "compact", description: "" }],
     skills: [],
+    rules: [],
   };
 }
 

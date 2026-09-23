@@ -1,4 +1,8 @@
-import { type DevinSettings, type ProviderOptionSelection } from "@t3tools/contracts";
+import {
+  type DevinSettings,
+  PROVIDER_VARIANT_SELECTION_ID,
+  type ProviderOptionSelection,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -8,7 +12,11 @@ import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
-import { devinModelGroupKey, parseDevinModelUid } from "../Layers/DevinProvider.ts";
+import {
+  devinModelGroupKey,
+  parseDevinFusionModelUid,
+  parseDevinModelUid,
+} from "../Layers/DevinProvider.ts";
 
 export { inferDevinContextWindowTokens } from "../Layers/DevinProvider.ts";
 
@@ -27,7 +35,35 @@ function stripTrailingSpeed(slug: string): { base: string; speed: string } | und
   return undefined;
 }
 
-type DevinAcpRuntimeSettings = Pick<DevinSettings, "binaryPath">;
+/**
+ * The slice of Devin settings that affects ACP process spawn. All optional so
+ * callers (adapter, background text generation) can pass only what applies.
+ */
+type DevinAcpRuntimeSettings = Partial<
+  Pick<DevinSettings, "binaryPath" | "agentType" | "refusalFallback" | "cloud">
+>;
+
+function parseRefusalFallbackModels(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function buildDevinAcpArgs(settings: DevinAcpRuntimeSettings | null | undefined): string[] {
+  const args = ["acp"];
+  const agentType = settings?.agentType;
+  if (agentType && agentType !== "default") {
+    args.push("--agent-type", agentType);
+  }
+  for (const model of parseRefusalFallbackModels(settings?.refusalFallback)) {
+    args.push("--refusal-fallback", model);
+  }
+  if (settings?.cloud === true) {
+    args.push("--cloud");
+  }
+  return args;
+}
 
 export const DEVIN_ACP_CLIENT_CAPABILITIES = {
   _meta: {
@@ -51,7 +87,7 @@ export function buildDevinAcpSpawnInput(
 ): AcpSessionRuntime.AcpSpawnInput {
   return {
     command: devinSettings?.binaryPath || "devin",
-    args: ["acp"],
+    args: buildDevinAcpArgs(devinSettings),
     cwd,
     ...(environment ? { env: environment } : {}),
   };
@@ -144,6 +180,9 @@ export function applyDevinAcpModelSelection<E>(input: {
 export function resolveDevinAcpBaseModelId(model: string | null | undefined): string {
   const trimmed = model?.trim();
   if (!trimmed) return "adaptive";
+  // Fusion is one stable model row; every concrete `fusion-*` UID maps back
+  // to it so changing dependent options never looks like a model swap.
+  if (trimmed === "fusion" || parseDevinFusionModelUid(trimmed) !== undefined) return "fusion";
   return devinModelGroupKey(parseDevinModelUid(trimmed));
 }
 
@@ -161,6 +200,14 @@ export function resolveDevinModelUid(
   model: string | null | undefined,
   options?: ReadonlyArray<ProviderOptionSelection> | null,
 ): string {
+  // A resolved catalog variant carries its exact provider UID; dispatch it
+  // verbatim rather than reconstructing from visible options (Fusion).
+  const exactVariant = options?.find(
+    (option) => option.id === PROVIDER_VARIANT_SELECTION_ID,
+  )?.value;
+  if (typeof exactVariant === "string" && exactVariant.trim()) {
+    return exactVariant.trim();
+  }
   const groupSlug = resolveDevinAcpBaseModelId(model);
   const reasoning = options?.find((option) => option.id === "reasoning")?.value;
   if (typeof reasoning !== "string" || !reasoning.trim()) {

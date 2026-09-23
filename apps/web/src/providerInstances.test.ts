@@ -36,6 +36,7 @@ function provider(input: {
     models: input.models ?? [],
     slashCommands: [],
     skills: [],
+    rules: [],
   };
 }
 

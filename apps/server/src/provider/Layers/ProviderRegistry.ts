@@ -93,6 +93,7 @@ export function upsertProviderWorkspaceSnapshot(
     checkedAt: scopedSnapshot.checkedAt,
     slashCommands: scopedSnapshot.slashCommands,
     skills: scopedSnapshot.skills,
+    ...(scopedSnapshot.rules !== undefined ? { rules: scopedSnapshot.rules } : {}),
   } satisfies NonNullable<ServerProvider["workspaceSnapshots"]>[number];
   return {
     ...provider,

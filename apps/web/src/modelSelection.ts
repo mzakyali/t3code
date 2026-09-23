@@ -84,7 +84,7 @@ export interface AppModelOption {
   shortName?: string;
   subProvider?: string;
   aliases?: ReadonlyArray<string>;
-  badge?: "new";
+  badge?: "new" | "beta";
   isCustom: boolean;
   isDefault?: boolean;
   isLegacy?: boolean;

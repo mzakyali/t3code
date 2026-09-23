@@ -53,6 +53,28 @@ export const ProviderOptionSelection = Schema.Struct({
 export type ProviderOptionSelection = typeof ProviderOptionSelection.Type;
 
 /**
+ * Internal selection id carrying the exact provider model UID for a resolved
+ * variant. Providers that publish {@link ModelCapabilities.optionVariants}
+ * use it so the server can route without reconstructing a UID from visible
+ * option values. It is never rendered as a user-facing option.
+ */
+export const PROVIDER_VARIANT_SELECTION_ID = "__providerVariant";
+
+/**
+ * One concrete catalog entry behind a grouped model row: the exact provider
+ * model UID plus the visible option selections that produce it.
+ *
+ * Used when a provider's option combinations are not independent — e.g.
+ * Devin Fusion pairs specific leads, efforts, and sidekicks — so clients can
+ * offer only compatible choices and keep the exact UID for dispatch.
+ */
+export const ProviderOptionVariant = Schema.Struct({
+  model: TrimmedNonEmptyString,
+  selections: Schema.Array(ProviderOptionSelection),
+});
+export type ProviderOptionVariant = typeof ProviderOptionVariant.Type;
+
+/**
  * Legacy on-disk shape for provider option selections, kept readable by the
  * decoder so we can tolerate stored data written before the v3 array shape.
  *
@@ -134,6 +156,13 @@ export const ModelCapabilities = Schema.Struct({
   inputImages: Schema.optional(Schema.Boolean),
   inputAudio: Schema.optional(Schema.Boolean),
   inputFiles: Schema.optional(Schema.Boolean),
+  /**
+   * Valid option combinations for models whose choices are not independent.
+   * When present, each entry maps a set of visible selections to the exact
+   * provider model UID they resolve to. Ordinary providers with independent
+   * options leave this unset.
+   */
+  optionVariants: Schema.optional(Schema.Array(ProviderOptionVariant)),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
 

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   buildDevinModelsFromPayload,
   inferDevinContextWindowTokens,
+  parseDevinCostSummary,
+  parseDevinFusionModelUid,
   parseDevinHumanModelList,
   parseDevinModelUid,
 } from "./DevinProvider.ts";
@@ -275,6 +277,172 @@ describe("buildDevinModelsFromPayload", () => {
     expect(glm.contextWindowTokens).toBe(1_000_000);
     expect(glm.pricingByVariant?.["glm-5-2-1m"]?.outputPerMillion).toBe(2.2);
   });
+
+  it("reads the current catalog shape: context/output limits, badges, cost tier, aliases", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "GPT 6 Astra",
+          family_uid: "gpt-6-astra",
+          slug: "gpt-6-astra",
+          aliases: ["astra", "gpt6"],
+          variants: [
+            {
+              model_uid: "gpt-6-astra-low",
+              label: "GPT-6 Astra Low",
+              max_context_tokens: 400_000,
+              max_output_tokens: 128_000,
+              cost_tier: "High",
+              is_new: true,
+              cost_summary: "$4 / 1M Input · $0.4 / 1M Cached input · $20 / 1M Output",
+            },
+            {
+              model_uid: "gpt-6-astra-high",
+              label: "GPT-6 Astra High",
+              max_context_tokens: 400_000,
+              max_output_tokens: 128_000,
+              cost_tier: "High",
+              is_new: true,
+              cost_summary: "$4 / 1M Input · $0.4 / 1M Cached input · $20 / 1M Output",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(models).toHaveLength(1);
+    const astra = models[0]!;
+    expect(astra.slug).toBe("gpt-6-astra");
+    expect(astra.badge).toBe("new");
+    expect(astra.costTier).toBe("High");
+    expect(astra.aliases).toEqual(["gpt-6-astra", "astra", "gpt6"]);
+    expect(astra.contextWindowTokens).toBe(400_000);
+    expect(astra.maxOutputTokens).toBe(128_000);
+    expect(astra.pricing?.inputPerMillion).toBe(4);
+    expect(astra.pricing?.cachedInputPerMillion).toBe(0.4);
+    expect(astra.pricing?.outputPerMillion).toBe(20);
+  });
+
+  it("prefers max_context_tokens over the legacy context_window field", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Kimi",
+          family_uid: "kimi",
+          variants: [
+            {
+              model_uid: "kimi-k2-6",
+              label: "Kimi K2.6",
+              context_window: 128_000,
+              max_context_tokens: 256_000,
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(models[0]?.contextWindowTokens).toBe(256_000);
+  });
+
+  it("marks beta variants with the beta badge", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Swe",
+          family_uid: "swe-2",
+          variants: [{ model_uid: "swe-2", label: "SWE-2", is_beta: true, cost_tier: "Free" }],
+        },
+      ],
+    });
+
+    expect(models[0]?.badge).toBe("beta");
+    expect(models[0]?.costTier).toBe("Free");
+  });
+
+  it("collapses the fusion family into one model with dependent option variants", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Claude Opus 5",
+          family_uid: "claude-opus-5",
+          variants: [{ model_uid: "claude-opus-5", label: "Claude Opus 5" }],
+        },
+        {
+          family_label: "SWE-2",
+          family_uid: "swe-2",
+          variants: [{ model_uid: "swe-2", label: "SWE-2" }],
+        },
+        {
+          family_label: "Fusion",
+          family_uid: "fusion",
+          slug: "fusion",
+          aliases: ["fuse"],
+          variants: [
+            {
+              model_uid: "fusion-claude-opus-5-high-sidekick-swe-2",
+              label: "Opus 5 High + SWE-2",
+              cost_summary: "$5 / 1M Input · $25 / 1M Output · Sidekick: Free",
+            },
+            {
+              model_uid: "fusion-claude-opus-5-high-fast-sidekick-swe-2-medium",
+              label: "Opus 5 High Fast + SWE-2 Medium",
+            },
+            {
+              model_uid: "fusion-claude-opus-5-low-sidekick-gpt-6-luna-high-priority",
+              label: "Opus 5 Low + Luna High Priority",
+            },
+          ],
+        },
+      ],
+    });
+
+    const fusion = models.find((model) => model.slug === "fusion");
+    expect(fusion).toBeDefined();
+    expect(fusion?.name).toBe("Fusion");
+    expect(fusion?.aliases).toEqual(["fusion", "fuse"]);
+    expect(fusion?.pricing?.inputPerMillion).toBe(5);
+
+    const descriptors = fusion?.capabilities?.optionDescriptors ?? [];
+    const byId = new Map(descriptors.map((descriptor) => [descriptor.id, descriptor]));
+    const selectOptionIds = (id: string) => {
+      const descriptor = byId.get(id);
+      return descriptor?.type === "select" ? descriptor.options.map((option) => option.id) : [];
+    };
+    expect(selectOptionIds("lead")).toEqual(["claude-opus-5"]);
+    expect(selectOptionIds("effort")).toEqual(["low", "high"]);
+    expect(selectOptionIds("sidekick")).toEqual([
+      "swe-2",
+      "swe-2-medium",
+      "gpt-6-luna-high-priority",
+    ]);
+    expect(byId.get("fastMode")?.type).toBe("boolean");
+
+    const variants = fusion?.capabilities?.optionVariants ?? [];
+    expect(variants).toHaveLength(3);
+    const fastVariant = variants.find(
+      (variant) => variant.model === "fusion-claude-opus-5-high-fast-sidekick-swe-2-medium",
+    );
+    expect(fastVariant?.selections).toEqual([
+      { id: "lead", value: "claude-opus-5" },
+      { id: "effort", value: "high" },
+      { id: "sidekick", value: "swe-2-medium" },
+      { id: "fastMode", value: true },
+    ]);
+  });
+
+  it("omits the fusion row entirely when no fusion UID parses", () => {
+    const models = buildDevinModelsFromPayload({
+      families: [
+        {
+          family_label: "Fusion",
+          family_uid: "fusion",
+          variants: [{ model_uid: "not-a-fusion-uid", label: "???" }],
+        },
+      ],
+    });
+
+    expect(models).toEqual([]);
+  });
 });
 
 describe("Devin model catalog fallbacks", () => {
@@ -360,5 +528,50 @@ describe("parseDevinModelUid", () => {
       reasoning: undefined,
       speed: undefined,
     });
+  });
+});
+
+describe("parseDevinCostSummary", () => {
+  it("extracts per-million rates and ignores non-rate segments", () => {
+    expect(
+      parseDevinCostSummary(
+        "$4 / 1M Input · $0.4 / 1M Cached input · $1 / 1M Cache write · $20 / 1M Output · Sidekick: Free",
+      ),
+    ).toEqual({ input: 4, cachedInput: 0.4, cacheCreation: 1, output: 20 });
+  });
+
+  it("returns the fields that are present", () => {
+    expect(parseDevinCostSummary("$0.7 / 1M Input · $2.2 / 1M Output")).toEqual({
+      input: 0.7,
+      output: 2.2,
+    });
+    expect(parseDevinCostSummary("Free")).toEqual({});
+  });
+});
+
+describe("parseDevinFusionModelUid", () => {
+  it("splits lead, effort, speed, and sidekick spec", () => {
+    expect(parseDevinFusionModelUid("fusion-claude-opus-5-high-sidekick-swe-2")).toEqual({
+      lead: "claude-opus-5",
+      leadEffort: "high",
+      fast: false,
+      sidekick: "swe-2",
+      sidekickSpec: "swe-2",
+    });
+    expect(
+      parseDevinFusionModelUid("fusion-gpt-6-luna-xhigh-fast-sidekick-glm-5-2-max-priority"),
+    ).toEqual({
+      lead: "gpt-6-luna",
+      leadEffort: "xhigh",
+      fast: true,
+      sidekick: "glm-5-2-max-priority",
+      sidekickSpec: "glm-5-2-max-priority",
+    });
+  });
+
+  it("rejects UIDs without a lead effort or sidekick section", () => {
+    expect(parseDevinFusionModelUid("fusion-claude-opus-5-sidekick-swe-2")).toBeUndefined();
+    expect(parseDevinFusionModelUid("fusion-claude-opus-5-high")).toBeUndefined();
+    expect(parseDevinFusionModelUid("claude-opus-5-high-sidekick-swe-2")).toBeUndefined();
   });
 });

@@ -3,10 +3,12 @@ import {
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   ModelCapabilities,
   type ModelSelection,
+  PROVIDER_VARIANT_SELECTION_ID,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
+  type ProviderOptionVariant,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -21,12 +23,21 @@ export interface SelectableModelOption {
 
 export function createModelCapabilities(input: {
   optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
+  optionVariants?: ReadonlyArray<ProviderOptionVariant>;
   inputImages?: boolean;
   inputAudio?: boolean;
   inputFiles?: boolean;
 }): ModelCapabilities {
   return {
     optionDescriptors: input.optionDescriptors.map(cloneDescriptor),
+    ...(input.optionVariants && input.optionVariants.length > 0
+      ? {
+          optionVariants: input.optionVariants.map((variant) => ({
+            model: variant.model,
+            selections: cloneSelections(variant.selections),
+          })),
+        }
+      : {}),
     ...(input.inputImages === false ? { inputImages: false } : {}),
     ...(input.inputAudio === false ? { inputAudio: false } : {}),
     ...(input.inputFiles === false ? { inputFiles: false } : {}),
@@ -138,6 +149,153 @@ function cloneSelection(selection: ProviderOptionSelection): ProviderOptionSelec
   return { ...selection };
 }
 
+function visibleSelections(
+  selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
+): ReadonlyArray<ProviderOptionSelection> {
+  return selections?.filter((selection) => selection.id !== PROVIDER_VARIANT_SELECTION_ID) ?? [];
+}
+
+/**
+ * Score a variant against the current selections: more matching values wins,
+ * then variants whose values are catalog-declared `isDefault` choices, then
+ * catalog order (callers iterate variants in order and keep the first max).
+ */
+function scoreVariant(
+  variant: ProviderOptionVariant,
+  current: ReadonlyMap<string, string | boolean>,
+  descriptorById: ReadonlyMap<string, ProviderOptionDescriptor>,
+): { matches: number; defaults: number } {
+  const variantValues = new Map(variant.selections.map((s) => [s.id, s.value]));
+  let matches = 0;
+  for (const [id, value] of current) {
+    if (variantValues.get(id) === value) matches++;
+  }
+  let defaults = 0;
+  for (const selection of variant.selections) {
+    const descriptor = descriptorById.get(selection.id);
+    if (
+      descriptor?.type === "select" &&
+      descriptor.options.some((option) => option.id === selection.value && option.isDefault)
+    ) {
+      defaults++;
+    }
+  }
+  return { matches, defaults };
+}
+
+/**
+ * Resolve the catalog variant that best matches the current visible
+ * selections. Deterministic: maximize matches, prefer catalog-declared
+ * defaults, then keep catalog order. When `pinnedIds` is set (e.g. the option
+ * the user just changed), only variants satisfying every pinned value are
+ * eligible — the explicit choice is never overridden.
+ */
+export function resolveProviderOptionVariant(input: {
+  caps: ModelCapabilities;
+  selections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  pinnedIds?: ReadonlyArray<string> | undefined;
+}): ProviderOptionVariant | undefined {
+  const variants = input.caps.optionVariants;
+  if (!variants || variants.length === 0) return undefined;
+
+  const current = new Map<string, string | boolean>();
+  for (const selection of visibleSelections(input.selections)) {
+    current.set(selection.id, selection.value);
+  }
+  const descriptorById = new Map(
+    (input.caps.optionDescriptors ?? []).map((descriptor) => [descriptor.id, descriptor]),
+  );
+
+  let candidates = variants;
+  const pinned = input.pinnedIds;
+  if (pinned && pinned.length > 0) {
+    const satisfying = variants.filter((variant) =>
+      pinned.every((id) => {
+        const wanted = current.get(id);
+        if (wanted === undefined) return true;
+        return variant.selections.some((s) => s.id === id && s.value === wanted);
+      }),
+    );
+    if (satisfying.length > 0) candidates = satisfying;
+  }
+
+  // A stored `__providerVariant` that is still in the catalog wins outright:
+  // it preserves the exact pairing the user last dispatched instead of
+  // re-deriving a possibly different variant from the same visible picks.
+  const hintedUid = input.selections?.find(
+    (selection) => selection.id === PROVIDER_VARIANT_SELECTION_ID,
+  )?.value;
+  if (typeof hintedUid === "string") {
+    const hint = candidates.find((variant) => variant.model === hintedUid);
+    if (hint) return hint;
+  }
+
+  let best: ProviderOptionVariant | undefined;
+  let bestScore = { matches: -1, defaults: -1 };
+  for (const variant of candidates) {
+    const score = scoreVariant(variant, current, descriptorById);
+    if (
+      score.matches > bestScore.matches ||
+      (score.matches === bestScore.matches && score.defaults > bestScore.defaults)
+    ) {
+      best = variant;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/**
+ * Normalize stored/requested selections against the variant table. Returns
+ * the resolved variant's visible selections plus the reserved
+ * `__providerVariant` entry carrying the exact provider model UID. When the
+ * model has no variant table the selections pass through unchanged.
+ */
+export function normalizeProviderOptionSelections(input: {
+  caps: ModelCapabilities;
+  selections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  pinnedIds?: ReadonlyArray<string> | undefined;
+}): ReadonlyArray<ProviderOptionSelection> | undefined {
+  const variant = resolveProviderOptionVariant(input);
+  if (!variant) return input.selections ?? undefined;
+  return [
+    ...variant.selections.map(cloneSelection),
+    { id: PROVIDER_VARIANT_SELECTION_ID, value: variant.model },
+  ];
+}
+
+/**
+ * Values still reachable for `descriptorId` given the other current
+ * selections: the union of that option's values across variants matching the
+ * rest of the current state. Returns undefined without a variant table.
+ */
+export function getCompatibleProviderOptionValues(input: {
+  caps: ModelCapabilities;
+  selections: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  descriptorId: string;
+}): ReadonlySet<string | boolean> | undefined {
+  const variants = input.caps.optionVariants;
+  if (!variants || variants.length === 0) return undefined;
+  const current = new Map<string, string | boolean>();
+  for (const selection of visibleSelections(input.selections)) {
+    if (selection.id !== input.descriptorId) current.set(selection.id, selection.value);
+  }
+  const compatible = new Set<string | boolean>();
+  for (const variant of variants) {
+    const variantValues = new Map(variant.selections.map((s) => [s.id, s.value]));
+    if (!variantValues.has(input.descriptorId)) continue;
+    let consistent = true;
+    for (const [id, value] of current) {
+      if (variantValues.get(id) !== value) {
+        consistent = false;
+        break;
+      }
+    }
+    if (consistent) compatible.add(variantValues.get(input.descriptorId)!);
+  }
+  return compatible;
+}
+
 function withDescriptorCurrentValue(
   descriptor: ProviderOptionDescriptor,
   rawCurrentValue: string | boolean | undefined,
@@ -169,15 +327,37 @@ export function getProviderOptionDescriptors(input: {
   caps: ModelCapabilities;
   selections?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
 }): ReadonlyArray<ProviderOptionDescriptor> {
-  const { caps, selections } = input;
+  const { caps } = input;
+  // Models with a variant table resolve their visible state through the best
+  // matching variant first, so stale or partial selections normalize to a
+  // valid combination before descriptors are built.
+  const selections =
+    normalizeProviderOptionSelections({ caps, selections: input.selections }) ?? input.selections;
   const baseDescriptors = (caps.optionDescriptors ?? []).map(cloneDescriptor);
 
-  return baseDescriptors.map((descriptor) =>
-    withDescriptorCurrentValue(
+  return baseDescriptors.map((descriptor) => {
+    const withValue = withDescriptorCurrentValue(
       descriptor,
       getRawSelectionValueById(selections, descriptor.id) ?? descriptor.currentValue,
-    ),
-  );
+    );
+    // Filter each select's choices to values that can still produce a valid
+    // variant given the rest of the current selection. A descriptor reduced
+    // to a single choice is this state's pivot control — narrowing it would
+    // deadlock sparse catalogs, so it keeps every advertised choice.
+    if (withValue.type !== "select" || !caps.optionVariants?.length) {
+      return withValue;
+    }
+    const compatible = getCompatibleProviderOptionValues({
+      caps,
+      selections,
+      descriptorId: descriptor.id,
+    });
+    if (!compatible || compatible.size <= 1) return withValue;
+    return {
+      ...withValue,
+      options: withValue.options.filter((option) => compatible.has(option.id)),
+    };
+  });
 }
 
 export function getProviderOptionCurrentValue(
@@ -217,6 +397,12 @@ export function getProviderOptionCurrentLabel(
 
 export function buildProviderOptionSelectionsFromDescriptors(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | null | undefined,
+  options?: {
+    readonly caps?: ModelCapabilities | null | undefined;
+    /** Option ids whose values must survive normalization (e.g. the control
+     * the user just changed). Other fields may shift to a valid pairing. */
+    readonly pinnedIds?: ReadonlyArray<string> | undefined;
+  },
 ): Array<ProviderOptionSelection> | undefined {
   if (!descriptors || descriptors.length === 0) {
     return undefined;
@@ -231,20 +417,53 @@ export function buildProviderOptionSelectionsFromDescriptors(
     }
   }
 
+  const caps = options?.caps;
+  if (caps?.optionVariants?.length) {
+    return [
+      ...(normalizeProviderOptionSelections({
+        caps,
+        selections: nextSelections,
+        ...(options?.pinnedIds ? { pinnedIds: options.pinnedIds } : {}),
+      }) ?? []),
+    ];
+  }
+
   return nextSelections.length > 0 ? nextSelections : undefined;
 }
 
 export function buildExplicitProviderOptionSelectionsFromDescriptors(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | null | undefined,
   selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
+  caps?: ModelCapabilities | null | undefined,
 ): Array<ProviderOptionSelection> | undefined {
-  if (!selections || selections.length === 0) {
+  const hasVariants = (caps?.optionVariants?.length ?? 0) > 0;
+  if ((!selections || selections.length === 0) && !hasVariants) {
     return undefined;
   }
-  const explicitIds = new Set(selections.map((selection) => selection.id));
+  const explicitIds = new Set(
+    (selections ?? [])
+      .map((selection) => selection.id)
+      .filter((id) => id !== PROVIDER_VARIANT_SELECTION_ID),
+  );
   const normalized = buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter(
     (selection) => explicitIds.has(selection.id),
   );
+  if (hasVariants) {
+    // Variant models dispatch an exact UID, so the resolved variant's full
+    // selection set is emitted even when the user never opened the picker.
+    const carriedVariant = (selections ?? []).find(
+      (selection) => selection.id === PROVIDER_VARIANT_SELECTION_ID,
+    );
+    return [
+      ...(normalizeProviderOptionSelections({
+        caps: caps!,
+        selections: [...(normalized ?? []), ...(carriedVariant ? [carriedVariant] : [])],
+        // The user's explicit picks pin the resolution: a stale carried
+        // variant that contradicts them loses instead of silently winning.
+        pinnedIds: [...explicitIds],
+      }) ?? []),
+    ];
+  }
   return normalized && normalized.length > 0 ? normalized : undefined;
 }
 

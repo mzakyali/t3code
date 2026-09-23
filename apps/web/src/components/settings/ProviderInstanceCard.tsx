@@ -303,6 +303,14 @@ function DevinDiagnosticsSection(props: {
           </span>
           <span>Usage</span>
           <span className="text-foreground">Local T3 event-log estimate. {accountUsageLabel}</span>
+          <span>Rules</span>
+          <span className="text-foreground">
+            {provider?.rules && provider.rules.length > 0
+              ? provider.rules
+                  .map((rule) => (rule.provider ? `${rule.name} (${rule.provider})` : rule.name))
+                  .join(", ")
+              : "None reported"}
+          </span>
           <span>Subagents</span>
           <span className="text-foreground">
             Standard ACP does not advertise child-agent events; only structured events are shown.

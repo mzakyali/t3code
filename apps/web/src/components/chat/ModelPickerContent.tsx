@@ -63,7 +63,8 @@ type ModelPickerItem = {
   name: string;
   shortName?: string;
   subProvider?: string;
-  badge?: "new";
+  aliases?: ReadonlyArray<string>;
+  badge?: "new" | "beta";
   instanceId: ProviderInstanceId;
   driverKind: ProviderDriverKind;
   instanceDisplayName: string;
@@ -405,6 +406,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           name: model.name,
           ...(model.shortName ? { shortName: model.shortName } : {}),
           ...(model.subProvider ? { subProvider: model.subProvider } : {}),
+          ...(model.aliases && model.aliases.length > 0 ? { aliases: model.aliases } : {}),
           ...(model.badge ? { badge: model.badge } : {}),
           ...(model.isLegacy ? { isLegacy: true } : {}),
           ...(model.isUnavailable ? { isUnavailable: true } : {}),
@@ -471,6 +473,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
               name: model.name,
               ...(model.shortName ? { shortName: model.shortName } : {}),
               ...(model.subProvider ? { subProvider: model.subProvider } : {}),
+              ...(model.aliases ? { aliases: model.aliases } : {}),
               driverKind: model.driverKind,
               providerDisplayName: model.instanceDisplayName,
               isFavorite: favoritesSet.has(providerModelKey(model.instanceId, model.slug)),
@@ -482,6 +485,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             name: model.name,
             ...(model.shortName ? { shortName: model.shortName } : {}),
             ...(model.subProvider ? { subProvider: model.subProvider } : {}),
+            ...(model.aliases ? { aliases: model.aliases } : {}),
             driverKind: model.driverKind,
             providerDisplayName: model.instanceDisplayName,
           }),
@@ -1129,7 +1133,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                         showProvider
                         preferShortName={!isLocked}
                         useTriggerLabel={false}
-                        showNewBadge={model.badge === "new"}
+                        badge={model.badge}
                         unavailable={model.isUnavailable === true}
                         jumpLabel={modelJumpLabelByKey.get(modelKey) ?? null}
                         disabledReason={disabledReason}

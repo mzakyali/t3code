@@ -118,6 +118,7 @@ function provider(): ServerProvider {
     models: [],
     slashCommands: [],
     skills: [],
+    rules: [],
     versionAdvisory: {
       status: "behind_latest",
       currentVersion: "1.0.0",

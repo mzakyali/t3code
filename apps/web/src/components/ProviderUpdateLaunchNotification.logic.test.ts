@@ -68,6 +68,7 @@ function provider(input: {
     models: [],
     slashCommands: [],
     skills: [],
+    rules: [],
     versionAdvisory: {
       status: input.advisoryStatus ?? "behind_latest",
       currentVersion: input.version ?? "1.0.0",

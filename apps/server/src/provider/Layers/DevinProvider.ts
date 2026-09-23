@@ -3,6 +3,8 @@ import {
   type ModelCapabilities,
   type ModelPricing,
   type ProviderOptionChoice,
+  type ProviderOptionDescriptor,
+  type ProviderOptionVariant,
   type SelectProviderOptionDescriptor,
   type ServerProviderModel,
 } from "@t3tools/contracts";
@@ -33,7 +35,7 @@ import {
  * written by the first grouped implementation so the picker cannot retain
  * rows such as `Max 1M`, `Fast`, or `Priority` as standalone models.
  */
-export const DEVIN_MODEL_CATALOG_VERSION = "devin-model-catalog-v3";
+export const DEVIN_MODEL_CATALOG_VERSION = "devin-model-catalog-v4";
 
 const DEVIN_PRESENTATION = {
   displayName: "Devin",
@@ -343,17 +345,75 @@ function formatContextWindowOption(tokens: number): string | undefined {
   return `${tokens}`;
 }
 
+const DEVIN_COST_RATE_PATTERN =
+  /\$\s*(\d+(?:\.\d+)?)\s*\/\s*1M\s*(Input|Cached\s+input|Cache\s*(?:write|creation)|Output)\b/giu;
+
+/**
+ * Parse Devin's `cost_summary` string ("$4 / 1M Input · $0.2 / 1M Cached
+ * input · $20 / 1M Output · Sidekick: Free") back into per-million rates.
+ * Non-rate segments such as the Fusion sidekick marker are ignored.
+ */
+export function parseDevinCostSummary(summary: string): {
+  input?: number;
+  cachedInput?: number;
+  cacheCreation?: number;
+  output?: number;
+} {
+  const rates: { input?: number; cachedInput?: number; cacheCreation?: number; output?: number } =
+    {};
+  for (const match of summary.matchAll(DEVIN_COST_RATE_PATTERN)) {
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount)) continue;
+    const kind = match[2]!.toLowerCase().replaceAll(/\s+/gu, " ");
+    if (kind === "input") rates.input = amount;
+    else if (kind === "cached input") rates.cachedInput = amount;
+    else if (kind === "output") rates.output = amount;
+    else rates.cacheCreation ??= amount;
+  }
+  return rates;
+}
+
+function variantContextWindowTokens(variant: Record<string, unknown>): number | undefined {
+  return (
+    parseContextWindowTokens(variant.max_context_tokens ?? variant.maxContextTokens) ??
+    parseContextWindowTokens(variant.context_window ?? variant.contextWindow)
+  );
+}
+
+function variantMaxOutputTokens(variant: Record<string, unknown>): number | undefined {
+  return parseContextWindowTokens(variant.max_output_tokens ?? variant.maxOutputTokens);
+}
+
+function variantCostTier(variant: Record<string, unknown>): string | undefined {
+  const raw = variant.cost_tier ?? variant.costTier;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().replace(/\s*cost$/iu, "");
+  return trimmed || undefined;
+}
+
+function variantBadge(variant: Record<string, unknown>): "new" | "beta" | undefined {
+  if (variant.is_new === true || variant.isNew === true) return "new";
+  if (variant.is_beta === true || variant.isBeta === true) return "beta";
+  return undefined;
+}
+
 /**
  * Accepts the JSON shapes used by different Devin CLI releases. Older builds
  * expose flat `*_per_million` fields, while newer builds nest rates under a
- * `pricing` object and use per-token values. The normalized result is always
- * USD per million tokens so it can be persisted in the provider snapshot.
+ * `pricing` object and use per-token values. Current builds report a
+ * `cost_summary` string instead, which is parsed back into rates. The
+ * normalized result is always USD per million tokens so it can be persisted
+ * in the provider snapshot.
  */
 function parseDevinVariantPricing(variant: Record<string, unknown>): ModelPricing | undefined {
   const nested =
     variant.pricing && typeof variant.pricing === "object" && !Array.isArray(variant.pricing)
       ? (variant.pricing as Record<string, unknown>)
       : {};
+  const summaryRates = (() => {
+    const summary = variant.cost_summary ?? variant.costSummary;
+    return typeof summary === "string" ? parseDevinCostSummary(summary) : {};
+  })();
   const input =
     readNormalizedRate(
       variant,
@@ -364,7 +424,8 @@ function parseDevinVariantPricing(variant: Record<string, unknown>): ModelPricin
       nested,
       ["input_per_million", "inputPerMillion", "input_cost_per_million", "inputCostPerMillion"],
       ["input_cost_per_token", "inputCostPerToken"],
-    );
+    ) ??
+    summaryRates.input;
   const output =
     readNormalizedRate(
       variant,
@@ -375,7 +436,8 @@ function parseDevinVariantPricing(variant: Record<string, unknown>): ModelPricin
       nested,
       ["output_per_million", "outputPerMillion", "output_cost_per_million", "outputCostPerMillion"],
       ["output_cost_per_token", "outputCostPerToken"],
-    );
+    ) ??
+    summaryRates.output;
   if (input === undefined || output === undefined) return undefined;
 
   const cached =
@@ -408,7 +470,8 @@ function parseDevinVariantPricing(variant: Record<string, unknown>): ModelPricin
         "cache_read_cost_per_token",
         "cacheReadCostPerToken",
       ],
-    );
+    ) ??
+    summaryRates.cachedInput;
   const cacheCreation =
     readNormalizedRate(
       variant,
@@ -439,9 +502,10 @@ function parseDevinVariantPricing(variant: Record<string, unknown>): ModelPricin
         "cache_write_cost_per_token",
         "cacheWriteCostPerToken",
       ],
-    );
+    ) ??
+    summaryRates.cacheCreation;
   const contextWindowTokens =
-    parseContextWindowTokens(variant.context_window ?? variant.contextWindow) ??
+    variantContextWindowTokens(variant) ??
     parseContextWindowTokens(nested.context_window ?? nested.contextWindow);
   return perMillionToPricing({
     input,
@@ -473,8 +537,21 @@ function modelPricingRecord(
 const DevinModelVariant = Schema.Struct({
   model_uid: Schema.String,
   label: Schema.String,
+  description: Schema.optional(Schema.String),
   context_window: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
   contextWindow: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  max_context_tokens: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  maxContextTokens: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  max_output_tokens: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  maxOutputTokens: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  cost_summary: Schema.optional(Schema.String),
+  costSummary: Schema.optional(Schema.String),
+  cost_tier: Schema.optional(Schema.String),
+  costTier: Schema.optional(Schema.String),
+  is_new: Schema.optional(Schema.Boolean),
+  isNew: Schema.optional(Schema.Boolean),
+  is_beta: Schema.optional(Schema.Boolean),
+  isBeta: Schema.optional(Schema.Boolean),
   input_per_million: Schema.optional(Schema.Number),
   output_per_million: Schema.optional(Schema.Number),
   cached_input_per_million: Schema.optional(Schema.Number),
@@ -507,6 +584,8 @@ const DevinModelVariant = Schema.Struct({
 const DevinModelFamily = Schema.Struct({
   family_label: Schema.String,
   family_uid: Schema.String,
+  slug: Schema.optional(Schema.String),
+  aliases: Schema.optional(Schema.Array(Schema.String)),
   variants: Schema.Array(DevinModelVariant),
 });
 
@@ -556,27 +635,18 @@ export function parseDevinHumanModelList(output: string): typeof DevinModelsPayl
     const contextWindowTokens = contextMatch
       ? parseContextWindowTokens(`${contextMatch[1]}${contextMatch[2] ?? ""}`)
       : undefined;
-    const pricingValues = new Map<string, number>();
-    const pricePattern = /\$\s*(\d+(?:\.\d+)?)\s*\/\s*1M\s*(Input|Cached\s+input|Output)\b/giu;
-    for (const match of details.matchAll(pricePattern)) {
-      const amount = Number(match[1]);
-      const kind = match[2]!.toLowerCase().replaceAll(/\s+/gu, " ");
-      if (Number.isFinite(amount)) pricingValues.set(kind, amount);
-    }
-    if (/\bfree\b/iu.test(details) && pricingValues.size === 0) {
-      pricingValues.set("input", 0);
-      pricingValues.set("output", 0);
-    }
+    const rates = parseDevinCostSummary(details);
+    const isFree = /\bfree\b/iu.test(details);
     current.variants.push({
       model_uid: modelUid,
       label,
       ...(contextWindowTokens !== undefined ? { contextWindow: contextWindowTokens } : {}),
-      ...(pricingValues.size > 0
+      ...(rates.input !== undefined || isFree
         ? {
             pricing: {
-              inputPerMillion: pricingValues.get("input") ?? 0,
-              cachedInputPerMillion: pricingValues.get("cached input"),
-              outputPerMillion: pricingValues.get("output") ?? 0,
+              inputPerMillion: rates.input ?? 0,
+              cachedInputPerMillion: rates.cachedInput,
+              outputPerMillion: rates.output ?? 0,
             },
           }
         : {}),
@@ -638,14 +708,262 @@ function runDevinCommand(
   });
 }
 
+/** Family labels for resolving Fusion lead/sidekick ids to display names. */
+type DevinFamilyLabels = ReadonlyMap<string, string>;
+
+/**
+ * The Fusion family composes a lead model + effort + optional fast tier with
+ * a sidekick model into one concrete UID per valid pairing. It collapses to a
+ * single `fusion` model row whose dependent controls are described by an
+ * `optionVariants` table — see docs/superpowers/specs/2026-09-12-devin-fusion-design.md.
+ */
+const FUSION_FAMILY_UID = "fusion";
+
+const FUSION_EFFORT_SUFFIX = /-(none|low|medium|high|xhigh|max|thinking)$/;
+const FUSION_SPEED_SUFFIX = /-(fast|priority)$/;
+
+/**
+ * Split `fusion-<lead>-<effort>[-fast]-sidekick-<sidekick>` into its parts.
+ * Lead effort is required; sidekick specs may carry their own effort and
+ * speed suffixes (e.g. `gpt-6-luna-high-priority`, `swe-2-medium`, `glm-5-2`
+ * with neither). Returns undefined for shapes the parser can't prove.
+ */
+export function parseDevinFusionModelUid(uid: string):
+  | {
+      lead: string;
+      leadEffort: string;
+      fast: boolean;
+      sidekick: string;
+      sidekickSpec: string;
+    }
+  | undefined {
+  const trimmed = uid.trim();
+  const splitAt = trimmed.indexOf("-sidekick-");
+  if (!trimmed.startsWith("fusion-") || splitAt < 0) return undefined;
+  const leadPart = trimmed.slice("fusion-".length, splitAt);
+  const sidekickSpec = trimmed.slice(splitAt + "-sidekick-".length);
+  if (!leadPart || !sidekickSpec) return undefined;
+
+  const fast = leadPart.endsWith("-fast");
+  const leadNoSpeed = fast ? leadPart.slice(0, -"-fast".length) : leadPart;
+  const effortMatch = leadNoSpeed.match(FUSION_EFFORT_SUFFIX);
+  if (!effortMatch) return undefined;
+  const lead = leadNoSpeed.slice(0, leadNoSpeed.length - effortMatch[0].length);
+  if (!lead) return undefined;
+
+  return { lead, leadEffort: effortMatch[1]!, fast, sidekick: sidekickSpec, sidekickSpec };
+}
+
+function humanizeDevinModelId(id: string, familyLabels: DevinFamilyLabels): string {
+  const known = familyLabels.get(id);
+  if (known) return known;
+  return id
+    .split(/[-_]/u)
+    .filter(Boolean)
+    .map((part) => (/^\d/.test(part) || part.length <= 2 ? part.toUpperCase() : capitalize(part)))
+    .join(" ");
+}
+
+function buildFusionSidekickLabel(spec: string, familyLabels: DevinFamilyLabels): string {
+  const speedMatch = spec.match(FUSION_SPEED_SUFFIX);
+  const withoutSpeed = speedMatch ? spec.slice(0, -speedMatch[0].length) : spec;
+  const effortMatch = withoutSpeed.match(FUSION_EFFORT_SUFFIX);
+  const model = effortMatch ? withoutSpeed.slice(0, -effortMatch[0].length) : withoutSpeed;
+  const parts = [humanizeDevinModelId(model, familyLabels)];
+  if (effortMatch)
+    parts.push(DEVIN_REASONING_LABELS[effortMatch[1]!] ?? capitalize(effortMatch[1]!));
+  if (speedMatch) parts.push(DEVIN_SPEED_LABELS[speedMatch[1]!] ?? capitalize(speedMatch[1]!));
+  return parts.join(" ");
+}
+
+/**
+ * Build the single `fusion` ServerProviderModel from the fusion family.
+ * Emits Lead / Effort / Sidekick selects plus a Fast Mode boolean, and the
+ * `optionVariants` table mapping each valid combination to its exact UID.
+ * Malformed variants are skipped individually; if none parse, the family is
+ * omitted rather than exposed as a misleading generic row.
+ */
+function buildDevinFusionModel(input: {
+  family: typeof DevinModelFamily.Type;
+  familyLabels: DevinFamilyLabels;
+  subProvider: string;
+}): ServerProviderModel | undefined {
+  const { family, familyLabels, subProvider } = input;
+
+  const leadIds: string[] = [];
+  const leadEfforts = new Map<string, string>(); // effort id -> label
+  const sidekickSpecs: string[] = [];
+  const variants: ProviderOptionVariant[] = [];
+  const pricingByVariant = new Map<string, ModelPricing>();
+  const seenUids = new Set<string>();
+  let contextWindowTokens: number | undefined;
+  let contextWindowConflict = false;
+  let maxOutputTokens: number | undefined;
+  let maxOutputConflict = false;
+  let defaultPricing: ModelPricing | undefined;
+  let costTier: string | undefined;
+  let badge: "new" | "beta" | undefined;
+
+  for (const variant of family.variants) {
+    const uid = variant.model_uid.trim();
+    if (!uid || seenUids.has(uid)) continue;
+    const parsed = parseDevinFusionModelUid(uid);
+    if (!parsed) continue;
+    seenUids.add(uid);
+
+    const rawVariant = variant as unknown as Record<string, unknown>;
+    const pricing = parseDevinVariantPricing(rawVariant);
+    if (pricing) pricingByVariant.set(uid, pricing);
+    if (defaultPricing === undefined) defaultPricing = pricing;
+    if (costTier === undefined) costTier = variantCostTier(rawVariant);
+    if (badge === undefined) badge = variantBadge(rawVariant);
+    const variantContext = variantContextWindowTokens(rawVariant);
+    if (variantContext !== undefined && !contextWindowConflict) {
+      // Only trust a context size every variant agrees on; Fusion pairs two
+      // models and a mixed value would misreport the lead's limit.
+      if (contextWindowTokens === undefined) {
+        contextWindowTokens = variantContext;
+      } else if (contextWindowTokens !== variantContext) {
+        contextWindowTokens = undefined;
+        contextWindowConflict = true;
+      }
+    }
+    const variantMaxOutput = variantMaxOutputTokens(rawVariant);
+    if (variantMaxOutput !== undefined && !maxOutputConflict) {
+      if (maxOutputTokens === undefined) {
+        maxOutputTokens = variantMaxOutput;
+      } else if (maxOutputTokens !== variantMaxOutput) {
+        maxOutputTokens = undefined;
+        maxOutputConflict = true;
+      }
+    }
+
+    if (!leadIds.includes(parsed.lead)) leadIds.push(parsed.lead);
+    if (!leadEfforts.has(parsed.leadEffort)) {
+      leadEfforts.set(
+        parsed.leadEffort,
+        DEVIN_REASONING_LABELS[parsed.leadEffort] ?? capitalize(parsed.leadEffort),
+      );
+    }
+    if (!sidekickSpecs.includes(parsed.sidekickSpec)) sidekickSpecs.push(parsed.sidekickSpec);
+
+    variants.push({
+      model: uid,
+      selections: [
+        { id: "lead", value: parsed.lead },
+        { id: "effort", value: parsed.leadEffort },
+        { id: "sidekick", value: parsed.sidekickSpec },
+        { id: "fastMode", value: parsed.fast },
+      ],
+    });
+  }
+
+  if (variants.length === 0) return undefined;
+
+  const defaults = variants[0]!.selections;
+  const defaultValue = (id: string) => defaults.find((s) => s.id === id)?.value;
+
+  const leadDescriptor: SelectProviderOptionDescriptor = {
+    id: "lead",
+    label: "Lead",
+    type: "select",
+    options: leadIds.map((lead) => ({
+      id: lead,
+      label: humanizeDevinModelId(lead, familyLabels),
+      ...(lead === defaultValue("lead") ? { isDefault: true } : {}),
+    })),
+  };
+  const effortOrder = [...DEVIN_REASONING_LEVELS];
+  const effortDescriptor: SelectProviderOptionDescriptor = {
+    id: "effort",
+    label: "Effort",
+    type: "select",
+    options: [...leadEfforts.entries()]
+      .sort(([a], [b]) => {
+        const ai = effortOrder.indexOf(a as (typeof effortOrder)[number]);
+        const bi = effortOrder.indexOf(b as (typeof effortOrder)[number]);
+        return (ai === -1 ? effortOrder.length : ai) - (bi === -1 ? effortOrder.length : bi);
+      })
+      .map(([id, label]) => ({
+        id,
+        label,
+        ...(id === defaultValue("effort") ? { isDefault: true } : {}),
+      })),
+  };
+  const sidekickDescriptor: SelectProviderOptionDescriptor = {
+    id: "sidekick",
+    label: "Sidekick",
+    type: "select",
+    options: sidekickSpecs.map((spec) => ({
+      id: spec,
+      label: buildFusionSidekickLabel(spec, familyLabels),
+      ...(spec === defaultValue("sidekick") ? { isDefault: true } : {}),
+    })),
+  };
+  const descriptors: ProviderOptionDescriptor[] = [
+    leadDescriptor,
+    effortDescriptor,
+    sidekickDescriptor,
+  ];
+  if (
+    variants.some((variant) =>
+      variant.selections.some((s) => s.id === "fastMode" && s.value === true),
+    )
+  ) {
+    descriptors.push({
+      id: "fastMode",
+      label: "Fast Mode",
+      type: "boolean",
+      currentValue: defaultValue("fastMode") === true,
+    });
+  }
+
+  return {
+    slug: FUSION_FAMILY_UID,
+    name: "Fusion",
+    subProvider,
+    isCustom: false,
+    capabilities: createModelCapabilities({
+      optionDescriptors: descriptors,
+      optionVariants: variants,
+    }),
+    ...(badge ? { badge } : {}),
+    ...(costTier ? { costTier } : {}),
+    ...(defaultPricing ? { pricing: defaultPricing } : {}),
+    ...(pricingByVariant.size > 0
+      ? { pricingByVariant: modelPricingRecord(pricingByVariant) }
+      : {}),
+    ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+    ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+  } satisfies ServerProviderModel;
+}
+
 export function buildDevinModelsFromPayload(
   payload: typeof DevinModelsPayload.Type,
 ): ReadonlyArray<ServerProviderModel> {
   const seen = new Set<string>();
   const models: ServerProviderModel[] = [];
+  const familyLabels: DevinFamilyLabels = new Map(
+    payload.families.map((family) => [family.family_uid, family.family_label]),
+  );
 
   for (const family of payload.families) {
     const subProvider = family.family_label.trim() || family.family_uid.trim();
+    const familyAliases = [
+      ...(family.slug?.trim() ? [family.slug.trim()] : []),
+      ...(family.aliases ?? []).map((alias) => alias.trim()).filter(Boolean),
+    ];
+    if (family.family_uid === FUSION_FAMILY_UID) {
+      const fusionModel = buildDevinFusionModel({ family, familyLabels, subProvider });
+      if (fusionModel && !seen.has(fusionModel.slug)) {
+        seen.add(fusionModel.slug);
+        models.push({
+          ...fusionModel,
+          ...(familyAliases.length > 0 ? { aliases: familyAliases } : {}),
+        });
+      }
+      continue;
+    }
     const parsedFamilyVariants = family.variants
       .map((candidate) => ({
         uid: candidate.model_uid.trim(),
@@ -686,7 +1004,10 @@ export function buildDevinModelsFromPayload(
       speeds: Set<string>;
       contexts: Set<string>;
       defaultContextWindow?: string;
+      badge?: "new" | "beta";
+      costTier?: string;
       pricingByVariant: Map<string, ModelPricing>;
+      maxOutputByVariant: Map<string, number>;
     };
     const groups = new Map<string, DevinModelGroup>();
 
@@ -698,8 +1019,11 @@ export function buildDevinModelsFromPayload(
       const parsed = parseDevinModelUid(uid);
       const rawVariant = variant as unknown as Record<string, unknown>;
       const explicitContextTokens =
-        parseContextWindowTokens(rawVariant.context_window ?? rawVariant.contextWindow) ??
+        variantContextWindowTokens(rawVariant) ??
         (parsed.contextWindow ? parseContext(parsed.contextWindow) * 1_000 : undefined);
+      const badge = variantBadge(rawVariant);
+      const costTier = variantCostTier(rawVariant);
+      const maxOutputTokens = variantMaxOutputTokens(rawVariant);
       const variantPricing = pricingWithContext(
         parseDevinVariantPricing(rawVariant),
         explicitContextTokens,
@@ -719,13 +1043,19 @@ export function buildDevinModelsFromPayload(
                 contexts: new Set<string>(),
                 ...(defaultContext ? { defaultContextWindow: defaultContext } : {}),
                 pricingByVariant: new Map<string, ModelPricing>(),
+                maxOutputByVariant: new Map<string, number>(),
               };
               if (defaultContext) created.contexts.add(defaultContext);
               if (variantPricing) created.pricingByVariant.set(uid, variantPricing);
+              if (maxOutputTokens !== undefined)
+                created.maxOutputByVariant.set(uid, maxOutputTokens);
               groups.set(key, created);
               return created;
             })();
+          if (badge && group.badge === undefined) group.badge = badge;
+          if (costTier && group.costTier === undefined) group.costTier = costTier;
           if (variantPricing) group.pricingByVariant.set(uid, variantPricing);
+          if (maxOutputTokens !== undefined) group.maxOutputByVariant.set(uid, maxOutputTokens);
           const contextOption = formatContextWindowOption(explicitContextTokens ?? 0);
           if (contextOption) group.contexts.add(contextOption);
           const inferredReasoning = inferReasoningFromLabel(label);
@@ -768,8 +1098,12 @@ export function buildDevinModelsFromPayload(
           isCustom: false,
           ...(uid === "adaptive" ? { isDefault: true } : {}),
           capabilities: devinModelCapabilities(uid),
+          ...(badge ? { badge } : {}),
+          ...(costTier ? { costTier } : {}),
+          ...(familyAliases.length > 0 ? { aliases: familyAliases } : {}),
           ...(variantPricing ? { pricing: variantPricing } : {}),
           ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+          ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
         } satisfies ServerProviderModel);
         continue;
       }
@@ -787,12 +1121,16 @@ export function buildDevinModelsFromPayload(
             contexts: new Set(parsed.contextWindow ? [parsed.contextWindow] : []),
             ...(defaultContext ? { defaultContextWindow: defaultContext } : {}),
             pricingByVariant: new Map<string, ModelPricing>(),
+            maxOutputByVariant: new Map<string, number>(),
           };
           if (defaultContext) created.contexts.add(defaultContext);
           groups.set(key, created);
           return created;
         })();
+      if (badge && group.badge === undefined) group.badge = badge;
+      if (costTier && group.costTier === undefined) group.costTier = costTier;
       if (variantPricing) group.pricingByVariant.set(uid, variantPricing);
+      if (maxOutputTokens !== undefined) group.maxOutputByVariant.set(uid, maxOutputTokens);
       const contextOption = formatContextWindowOption(explicitContextTokens ?? 0);
       if (contextOption) group.contexts.add(contextOption);
       if (parsed.reasoning !== undefined && !group.reasoningLevels.has(parsed.reasoning)) {
@@ -903,6 +1241,11 @@ export function buildDevinModelsFromPayload(
         pricingContextWindowTokens ??
         defaultPricing?.contextWindowTokens ??
         inferDevinContextWindowTokens(group.base);
+      // Output limits vary per reasoning level on some families; only surface
+      // one when every reporting variant agrees on the same number.
+      const uniqueMaxOutputs = new Set(group.maxOutputByVariant.values());
+      const maxOutputTokens =
+        uniqueMaxOutputs.size === 1 ? uniqueMaxOutputs.values().next().value : undefined;
       models.push({
         slug: key,
         name: subProvider,
@@ -913,11 +1256,15 @@ export function buildDevinModelsFromPayload(
           optionDescriptors,
           ...overrides,
         }),
+        ...(group.badge ? { badge: group.badge } : {}),
+        ...(group.costTier ? { costTier: group.costTier } : {}),
+        ...(familyAliases.length > 0 ? { aliases: familyAliases } : {}),
         ...(defaultPricing ? { pricing: defaultPricing } : {}),
         ...(modelPricingRecord(pricingEntries)
           ? { pricingByVariant: modelPricingRecord(pricingEntries) }
           : {}),
         ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+        ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
       } satisfies ServerProviderModel);
     }
   }

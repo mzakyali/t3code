@@ -116,6 +116,31 @@ describe("scoreModelPickerSearch", () => {
     expect(nonFavoriteExactScore!).toBeLessThan(favoriteScore!);
   });
 
+  it("matches provider-declared aliases", () => {
+    expect(
+      scoreModelPickerSearch(
+        {
+          driverKind: "devin",
+          providerDisplayName: "Devin",
+          name: "Claude Sonnet 4.6",
+          aliases: ["sonnet", "swe"],
+        },
+        "sonnet",
+      ),
+    ).not.toBeNull();
+    expect(
+      scoreModelPickerSearch(
+        {
+          driverKind: "devin",
+          providerDisplayName: "Devin",
+          name: "Claude Sonnet 4.6",
+          aliases: ["sonnet", "swe"],
+        },
+        "swe",
+      ),
+    ).not.toBeNull();
+  });
+
   it("matches a custom instance's display name against its models", () => {
     expect(
       scoreModelPickerSearch(

@@ -6,7 +6,11 @@ import {
   type ModelCapabilities,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { getProviderOptionCurrentValue, getProviderOptionDescriptors } from "@t3tools/shared/model";
+import {
+  getProviderOptionCurrentValue,
+  getProviderOptionDescriptors,
+  normalizeProviderOptionSelections,
+} from "@t3tools/shared/model";
 
 /**
  * The descriptor id used for the primary reasoning-effort select option.
@@ -88,8 +92,10 @@ export function resolveReasoningLevel(input: {
 }
 
 /**
- * Produce the next options array after changing the reasoning level, leaving
- * every other option untouched. Returns `undefined` when the model has no
+ * Produce the next options array after changing the reasoning level. The
+ * changed option is pinned and the rest normalize against the model's
+ * variant table, so dependent options (e.g. Devin Fusion's sidekick pairing)
+ * land on a valid combination. Returns `undefined` when the model has no
  * reasoning descriptor (so callers can short-circuit).
  */
 export function withReasoningLevelChange(input: {
@@ -106,7 +112,14 @@ export function withReasoningLevelChange(input: {
   }
   const existing = input.selections ?? [];
   const filtered = existing.filter((selection) => selection.id !== descriptor.descriptorId);
-  return [...filtered, { id: descriptor.descriptorId, value: input.nextValue }];
+  const next = [...filtered, { id: descriptor.descriptorId, value: input.nextValue }];
+  return (
+    normalizeProviderOptionSelections({
+      caps: input.caps,
+      selections: next,
+      pinnedIds: [descriptor.descriptorId],
+    }) ?? next
+  );
 }
 
 /**

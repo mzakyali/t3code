@@ -160,6 +160,7 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
     modelOptionsForDispatch: buildExplicitProviderOptionSelectionsFromDescriptors(
       descriptors,
       selections,
+      caps,
     ),
     inputCapabilities: getModelInputCapabilities(caps),
     ...(ultrathinkActive

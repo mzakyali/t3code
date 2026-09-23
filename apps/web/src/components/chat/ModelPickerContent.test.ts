@@ -28,6 +28,7 @@ function entry(status: ServerProvider["status"], driver = "opencode") {
       models: [],
       slashCommands: [],
       skills: [],
+      rules: [],
     },
   ])[0]!;
 }

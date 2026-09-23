@@ -722,6 +722,14 @@ export const CursorSettings = makeProviderSettingsSchema(
 );
 export type CursorSettings = typeof CursorSettings.Type;
 
+export const DEVIN_AGENT_TYPES = [
+  { value: "default", label: "Default agent" },
+  { value: "review", label: "Review (read-only)" },
+  { value: "summarizer", label: "Summarizer" },
+] as const satisfies ReadonlyArray<ProviderSettingsFormOption>;
+export const DevinAgentType = Schema.Literals(DEVIN_AGENT_TYPES.map((type) => type.value));
+export type DevinAgentType = typeof DevinAgentType.Type;
+
 export const DevinSettings = makeProviderSettingsSchema(
   {
     // Devin is opt-in because it requires a separately installed and authenticated CLI.
@@ -736,13 +744,44 @@ export const DevinSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "devin", clearWhenEmpty: "omit" },
       }),
     ),
+    agentType: DevinAgentType.pipe(
+      Schema.withDecodingDefault(Effect.succeed("default" as const)),
+      Schema.annotateKey({
+        title: "Agent type",
+        description:
+          "Purpose-built agent for sessions on this instance. Ignored when Devin Cloud is on.",
+        providerSettingsForm: {
+          control: "select",
+          options: DEVIN_AGENT_TYPES,
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    refusalFallback: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Refusal fallback",
+        description:
+          "Comma-separated models to try when a provider refuses a request under its usage policy.",
+        providerSettingsForm: { placeholder: "e.g. opus, sonnet", clearWhenEmpty: "omit" },
+      }),
+    ),
+    cloud: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Devin Cloud",
+        description:
+          "Run sessions in Devin Cloud instead of the local agent. Requires `devin auth login`.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     customModels: Schema.Array(Schema.String).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath"],
+    order: ["binaryPath", "agentType", "refusalFallback", "cloud"],
   },
 );
 export type DevinSettings = typeof DevinSettings.Type;
@@ -1442,6 +1481,9 @@ const CursorSettingsPatch = Schema.Struct({
 const DevinSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
+  agentType: Schema.optionalKey(DevinAgentType),
+  refusalFallback: Schema.optionalKey(TrimmedString),
+  cloud: Schema.optionalKey(Schema.Boolean),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 

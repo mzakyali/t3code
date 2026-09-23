@@ -49,6 +49,7 @@ function provider(overrides: Partial<ServerProvider>): ServerProvider {
     slashCommands: [],
     skills: [],
     ...overrides,
+    rules: overrides.rules ?? [],
   };
 }
 

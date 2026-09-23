@@ -88,6 +88,7 @@ const provider: ServerProvider = {
   checkedAt: "2026-09-02T00:00:00.000Z",
   models: [],
   skills: [],
+  rules: [],
   slashCommands: [],
   setup: { canAuthenticate: true, canInstall: true },
 };

@@ -23,6 +23,7 @@ const provider = {
   models: [],
   slashCommands: [{ name: "global" }],
   skills: [{ name: "global", path: "/global/SKILL.md", enabled: true }],
+  rules: [],
   workspaceSnapshots: [
     {
       cwd: "/workspace/project-a",

@@ -71,7 +71,13 @@ export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(func
     Effect.gen(function* () {
       const outputRef = yield* Ref.make("");
       const runtime = yield* makeDevinAcpRuntime({
-        devinSettings,
+        // agentType is a persona for user-driven sessions; background text
+        // jobs only inherit transport/resilience settings.
+        devinSettings: {
+          binaryPath: devinSettings.binaryPath,
+          refusalFallback: devinSettings.refusalFallback,
+          cloud: devinSettings.cloud,
+        },
         environment: resolvedEnvironment,
         childProcessSpawner: commandSpawner,
         cwd,

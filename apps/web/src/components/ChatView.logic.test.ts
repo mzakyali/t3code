@@ -1097,6 +1097,7 @@ describe("resolveComposerProviderSelection", () => {
         slashCommands: [],
         skills: [],
         ...overrides,
+        rules: overrides.rules ?? [],
       },
     ])[0]!;
   }

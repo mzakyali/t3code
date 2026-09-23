@@ -30,6 +30,55 @@ describe("buildDevinAcpSpawnInput", () => {
       env: { DEVIN_ORG: "example" },
     });
   });
+
+  it("passes a non-default agent type", () => {
+    expect(buildDevinAcpSpawnInput({ agentType: "review" }, "/tmp/project").args).toEqual([
+      "acp",
+      "--agent-type",
+      "review",
+    ]);
+    expect(buildDevinAcpSpawnInput({ agentType: "summarizer" }, "/tmp/project").args).toEqual([
+      "acp",
+      "--agent-type",
+      "summarizer",
+    ]);
+  });
+
+  it("omits the agent type flag for the default agent", () => {
+    expect(buildDevinAcpSpawnInput({ agentType: "default" }, "/tmp/project").args).toEqual(["acp"]);
+  });
+
+  it("repeats --refusal-fallback per configured model", () => {
+    expect(
+      buildDevinAcpSpawnInput({ refusalFallback: "claude-opus-5, glm-5-2 ,,swe-2" }, "/tmp/project")
+        .args,
+    ).toEqual([
+      "acp",
+      "--refusal-fallback",
+      "claude-opus-5",
+      "--refusal-fallback",
+      "glm-5-2",
+      "--refusal-fallback",
+      "swe-2",
+    ]);
+  });
+
+  it("passes --cloud when Devin Cloud mode is enabled", () => {
+    expect(buildDevinAcpSpawnInput({ cloud: true }, "/tmp/project").args).toEqual([
+      "acp",
+      "--cloud",
+    ]);
+    expect(buildDevinAcpSpawnInput({ cloud: false }, "/tmp/project").args).toEqual(["acp"]);
+  });
+
+  it("combines agent type, refusal fallbacks, and cloud in one spawn", () => {
+    expect(
+      buildDevinAcpSpawnInput(
+        { agentType: "review", refusalFallback: "swe-2", cloud: true },
+        "/tmp/project",
+      ).args,
+    ).toEqual(["acp", "--agent-type", "review", "--refusal-fallback", "swe-2", "--cloud"]);
+  });
 });
 
 describe("applyDevinAcpModelSelection", () => {
@@ -80,6 +129,14 @@ describe("applyDevinAcpModelSelection", () => {
 
   it("falls back to adaptive", () => {
     expect(resolveDevinAcpBaseModelId("  ")).toBe("adaptive");
+  });
+
+  it("maps every concrete fusion UID back to the stable fusion base", () => {
+    expect(resolveDevinAcpBaseModelId("fusion")).toBe("fusion");
+    expect(resolveDevinAcpBaseModelId("fusion-claude-opus-5-high-fast-sidekick-swe-2-medium")).toBe(
+      "fusion",
+    );
+    expect(resolveDevinAcpBaseModelId("claude-opus-5-high")).toBe("claude-opus-5");
   });
 });
 
@@ -158,5 +215,24 @@ describe("resolveDevinModelUid", () => {
 
   it("falls back to adaptive for empty input", () => {
     expect(resolveDevinModelUid("   ")).toBe("adaptive");
+  });
+
+  it("dispatches a resolved __providerVariant UID verbatim", () => {
+    expect(
+      resolveDevinModelUid("fusion", [
+        { id: "lead", value: "claude-opus-5" },
+        { id: "effort", value: "high" },
+        { id: "__providerVariant", value: "fusion-claude-opus-5-high-sidekick-swe-2" },
+      ]),
+    ).toBe("fusion-claude-opus-5-high-sidekick-swe-2");
+  });
+
+  it("ignores a blank __providerVariant value", () => {
+    expect(
+      resolveDevinModelUid("claude-opus-5", [
+        { id: "__providerVariant", value: "   " },
+        { id: "reasoning", value: "high" },
+      ]),
+    ).toBe("claude-opus-5-high");
   });
 });

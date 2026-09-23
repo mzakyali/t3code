@@ -61,4 +61,81 @@ describe("mobile provider options", () => {
       { id: "fastMode", value: true },
     ]);
   });
+
+  it("normalizes dependent options around the changed control when a variant table exists", () => {
+    const fusionCaps: ModelCapabilities = {
+      optionDescriptors: [
+        {
+          id: "lead",
+          label: "Lead",
+          type: "select",
+          options: [
+            { id: "opus", label: "Opus", isDefault: true },
+            { id: "luna", label: "Luna" },
+          ],
+          currentValue: "opus",
+        },
+        {
+          id: "effort",
+          label: "Effort",
+          type: "select",
+          options: [
+            { id: "high", label: "High", isDefault: true },
+            { id: "low", label: "Low" },
+          ],
+          currentValue: "high",
+        },
+        {
+          id: "sidekick",
+          label: "Sidekick",
+          type: "select",
+          options: [
+            { id: "swe-2", label: "SWE-2", isDefault: true },
+            { id: "glm-priority", label: "GLM Priority" },
+          ],
+          currentValue: "swe-2",
+        },
+      ],
+      optionVariants: [
+        {
+          model: "fusion-opus-high-sidekick-swe-2",
+          selections: [
+            { id: "lead", value: "opus" },
+            { id: "effort", value: "high" },
+            { id: "sidekick", value: "swe-2" },
+          ],
+        },
+        {
+          model: "fusion-luna-low-sidekick-glm-priority",
+          selections: [
+            { id: "lead", value: "luna" },
+            { id: "effort", value: "low" },
+            { id: "sidekick", value: "glm-priority" },
+          ],
+        },
+      ],
+    };
+    const descriptors = resolveProviderOptionDescriptors({
+      capabilities: fusionCaps,
+      selections: undefined,
+    });
+
+    // Switching the lead to luna forces effort+sidekick onto luna's only
+    // valid pairing, and the exact dispatch UID is carried along.
+    expect(
+      applyProviderOptionSelection(descriptors, { id: "lead", value: "luna" }, fusionCaps),
+    ).toEqual([
+      { id: "lead", value: "luna" },
+      { id: "effort", value: "low" },
+      { id: "sidekick", value: "glm-priority" },
+      { id: "__providerVariant", value: "fusion-luna-low-sidekick-glm-priority" },
+    ]);
+
+    // Without capabilities the descriptors' raw values pass through.
+    expect(applyProviderOptionSelection(descriptors, { id: "lead", value: "luna" })).toEqual([
+      { id: "lead", value: "luna" },
+      { id: "effort", value: "high" },
+      { id: "sidekick", value: "swe-2" },
+    ]);
+  });
 });

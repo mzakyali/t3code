@@ -17,6 +17,7 @@ const provider: ServerProvider = {
   checkedAt: "2026-09-22T00:00:00Z",
   models: [],
   skills: [],
+  rules: [],
   slashCommands: [],
   compatibilityAdvisory: {
     status: "unsupported",

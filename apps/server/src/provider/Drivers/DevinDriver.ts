@@ -1,4 +1,9 @@
-import { DevinSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import {
+  DevinSettings,
+  ProviderDriverKind,
+  type ServerProvider,
+  type ServerProviderRule,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -18,6 +23,7 @@ import {
 } from "../Layers/DevinProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import { discoverDevinRules } from "./DevinRules.ts";
 import { discoverDevinSkills } from "./DevinSkills.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -143,7 +149,19 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
                     }),
                 ),
               ),
-            ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
+              // `devin rules` does not exist on older CLIs; a failed probe
+              // degrades to an empty list instead of failing the snapshot.
+              discoverDevinRules(effectiveConfig, processEnv, workspaceCwd).pipe(
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.catch(() => Effect.succeed<ReadonlyArray<ServerProviderRule>>([])),
+              ),
+            ]).pipe(
+              Effect.map(([machineSnapshot, skills, rules]) => ({
+                ...machineSnapshot,
+                skills,
+                rules,
+              })),
+            );
 
       return {
         instanceId,
@@ -156,6 +174,22 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
         snapshotForCwd,
         adapter,
         textGeneration,
+        // Devin keeps no T3-owned discovery caches; probes run live per
+        // snapshot, so invalidation is a no-op by design.
+        invalidateCaches: Effect.void,
+        refreshModels: () =>
+          snapshot.refresh.pipe(
+            Effect.catchDefect((defect) =>
+              Effect.fail(
+                new ProviderDriverError({
+                  driver: DRIVER_KIND,
+                  instanceId,
+                  detail: "Could not refresh Devin models. The previous model list is unchanged.",
+                  cause: defect,
+                }),
+              ),
+            ),
+          ),
       } satisfies ProviderInstance;
     }),
 };

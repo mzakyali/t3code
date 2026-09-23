@@ -24,11 +24,13 @@ export function resolveProviderOptionDescriptors(input: {
 /**
  * Applies one option change (by descriptor id) and returns the full selection
  * list to store on the model selection, or null when the change doesn't match
- * an advertised descriptor / choice.
+ * an advertised descriptor / choice. With a variant table, the changed option
+ * is pinned so dependent fields normalize around it instead of overriding it.
  */
 export function applyProviderOptionSelection(
   descriptors: ReadonlyArray<ProviderOptionDescriptor>,
   change: ProviderOptionSelection,
+  capabilities?: ModelCapabilities | null,
 ): ReadonlyArray<ProviderOptionSelection> | null {
   const descriptor = descriptors.find((candidate) => candidate.id === change.id);
   if (!descriptor) {
@@ -52,5 +54,10 @@ export function applyProviderOptionSelection(
       : candidate,
   ) as ReadonlyArray<ProviderOptionDescriptor>;
 
-  return buildProviderOptionSelectionsFromDescriptors(nextDescriptors) ?? [];
+  return (
+    buildProviderOptionSelectionsFromDescriptors(nextDescriptors, {
+      caps: capabilities,
+      pinnedIds: [change.id],
+    }) ?? []
+  );
 }

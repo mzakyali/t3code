@@ -36,7 +36,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
   showProvider: boolean;
   preferShortName?: boolean;
   useTriggerLabel?: boolean;
-  showNewBadge?: boolean;
+  badge?: "new" | "beta" | undefined;
   unavailable?: boolean;
   jumpLabel?: string | null;
   disabledReason?: string | null;
@@ -104,12 +104,17 @@ export const ModelListRow = memo(function ModelListRow(props: {
                   props.preferShortName ? { preferShortName: true } : undefined,
                 )}
           </div>
-          {props.showNewBadge ? (
+          {props.badge ? (
             <span
-              className="shrink-0 rounded border border-update/35 bg-update/15 px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide text-update-foreground"
-              aria-label="New model"
+              className={cn(
+                "shrink-0 rounded border px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide",
+                props.badge === "new"
+                  ? "border-update/35 bg-update/15 text-update-foreground"
+                  : "border-warning/35 bg-warning/15 text-warning-foreground",
+              )}
+              aria-label={props.badge === "new" ? "New model" : "Beta model"}
             >
-              New
+              {props.badge === "new" ? "New" : "Beta"}
             </span>
           ) : null}
           {props.unavailable ? (
