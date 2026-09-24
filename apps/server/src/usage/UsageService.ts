@@ -423,7 +423,7 @@ export const make = Effect.gen(function* () {
     }
 
     const endpoint = new URL(
-      `${DEVIN_ACCOUNT_API_BASE}/organizations/${encodeURIComponent(organizationId)}/consumption/daily`,
+      `${DEVIN_ACCOUNT_API_BASE}/enterprise/consumption/daily/organizations/${encodeURIComponent(organizationId)}`,
     );
     endpoint.searchParams.set("time_after", String(timeAfter));
     endpoint.searchParams.set("time_before", String(timeBefore));
@@ -447,7 +447,8 @@ export const make = Effect.gen(function* () {
     if (response.status === 401 || response.status === 403) {
       const value = accountConsumptionStatus({
         status: "forbidden",
-        message: "The Devin API key lacks organization consumption permission.",
+        message:
+          "Devin's consumption API requires an Enterprise plan and a credential with ViewAccountConsumption permission.",
       });
       devinAccountCache.set(cacheKey, { fetchedAtMs: now, value });
       return value;

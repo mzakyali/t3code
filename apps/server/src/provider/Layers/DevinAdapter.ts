@@ -518,20 +518,21 @@ function applyRequestedSessionConfiguration<E>(input: {
     readonly cause: import("effect-acp/errors").AcpError;
     readonly method: "session/set_config_option" | "session/set_mode";
   }) => E;
-}): Effect.Effect<void, E> {
+}): Effect.Effect<string | undefined, E> {
   return Effect.gen(function* () {
-    if (input.modelSelection) {
-      yield* applyDevinAcpModelSelection({
-        runtime: input.runtime,
-        model: input.modelSelection.model,
-        selections: input.modelSelection.options,
-        mapError: ({ cause }) =>
-          input.mapError({
-            cause,
-            method: "session/set_config_option",
-          }),
-      });
-    }
+    const appliedModelUid =
+      input.modelSelection === undefined
+        ? undefined
+        : yield* applyDevinAcpModelSelection({
+            runtime: input.runtime,
+            model: input.modelSelection.model,
+            selections: input.modelSelection.options,
+            mapError: ({ cause }) =>
+              input.mapError({
+                cause,
+                method: "session/set_config_option",
+              }),
+          });
 
     const requestedModeId = resolveRequestedModeId({
       interactionMode: input.interactionMode,
@@ -539,7 +540,7 @@ function applyRequestedSessionConfiguration<E>(input: {
       modeState: yield* input.runtime.getModeState,
     });
     if (!requestedModeId) {
-      return;
+      return appliedModelUid;
     }
 
     yield* input.runtime.setMode(requestedModeId).pipe(
@@ -550,6 +551,7 @@ function applyRequestedSessionConfiguration<E>(input: {
         }),
       ),
     );
+    return appliedModelUid;
   });
 }
 
@@ -1258,7 +1260,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             ctxRef,
           });
 
-          yield* applyRequestedSessionConfiguration({
+          const appliedModelUid = yield* applyRequestedSessionConfiguration({
             runtime: acp,
             runtimeMode: input.runtimeMode,
             interactionMode: undefined,
@@ -1302,9 +1304,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             lastAcpCostUsd: undefined,
             pendingCostDeltaUsd: undefined,
             totalProcessedTokens: 0,
-            activeModelUid: devinModelSelection
-              ? resolveDevinModelUid(devinModelSelection.model, devinModelSelection.options)
-              : undefined,
+            activeModelUid:
+              appliedModelUid ??
+              (devinModelSelection
+                ? resolveDevinModelUid(devinModelSelection.model, devinModelSelection.options)
+                : undefined),
             stopped: false,
           };
           ctxRef.current = ctx;
@@ -1386,7 +1390,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         // Apply the new model to the fresh session. `newModel` is the base
         // (group) slug; the reasoning option is folded in to form the full
         // UID Devin's backend expects.
-        yield* applyDevinAcpModelSelection({
+        const appliedModelUid = yield* applyDevinAcpModelSelection({
           runtime: acp,
           model: newModel,
           selections: options,
@@ -1405,7 +1409,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           },
           updatedAt: yield* nowIso,
         };
-        ctx.activeModelUid = resolveDevinModelUid(newModel, options);
+        ctx.activeModelUid = appliedModelUid;
 
         const nf = yield* startNotificationFiber(ctx);
         ctx.notificationFiber = nf;
@@ -1521,7 +1525,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               yield* restartForModelChange(ctx, resolvedModel, turnModelSelection?.options);
             }
 
-            yield* applyRequestedSessionConfiguration({
+            const appliedModelUid = yield* applyRequestedSessionConfiguration({
               runtime: ctx.acp,
               runtimeMode: ctx.session.runtimeMode,
               interactionMode: input.interactionMode,
@@ -1557,7 +1561,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                   ...(model !== undefined ? { model: resolvedModel } : {}),
                   updatedAt,
                 };
-                if (model !== undefined) ctx.activeModelUid = resolvedModelUid;
+                if (model !== undefined) ctx.activeModelUid = appliedModelUid ?? resolvedModelUid;
 
                 if (turnStartedStamp !== undefined) {
                   yield* offerRuntimeEvent({

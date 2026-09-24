@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
@@ -31,6 +32,12 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
       shouldRunScopeWork: () => Effect.succeed(false),
     }),
   ),
+  Layer.provideMerge(
+    Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make(() => Effect.die("Tests must not make an HTTP request")),
+    ),
+  ),
 );
 
 // The `#!/bin/sh` stub below cannot be resolved as an executable on Windows.
@@ -41,6 +48,8 @@ const makeSkillsBinary = Effect.fn("makeDevinSkillsBinary")(function* (options: 
   readonly skillsExitCode?: number;
   readonly rulesOutput?: string;
   readonly rulesExitCode?: number;
+  readonly modelsJson?: string;
+  readonly modelsExitCode?: number;
 }) {
   const dir = yield* Effect.promise(() =>
     NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-driver-skills-")),
@@ -48,12 +57,20 @@ const makeSkillsBinary = Effect.fn("makeDevinSkillsBinary")(function* (options: 
   const binaryPath = NodePath.join(dir, "fake-devin.sh");
   const skillsJsonPath = NodePath.join(dir, "skills.json");
   const rulesPath = NodePath.join(dir, "rules.txt");
+  const modelsJsonPath = NodePath.join(dir, "models.json");
   yield* Effect.promise(() => NodeFSP.writeFile(skillsJsonPath, options.skillsJson, "utf8"));
   yield* Effect.promise(() => NodeFSP.writeFile(rulesPath, options.rulesOutput ?? "", "utf8"));
+  yield* Effect.promise(() =>
+    NodeFSP.writeFile(modelsJsonPath, options.modelsJson ?? '{"families":[]}', "utf8"),
+  );
   const script = `#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "devin 1.0.0"
   exit 0
+fi
+if [ "$1" = "models" ]; then
+  cat '${modelsJsonPath}'
+  exit ${options.modelsExitCode ?? 0}
 fi
 if [ "$1" = "skills" ]; then
   cat '${skillsJsonPath}'
@@ -71,12 +88,16 @@ exit 1
   return binaryPath;
 });
 
-const createInstance = (binaryPath: string, enabled: boolean) =>
+const createInstance = (
+  binaryPath: string,
+  enabled: boolean,
+  environment: ReadonlyArray<{ name: string; value: string; sensitive: boolean }> = [],
+) =>
   DevinDriver.create({
     instanceId: ProviderInstanceId.make("devin-skills-test"),
     displayName: "Devin skills test",
     enabled,
-    environment: [],
+    environment,
     config: { ...DevinDriver.defaultConfig(), binaryPath, enabled },
   });
 
@@ -166,6 +187,80 @@ it.layer(testLayer)("DevinDriver snapshotForCwd", (it) => {
         const exit = yield* Effect.exit(instance.snapshotForCwd!(process.cwd()));
 
         expect(Exit.isFailure(exit)).toBe(true);
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "attaches ACU usage limits to the probed snapshot when consumption credentials exist",
+    () =>
+      Effect.gen(function* () {
+        const binaryPath = yield* makeSkillsBinary({ skillsJson: "[]" });
+        const client = HttpClient.make((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              request.url.includes("/acu-limits/devin")
+                ? Response.json({
+                    items: [{ cycle_acu_limit: 100, scope: "org", org_id: "org-123" }],
+                    has_next_page: false,
+                    end_cursor: null,
+                  })
+                : Response.json({ total_acus: 25, consumption_by_date: [] }),
+            ),
+          ),
+        );
+        const instance = yield* createInstance(binaryPath, true, [
+          { name: "DEVIN_API_KEY", value: "cog_token", sensitive: true },
+          { name: "DEVIN_ORG_ID", value: "org-123", sensitive: false },
+        ]).pipe(Effect.provide(Layer.succeed(HttpClient.HttpClient, client)));
+
+        const snapshot = yield* instance.snapshot.refresh;
+        expect(snapshot.auth.status).toBe("authenticated");
+        expect(snapshot.usageLimits?.windows[0]?.usedPercent).toBe(25);
+        expect(snapshot.usageLimits?.windows[0]?.kind).toBe("monthly");
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "keeps the provider snapshot healthy when the consumption API forbids the credential",
+    () =>
+      Effect.gen(function* () {
+        const binaryPath = yield* makeSkillsBinary({ skillsJson: "[]" });
+        const client = HttpClient.make((request) =>
+          Effect.succeed(HttpClientResponse.fromWeb(request, new Response(null, { status: 403 }))),
+        );
+        const instance = yield* createInstance(binaryPath, true, [
+          { name: "DEVIN_API_KEY", value: "cog_token", sensitive: true },
+          { name: "DEVIN_ORG_ID", value: "org-123", sensitive: false },
+        ]).pipe(Effect.provide(Layer.succeed(HttpClient.HttpClient, client)));
+
+        const snapshot = yield* instance.snapshot.refresh;
+        expect(snapshot.status).toBe("ready");
+        expect(snapshot.usageLimits?.windows).toEqual([]);
+        expect(snapshot.usageLimits?.unavailable?.reason).toBe("unsupported");
+      }),
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "reports usage limits as unsupported instead of probing when no consumption credential is configured",
+    () =>
+      Effect.gen(function* () {
+        const binaryPath = yield* makeSkillsBinary({ skillsJson: "[]" });
+        const client = HttpClient.make(() =>
+          Effect.die("must not request usage without credentials"),
+        );
+        // Explicitly blank the credential names so a host-exported
+        // DEVIN_API_KEY/DEVIN_ORG_ID cannot leak into the probe.
+        const instance = yield* createInstance(binaryPath, true, [
+          { name: "DEVIN_API_KEY", value: "", sensitive: false },
+          { name: "DEVIN_PERSONAL_ACCESS_TOKEN", value: "", sensitive: false },
+          { name: "DEVIN_ORG_ID", value: "", sensitive: false },
+          { name: "DEVIN_ORGANIZATION_ID", value: "", sensitive: false },
+        ]).pipe(Effect.provide(Layer.succeed(HttpClient.HttpClient, client)));
+
+        const snapshot = yield* instance.snapshot.refresh;
+        expect(snapshot.status).toBe("ready");
+        expect(snapshot.usageLimits?.unavailable?.reason).toBe("unsupported");
       }),
   );
 });

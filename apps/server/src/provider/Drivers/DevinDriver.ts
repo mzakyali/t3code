@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
@@ -21,6 +22,7 @@ import {
   buildInitialDevinProviderSnapshot,
   checkDevinProviderStatus,
 } from "../Layers/DevinProvider.ts";
+import { readDevinUsageLimits } from "../Layers/devinUsageLimits.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { discoverDevinRules } from "./DevinRules.ts";
@@ -51,6 +53,7 @@ export type DevinDriverEnv =
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
+  | HttpClient.HttpClient
   | Path.Path
   | ProviderEventLoggers
   | ServerConfig
@@ -84,6 +87,7 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
     Effect.gen(function* () {
       const crypto = yield* Crypto.Crypto;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
       const path = yield* Path.Path;
@@ -107,9 +111,17 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
       });
       const textGeneration = yield* makeDevinTextGeneration(effectiveConfig, processEnv);
       const checkProvider = checkDevinProviderStatus(effectiveConfig, processEnv).pipe(
+        Effect.flatMap((snapshot) =>
+          effectiveConfig.enabled && snapshot.installed && snapshot.auth.status === "authenticated"
+            ? readDevinUsageLimits(processEnv).pipe(
+                Effect.map((usageLimits) => ({ ...snapshot, usageLimits })),
+              )
+            : Effect.succeed(snapshot),
+        ),
         Effect.map(stampIdentity),
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(HttpClient.HttpClient, httpClient),
       );
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<DevinSettings>>({

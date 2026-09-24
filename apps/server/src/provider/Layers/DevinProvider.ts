@@ -1003,6 +1003,8 @@ export function buildDevinModelsFromPayload(
       usesExplicitReasoningUids?: boolean;
       speeds: Set<string>;
       contexts: Set<string>;
+      /** Largest explicit context size (in tokens) any variant reported. */
+      maxContextTokens?: number;
       defaultContextWindow?: string;
       badge?: "new" | "beta";
       costTier?: string;
@@ -1052,6 +1054,9 @@ export function buildDevinModelsFromPayload(
               groups.set(key, created);
               return created;
             })();
+          if (explicitContextTokens !== undefined) {
+            group.maxContextTokens = Math.max(group.maxContextTokens ?? 0, explicitContextTokens);
+          }
           if (badge && group.badge === undefined) group.badge = badge;
           if (costTier && group.costTier === undefined) group.costTier = costTier;
           if (variantPricing) group.pricingByVariant.set(uid, variantPricing);
@@ -1127,6 +1132,9 @@ export function buildDevinModelsFromPayload(
           groups.set(key, created);
           return created;
         })();
+      if (explicitContextTokens !== undefined) {
+        group.maxContextTokens = Math.max(group.maxContextTokens ?? 0, explicitContextTokens);
+      }
       if (badge && group.badge === undefined) group.badge = badge;
       if (costTier && group.costTier === undefined) group.costTier = costTier;
       if (variantPricing) group.pricingByVariant.set(uid, variantPricing);
@@ -1235,9 +1243,7 @@ export function buildDevinModelsFromPayload(
         .filter((value): value is number => value !== undefined)
         .sort((left, right) => right - left)[0];
       const contextWindowTokens =
-        (contextValues.length > 0
-          ? parseContext(contextValues[contextValues.length - 1]!) * 1_000
-          : undefined) ??
+        group.maxContextTokens ??
         pricingContextWindowTokens ??
         defaultPricing?.contextWindowTokens ??
         inferDevinContextWindowTokens(group.base);

@@ -12,6 +12,7 @@ import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
+import { collectSessionConfigOptionValues, findSessionConfigOption } from "./AcpRuntimeModel.ts";
 import {
   devinModelGroupKey,
   parseDevinFusionModelUid,
@@ -120,15 +121,133 @@ export const makeDevinAcpRuntime = (
 export interface DevinAcpModelSelectionErrorContext {
   readonly cause: EffectAcpErrors.AcpError;
   readonly step: "set-config-option";
-  readonly configId: "model";
+  readonly configId: string;
 }
 
+function sessionModelOptionValues(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+): ReadonlyArray<string> {
+  const option =
+    configOptions.find((entry) => entry.category === "model") ??
+    findSessionConfigOption(configOptions, "model");
+  return option === undefined ? [] : collectSessionConfigOptionValues(option);
+}
+
+/**
+ * The `devin models list` catalog is broader than the `model` enum a session
+ * advertises — e.g. `swe-2-max` lists but only `swe-2-high` is selectable,
+ * the same aliasing the CLI's own `--model` resolution performs. When the
+ * resolved UID is absent from the enum, degrade to the closest allowed
+ * variant instead of failing the session. Returns [] when the UID is already
+ * allowed or no enum was advertised.
+ */
+export function resolveDevinSessionModelFallbacks(
+  resolvedUid: string,
+  allowedValues: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  if (allowedValues.length === 0 || allowedValues.includes(resolvedUid)) {
+    return [];
+  }
+  const fusion = parseDevinFusionModelUid(resolvedUid);
+  if (fusion !== undefined) {
+    const allowed = allowedValues.flatMap((value) => {
+      const parsed = parseDevinFusionModelUid(value);
+      return parsed === undefined ? [] : [{ value, parsed }];
+    });
+    const chosen = new Set<string>();
+    const pick = (
+      pred: (parsed: NonNullable<ReturnType<typeof parseDevinFusionModelUid>>) => boolean,
+    ) => {
+      const hit = allowed.find(
+        (candidate) => !chosen.has(candidate.value) && pred(candidate.parsed),
+      )?.value;
+      if (hit !== undefined) chosen.add(hit);
+      return hit;
+    };
+    const sidekickGroup = devinModelGroupKey(parseDevinModelUid(fusion.sidekickSpec));
+    return [
+      // Same lead + sidekick, lead speed relaxed — `-fast` fusion variants
+      // are catalogued but never offered by the session enum.
+      pick(
+        (f) =>
+          f.lead === fusion.lead &&
+          f.leadEffort === fusion.leadEffort &&
+          f.sidekickSpec === fusion.sidekickSpec,
+      ),
+      // Lead effort relaxed.
+      pick((f) => f.lead === fusion.lead && f.sidekickSpec === fusion.sidekickSpec),
+      // Sidekick tier relaxed (e.g. `swe-2-medium` -> `swe-2-high`).
+      pick(
+        (f) =>
+          f.lead === fusion.lead &&
+          devinModelGroupKey(parseDevinModelUid(f.sidekickSpec)) === sidekickGroup,
+      ),
+    ].filter((value): value is string => value !== undefined);
+  }
+  const parsed = parseDevinModelUid(resolvedUid);
+  const group = devinModelGroupKey(parsed);
+  const family = allowedValues
+    .flatMap((value, index) => {
+      if (parseDevinFusionModelUid(value) !== undefined) return [];
+      const candidate = parseDevinModelUid(value);
+      if (devinModelGroupKey(candidate) !== group) return [];
+      let score = 0;
+      if (candidate.contextWindow === parsed.contextWindow) score += 4;
+      if (candidate.reasoning === parsed.reasoning) score += 2;
+      return [{ value, score, index }];
+    })
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map(({ value }) => value);
+  return family;
+}
+
+/**
+ * The model UID that describes a session's effective model after applying a
+ * `thought_level` — e.g. `swe-2-high` + `max` is what `models list` calls
+ * `swe-2-max`, and `glm-5-2-1m` + `max` is `glm-5-2-max-1m`.
+ */
+export function resolveDevinEffectiveModelUid(appliedUid: string, thoughtLevel: string): string {
+  const fusion = parseDevinFusionModelUid(appliedUid);
+  if (fusion !== undefined) {
+    return `fusion-${fusion.lead}-${thoughtLevel}${fusion.fast ? "-fast" : ""}-sidekick-${fusion.sidekickSpec}`;
+  }
+  const parsed = parseDevinModelUid(appliedUid);
+  const selections: ProviderOptionSelection[] = [
+    { id: "reasoning", value: thoughtLevel },
+    ...(parsed.contextWindow ? [{ id: "contextWindow", value: parsed.contextWindow }] : []),
+  ];
+  return resolveDevinModelUid(appliedUid, selections);
+}
+
+function thoughtLevelOption(
+  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+): EffectAcpSchema.SessionConfigOption | undefined {
+  const option =
+    configOptions.find((entry) => entry.category === "thought_level") ??
+    findSessionConfigOption(configOptions, "thought_level");
+  return option?.type === "select" ? option : undefined;
+}
+
+/**
+ * Applies the model selection and resolves to the UID describing the
+ * session's effective model. Devin's ACP session splits model selection
+ * across two config options: the `model` enum carries one member per family
+ * (e.g. `swe-2-high`), while `thought_level` carries the family's effort
+ * tier (`medium|high|max` for SWE-2, up to `low|…|xhigh|max` elsewhere).
+ * `swe-2-max` therefore applies as `model: swe-2-high` + `thought_level: max`.
+ * Variants the enum omits fall back to the closest same-family member, and
+ * qualifiers with no config channel (speed `-fast`) degrade silently, as the
+ * CLI's own `--model` resolution does.
+ */
 export function applyDevinAcpModelSelection<E>(input: {
-  readonly runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "setModel">;
+  readonly runtime: Pick<
+    AcpSessionRuntime.AcpSessionRuntime["Service"],
+    "getConfigOptions" | "setConfigOption" | "setModel"
+  >;
   readonly model: string | null | undefined;
   readonly selections?: ReadonlyArray<ProviderOptionSelection> | null | undefined;
   readonly mapError: (context: DevinAcpModelSelectionErrorContext) => E;
-}): Effect.Effect<void, E> {
+}): Effect.Effect<string, E> {
   const model = resolveDevinModelUid(input.model, input.selections);
   const reasoning = input.selections?.find((option) => option.id === "reasoning")?.value;
   const context = input.selections?.find((option) => option.id === "contextWindow")?.value;
@@ -140,28 +259,38 @@ export function applyDevinAcpModelSelection<E>(input: {
     typeof context === "string" && context.trim()
       ? `${separator}${isUpper ? context.toUpperCase() : context.toLowerCase()}`
       : "";
-  const fallbackCandidates =
+  const contextFallbacks =
     reasoning === "none" && (speed === undefined || speed === "standard")
       ? [contextSuffix.length > 0 ? `${base}${contextSuffix}` : null, base].filter(
           (candidate): candidate is string => candidate !== null && candidate !== model,
         )
       : [];
-  const setModel = input.runtime.setModel(model).pipe(
-    Effect.catch((cause) => {
-      const fallback = fallbackCandidates[0];
-      return fallback === undefined
-        ? Effect.fail(cause)
-        : input.runtime.setModel(fallback).pipe(
-            Effect.catch((fallbackCause) => {
-              const secondFallback = fallbackCandidates[1];
-              return secondFallback === undefined
-                ? Effect.fail(fallbackCause)
-                : input.runtime.setModel(secondFallback);
-            }),
-          );
-    }),
-  );
-  return setModel.pipe(
+  const attempt = (
+    candidates: ReadonlyArray<string>,
+  ): Effect.Effect<string, EffectAcpErrors.AcpError> => {
+    const [first, ...rest] = candidates;
+    if (first === undefined) {
+      return Effect.die("applyDevinAcpModelSelection: empty candidate list");
+    }
+    return input.runtime.setModel(first).pipe(
+      Effect.as(first),
+      Effect.catch((cause) => (rest.length === 0 ? Effect.fail(cause) : attempt(rest))),
+    );
+  };
+  // The effort tier the resolved UID asks for: a fusion variant's lead
+  // effort, otherwise the reasoning suffix. Applied through the session's
+  // `thought_level` option when that option advertises it.
+  const desiredTier =
+    parseDevinFusionModelUid(model)?.leadEffort ?? parseDevinModelUid(model).reasoning;
+  return Effect.flatMap(input.runtime.getConfigOptions, (configOptions) =>
+    attempt(
+      [
+        model,
+        ...resolveDevinSessionModelFallbacks(model, sessionModelOptionValues(configOptions)),
+        ...contextFallbacks,
+      ].filter((value, index, all) => all.indexOf(value) === index),
+    ),
+  ).pipe(
     Effect.mapError((cause) =>
       input.mapError({
         cause,
@@ -169,6 +298,30 @@ export function applyDevinAcpModelSelection<E>(input: {
         configId: "model",
       }),
     ),
+    Effect.flatMap((appliedUid) => {
+      if (desiredTier === undefined) {
+        return Effect.succeed(appliedUid);
+      }
+      return Effect.flatMap(input.runtime.getConfigOptions, (configOptions) => {
+        const option = thoughtLevelOption(configOptions);
+        if (
+          option === undefined ||
+          !collectSessionConfigOptionValues(option).includes(desiredTier)
+        ) {
+          return Effect.succeed(appliedUid);
+        }
+        return input.runtime.setConfigOption(option.id, desiredTier).pipe(
+          Effect.mapError((cause) =>
+            input.mapError({
+              cause,
+              step: "set-config-option",
+              configId: option.id,
+            }),
+          ),
+          Effect.as(resolveDevinEffectiveModelUid(appliedUid, desiredTier)),
+        );
+      });
+    }),
   );
 }
 
