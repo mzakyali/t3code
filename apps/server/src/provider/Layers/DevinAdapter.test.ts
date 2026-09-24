@@ -833,6 +833,141 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
     }),
   );
 
+  it.effect("prompt activity resets the idle timeout so long turns survive", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_PROMPT_TICK_COUNT: "8",
+        T3_ACP_PROMPT_TICK_MS: "300",
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        promptTimeout: "1 second",
+      });
+      const threadId = ThreadId.make("devin-prompt-idle-timeout");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      // The prompt streams ~2.4s of updates — well past the 1s absolute
+      // deadline — but every update resets the idle watchdog, so the turn
+      // completes instead of timing out.
+      const result = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "slow but active prompt",
+          attachments: [],
+        })
+        .pipe(Effect.timeoutOption("10 seconds"));
+      assert.isTrue(Option.isSome(result));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps Devin subagent lifecycle to task events and agent-owned items", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({ T3_ACP_EMIT_DEVIN_SUBAGENT: "1" });
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-subagent-events");
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const taskCompleted = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) return;
+          runtimeEvents.push(event);
+          if (event.type === "task.completed") {
+            yield* Deferred.succeed(taskCompleted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "spawn a subagent",
+        attachments: [],
+      });
+      yield* Deferred.await(taskCompleted).pipe(Effect.timeout("10 seconds"));
+
+      const started = runtimeEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.started" }> =>
+          event.type === "task.started",
+      );
+      assert.isDefined(started);
+      assert.equal(started?.payload.taskId, "agent001");
+      assert.equal(started?.payload.taskType, "subagent");
+      assert.equal(started?.payload.title, "Inventory things");
+      assert.equal(started?.payload.role, "Explore");
+      assert.equal(started?.payload.model, "SWE-2 Max");
+      // Correlated back to the run_subagent launch row so the timeline can
+      // collapse the launch into the agent's spawn row.
+      assert.equal(started?.payload.toolUseId, "run_subagent:1#abc123");
+
+      const completed = runtimeEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
+          event.type === "task.completed",
+      );
+      assert.isDefined(completed);
+      assert.equal(completed?.payload.taskId, "agent001");
+      assert.equal(completed?.payload.status, "completed");
+      assert.equal(completed?.payload.summary, "done");
+
+      // Tool calls stamped with a non-root subagent_context are attributed
+      // to the owning agent so clients can re-home them.
+      const innerItem = runtimeEvents.find(
+        (event) => event.itemId !== undefined && String(event.itemId) === "inner-tool-1",
+      );
+      assert.isDefined(innerItem);
+      assert.equal((innerItem?.payload as { agentId?: string } | undefined)?.agentId, "agent001");
+
+      // The run_subagent launch row itself stays unattributed.
+      const launchItem = runtimeEvents.find(
+        (event) => event.itemId !== undefined && String(event.itemId) === "run_subagent:1#abc123",
+      );
+      assert.isDefined(launchItem);
+      assert.isUndefined((launchItem?.payload as { agentId?: string } | undefined)?.agentId);
+
+      // The subagent's usage frame surfaces as task usage, not the thread
+      // meter.
+      const taskProgress = runtimeEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.progress" }> =>
+          event.type === "task.progress",
+      );
+      assert.isDefined(taskProgress);
+      assert.equal(taskProgress?.payload.taskId, "agent001");
+      assert.deepEqual(taskProgress?.payload.typedUsage, {
+        totalTokens: 1234,
+        inputTokens: 1000,
+        outputTokens: 200,
+        cachedInputTokens: 34,
+      });
+      const threadUsage = runtimeEvents.filter(
+        (event) => event.type === "thread.token-usage.updated",
+      );
+      assert.isFalse(
+        threadUsage.some(
+          (event) =>
+            (event.payload as { usage?: { usedTokens?: number } }).usage?.usedTokens === 1234,
+        ),
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("cancelling a stuck request recovers so the next prompt works", () =>
     Effect.gen(function* () {
       const wrapperPath = yield* makeMockDevinWrapper({

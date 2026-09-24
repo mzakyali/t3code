@@ -17,6 +17,7 @@ const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitDevinResourceToolCall = process.env.T3_ACP_EMIT_DEVIN_RESOURCE_TOOL_CALL === "1";
+const emitDevinSubagent = process.env.T3_ACP_EMIT_DEVIN_SUBAGENT === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
 const emitGenericToolPlaceholders = process.env.T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS === "1";
@@ -60,6 +61,8 @@ const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const promptTickCount = Math.max(0, Number(process.env.T3_ACP_PROMPT_TICK_COUNT ?? "0") || 0);
+const promptTickMs = Math.max(0, Number(process.env.T3_ACP_PROMPT_TICK_MS ?? "0") || 0);
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -1007,6 +1010,111 @@ const program = Effect.gen(function* () {
             content,
           },
         });
+        return { stopReason: "end_turn" };
+      }
+
+      if (emitDevinSubagent) {
+        const agentId = "agent001";
+        // Devin reports its whole subagent protocol inside update._meta
+        // cognition.ai/* keys, which the typed sessionUpdate helper
+        // cannot express — write raw notifications.
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "run_subagent:1#abc123",
+            title: "Ran Explore subagent Inventory things",
+            status: "in_progress",
+            rawInput: {
+              title: "Inventory things",
+              task: "Read the repo and report findings.",
+              profile: "explore",
+              is_background: true,
+            },
+            _meta: {
+              "cognition.ai/inferenceToolName": "run_subagent",
+              "cognition.ai/subagent_context": { parentAgentId: "root" },
+            },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: agentId,
+            status: "in_progress",
+            _meta: {
+              "cognition.ai/subagent_started": {
+                agentId,
+                title: "Inventory things",
+                task: "Read the repo and report findings.",
+                profile: "Explore",
+                model: "SWE-2 Max",
+                isBackground: true,
+                depth: 1,
+              },
+            },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "inner-tool-1",
+            title: "read",
+            kind: "read",
+            status: "completed",
+            _meta: {
+              "cognition.ai/inferenceToolName": "read",
+              "cognition.ai/subagent_context": { parentAgentId: agentId },
+            },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: 1234,
+            size: 200000,
+            _meta: {
+              "cognition.ai/subagent_context": { parentAgentId: agentId },
+              "cognition.ai/inputTokens": 1000,
+              "cognition.ai/outputTokens": 200,
+              "cognition.ai/cachedReadTokens": 34,
+            },
+          },
+        });
+        writeJsonRpcNotification("session/update", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: agentId,
+            status: "completed",
+            _meta: {
+              "cognition.ai/subagent_completed": {
+                agentId,
+                success: true,
+                summary: "done",
+              },
+            },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
+      // Trickles session traffic for longer than a test promptTimeout to
+      // prove the adapter's idle watchdog resets on activity.
+      if (promptTickCount > 0 && promptTickMs > 0) {
+        for (let index = 0; index < promptTickCount; index += 1) {
+          yield* Effect.sleep(`${promptTickMs} millis`);
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: `tick ${index}` },
+            },
+          });
+        }
         return { stopReason: "end_turn" };
       }
 

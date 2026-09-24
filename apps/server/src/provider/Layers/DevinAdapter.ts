@@ -18,13 +18,15 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  RuntimeTaskId,
   type RuntimeMode,
   type ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
 } from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -196,6 +198,15 @@ interface DevinSessionContext {
   totalProcessedTokens: number;
   /** Full ACP model UID, including reasoning/context/speed variants. */
   activeModelUid: string | undefined;
+  /** Epoch millis of the most recent ACP session traffic. The prompt
+   * watchdog only fires after promptTimeout with no activity at all. */
+  lastActivityAtMillis: number;
+  /** Devin subagents still running, keyed by the agentId Devin stamps
+   * on subagent-owned session updates. */
+  readonly openSubagents: Map<string, DevinSubagentIdentity>;
+  /** run_subagent launches awaiting their subagent_started frame, used
+   * to correlate the task lifecycle back to the launch tool row. */
+  readonly pendingAgentLaunches: Array<{ toolCallId: string; title?: string }>;
   stopped: boolean;
 }
 
@@ -336,6 +347,141 @@ const DEVIN_TOOL_CALL_RAW_METADATA_FIELDS = [
 function boundedDevinMetadata(value: unknown): string | undefined {
   return typeof value === "string" && value.length <= DEVIN_RESOURCE_TEXT_MAX_CHARS
     ? value
+    : undefined;
+}
+
+const DEVIN_ROOT_AGENT_ID = "root";
+const DEVIN_RUN_SUBAGENT_TOOL = "run_subagent";
+/** Bounds launches queued for a subagent_started that may never arrive. */
+const DEVIN_MAX_PENDING_AGENT_LAUNCHES = 64;
+
+/** Identity reported once on subagent_started, repeated on every later
+ * task.* row so each persisted activity stays self-describing. */
+interface DevinSubagentIdentity {
+  readonly title?: string;
+  readonly role?: string;
+  readonly model?: string;
+  readonly toolUseId?: string;
+}
+
+interface DevinSubagentStarted {
+  readonly agentId: string;
+  readonly title?: string;
+  readonly profile?: string;
+  readonly model?: string;
+  readonly isBackground?: boolean;
+}
+
+interface DevinSubagentCompleted {
+  readonly agentId: string;
+  readonly success: boolean;
+  readonly summary?: string;
+}
+
+/**
+ * The Devin-specific session-update metadata the adapter consumes. Devin
+ * reports its whole subagent protocol through update._meta cognition.ai/*
+ * keys: lifecycle (subagent_started/subagent_completed), per-update
+ * ownership (subagent_context.parentAgentId), and the real tool name.
+ */
+interface DevinUpdateMeta {
+  readonly inferenceToolName?: string;
+  /** Owning subagent; absent or "root" means the main agent. */
+  readonly parentAgentId?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly cachedReadTokens?: number;
+  readonly subagentStarted?: DevinSubagentStarted;
+  readonly subagentCompleted?: DevinSubagentCompleted;
+}
+
+function devinUpdateMeta(rawPayload: unknown): DevinUpdateMeta | undefined {
+  if (!isRecord(rawPayload) || !isRecord(rawPayload.update)) {
+    return undefined;
+  }
+  const meta = rawPayload.update._meta;
+  if (!isRecord(meta)) {
+    return undefined;
+  }
+
+  let subagentStarted: DevinSubagentStarted | undefined;
+  const started = meta["cognition.ai/subagent_started"];
+  if (
+    isRecord(started) &&
+    typeof started.agentId === "string" &&
+    started.agentId.trim().length > 0
+  ) {
+    const title = boundedDevinMetadata(started.title);
+    const profile = boundedDevinMetadata(started.profile);
+    const model = boundedDevinMetadata(started.model);
+    subagentStarted = {
+      agentId: started.agentId.trim(),
+      ...(title !== undefined ? { title } : {}),
+      ...(profile !== undefined ? { profile } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(started.isBackground === true ? { isBackground: true } : {}),
+    };
+  }
+
+  let subagentCompleted: DevinSubagentCompleted | undefined;
+  const completed = meta["cognition.ai/subagent_completed"];
+  if (
+    isRecord(completed) &&
+    typeof completed.agentId === "string" &&
+    completed.agentId.trim().length > 0
+  ) {
+    const summary =
+      typeof completed.summary === "string"
+        ? completed.summary.slice(0, DEVIN_RESOURCE_TEXT_MAX_CHARS)
+        : undefined;
+    subagentCompleted = {
+      agentId: completed.agentId.trim(),
+      success: completed.success !== false,
+      ...(summary ? { summary } : {}),
+    };
+  }
+
+  const context = meta["cognition.ai/subagent_context"];
+  const parentAgentId = isRecord(context) ? boundedDevinMetadata(context.parentAgentId) : undefined;
+  const inferenceToolName = boundedDevinMetadata(meta["cognition.ai/inferenceToolName"]);
+  const inputTokens =
+    typeof meta["cognition.ai/inputTokens"] === "number"
+      ? nonNegativeInteger(meta["cognition.ai/inputTokens"])
+      : undefined;
+  const outputTokens =
+    typeof meta["cognition.ai/outputTokens"] === "number"
+      ? nonNegativeInteger(meta["cognition.ai/outputTokens"])
+      : undefined;
+  const cachedReadTokens =
+    typeof meta["cognition.ai/cachedReadTokens"] === "number"
+      ? nonNegativeInteger(meta["cognition.ai/cachedReadTokens"])
+      : undefined;
+
+  if (
+    subagentStarted === undefined &&
+    subagentCompleted === undefined &&
+    parentAgentId === undefined &&
+    inferenceToolName === undefined &&
+    inputTokens === undefined &&
+    outputTokens === undefined &&
+    cachedReadTokens === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...(inferenceToolName !== undefined ? { inferenceToolName } : {}),
+    ...(parentAgentId !== undefined ? { parentAgentId } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cachedReadTokens } : {}),
+    ...(subagentStarted !== undefined ? { subagentStarted } : {}),
+    ...(subagentCompleted !== undefined ? { subagentCompleted } : {}),
+  };
+}
+
+function devinOwningAgentId(meta: DevinUpdateMeta | undefined): string | undefined {
+  return meta?.parentAgentId !== undefined && meta.parentAgentId !== DEVIN_ROOT_AGENT_ID
+    ? meta.parentAgentId
     : undefined;
 }
 
@@ -574,7 +720,7 @@ function mapPromptTimeout(
   return new ProviderAdapterRequestError({
     provider,
     method: "session/prompt",
-    detail: `Devin ACP prompt timed out after ${seconds}s. The session has been reset — try sending your message again.`,
+    detail: `Devin ACP prompt timed out after ${seconds}s without activity. The session has been reset — try sending your message again.`,
   });
 }
 
@@ -914,6 +1060,173 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         );
       });
 
+    /**
+     * Resolves once the session has gone promptTimeout without any ACP
+     * traffic. session/prompt only returns when the whole turn finishes,
+     * so an absolute timeout kills healthy long turns; resetting the
+     * deadline on every session update makes it a genuine-stall detector
+     * instead. A pending permission/user-input request also holds the
+     * deadline open — the agent is waiting on the user, not hung.
+     */
+    const promptIdleWatchdog = (ctx: DevinSessionContext): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        const timeoutMillis = Duration.toMillis(promptTimeout);
+        for (;;) {
+          const awaitingUserDecision =
+            ctx.pendingApprovals.size > 0 || ctx.pendingUserInputs.size > 0;
+          const remaining =
+            timeoutMillis - (yield* Clock.currentTimeMillis) + ctx.lastActivityAtMillis;
+          if (remaining <= 0 && !awaitingUserDecision) {
+            return;
+          }
+          yield* Effect.sleep(Duration.millis(Math.min(Math.max(remaining, 250), 30_000)));
+        }
+      });
+
+    /** task.started for a Devin subagent. The container tool_call_update
+     * (whose toolCallId is the agentId) is suppressed in favor of this. */
+    const emitDevinSubagentStarted = (
+      ctx: DevinSessionContext,
+      started: DevinSubagentStarted,
+      parentAgentId: string | undefined,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        // Correlate the run_subagent launch row so its tool row can
+        // collapse into the agent's spawn row (payload.toolUseId).
+        // Titles match exactly; untitled or duplicate launches fall
+        // back to FIFO order.
+        const matchIndex = ctx.pendingAgentLaunches.findIndex(
+          (launch) => started.title !== undefined && launch.title === started.title,
+        );
+        const launch =
+          matchIndex >= 0
+            ? ctx.pendingAgentLaunches.splice(matchIndex, 1)[0]
+            : ctx.pendingAgentLaunches.shift();
+        const identity: DevinSubagentIdentity = {
+          ...(started.title !== undefined ? { title: started.title } : {}),
+          ...(started.profile !== undefined ? { role: started.profile } : {}),
+          ...(started.model !== undefined ? { model: started.model } : {}),
+          ...(launch !== undefined ? { toolUseId: launch.toolCallId } : {}),
+        };
+        ctx.openSubagents.set(started.agentId, identity);
+        yield* offerRuntimeEvent({
+          type: "task.started",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: ctx.activeTurnId,
+          payload: {
+            taskId: RuntimeTaskId.make(started.agentId),
+            taskType: "subagent",
+            ...(started.title !== undefined ? { description: started.title } : {}),
+            ...identity,
+            ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
+          },
+          raw: {
+            source: "acp.jsonrpc",
+            method: "session/update",
+            payload: rawPayload,
+          },
+        });
+      });
+
+    const emitDevinSubagentCompleted = (
+      ctx: DevinSessionContext,
+      completed: DevinSubagentCompleted,
+      parentAgentId: string | undefined,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const identity = ctx.openSubagents.get(completed.agentId);
+        ctx.openSubagents.delete(completed.agentId);
+        yield* offerRuntimeEvent({
+          type: "task.completed",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: ctx.activeTurnId,
+          payload: {
+            taskId: RuntimeTaskId.make(completed.agentId),
+            taskType: "subagent",
+            status: completed.success ? "completed" : "failed",
+            ...(completed.summary !== undefined ? { summary: completed.summary } : {}),
+            ...identity,
+            ...(parentAgentId !== undefined ? { agentId: parentAgentId } : {}),
+          },
+          raw: {
+            source: "acp.jsonrpc",
+            method: "session/update",
+            payload: rawPayload,
+          },
+        });
+      });
+
+    // Devin's session/cancel kills in-flight subagents without emitting
+    // subagent_completed; synthesize stops so their cards do not read as
+    // running forever.
+    const emitDevinSubagentStops = (ctx: DevinSessionContext) =>
+      Effect.forEach(
+        Array.from(ctx.openSubagents.entries()),
+        ([agentId, identity]) =>
+          Effect.gen(function* () {
+            yield* offerRuntimeEvent({
+              type: "task.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              turnId: ctx.activeTurnId,
+              payload: {
+                taskId: RuntimeTaskId.make(agentId),
+                taskType: "subagent",
+                status: "stopped",
+                ...identity,
+              },
+            });
+          }),
+        { discard: true },
+      ).pipe(Effect.ensuring(Effect.sync(() => ctx.openSubagents.clear())));
+
+    // usage_update frames stamped with a non-root parentAgentId describe
+    // that subagent's context, not the thread's — surface them as task
+    // usage instead of corrupting the composer meter.
+    const emitDevinSubagentUsage = (
+      ctx: DevinSessionContext,
+      agentId: string,
+      meta: DevinUpdateMeta,
+      rawPayload: unknown,
+    ) =>
+      Effect.gen(function* () {
+        const identity = ctx.openSubagents.get(agentId);
+        const inputTokens = meta.inputTokens ?? 0;
+        const outputTokens = meta.outputTokens ?? 0;
+        const cachedReadTokens = meta.cachedReadTokens ?? 0;
+        yield* offerRuntimeEvent({
+          type: "task.progress",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId: ctx.activeTurnId,
+          payload: {
+            taskId: RuntimeTaskId.make(agentId),
+            taskType: "subagent",
+            description: identity?.title ?? `Subagent ${agentId}`,
+            typedUsage: {
+              totalTokens: inputTokens + outputTokens + cachedReadTokens,
+              inputTokens,
+              outputTokens,
+              cachedInputTokens: cachedReadTokens,
+            },
+            ...identity,
+          },
+          raw: {
+            source: "acp.jsonrpc",
+            method: "session/update",
+            payload: rawPayload,
+          },
+        });
+      });
+
     // Tears down the ACP runtime (child process, notification fiber, scope)
     // without emitting session.exited or removing the context from the
     // sessions map. Used by the model-change restart path so the visible T3
@@ -922,6 +1235,8 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       Effect.gen(function* () {
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+        // The child process dies with its in-flight subagents.
+        yield* emitDevinSubagentStops(ctx);
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
           ctx.notificationFiber = undefined;
@@ -1030,15 +1345,31 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         const started = yield* Effect.gen(function* () {
           yield* acp.handleUnknownExtRequest((method, params) =>
             mapExtensionFailure(
-              logNative(input.threadId, method, params, "acp.devin.extension").pipe(Effect.as({})),
+              Effect.gen(function* () {
+                if (input.ctxRef.current !== undefined) {
+                  input.ctxRef.current.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+                }
+                yield* logNative(input.threadId, method, params, "acp.devin.extension");
+                return {};
+              }),
             ),
           );
           yield* acp.handleUnknownExtNotification((method, params) =>
-            mapExtensionFailure(logNative(input.threadId, method, params, "acp.devin.extension")),
+            mapExtensionFailure(
+              Effect.gen(function* () {
+                if (input.ctxRef.current !== undefined) {
+                  input.ctxRef.current.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+                }
+                yield* logNative(input.threadId, method, params, "acp.devin.extension");
+              }),
+            ),
           );
           yield* acp.handleRequestPermission((params) =>
             mapExtensionFailure(
               Effect.gen(function* () {
+                if (input.ctxRef.current !== undefined) {
+                  input.ctxRef.current.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+                }
                 const { permissionRequest, payload } = sanitizeDevinPermissionRequest(params);
                 yield* logNative(
                   input.threadId,
@@ -1127,6 +1458,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
       Stream.runDrain(
         Stream.mapEffect(ctx.acp.getEvents(), (event) =>
           Effect.gen(function* () {
+            // Any parsed session traffic proves the agent is alive; the
+            // prompt idle watchdog counts from this timestamp.
+            ctx.lastActivityAtMillis = yield* Clock.currentTimeMillis;
             switch (event._tag) {
               case "EventStreamBarrier":
                 yield* Deferred.succeed(event.acknowledge, undefined);
@@ -1172,6 +1506,43 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                   const toolCall = sanitizeDevinToolCall(event.toolCall);
                   const rawPayload = sanitizeDevinToolCallRawPayload(event.rawPayload, toolCall);
                   yield* logNative(ctx.threadId, "session/update", rawPayload, "acp.jsonrpc");
+                  const meta = devinUpdateMeta(event.rawPayload);
+                  const ownerAgentId = devinOwningAgentId(meta);
+                  if (meta?.subagentStarted !== undefined) {
+                    yield* emitDevinSubagentStarted(
+                      ctx,
+                      meta.subagentStarted,
+                      ownerAgentId,
+                      event.rawPayload,
+                    );
+                    return;
+                  }
+                  if (meta?.subagentCompleted !== undefined) {
+                    yield* emitDevinSubagentCompleted(
+                      ctx,
+                      meta.subagentCompleted,
+                      ownerAgentId,
+                      event.rawPayload,
+                    );
+                    return;
+                  }
+                  if (
+                    meta?.inferenceToolName === DEVIN_RUN_SUBAGENT_TOOL &&
+                    isRecord(event.rawPayload) &&
+                    isRecord(event.rawPayload.update) &&
+                    event.rawPayload.update.sessionUpdate === "tool_call"
+                  ) {
+                    const launchTitle = isRecord(toolCall.data.rawInput)
+                      ? boundedDevinMetadata(toolCall.data.rawInput.title)
+                      : undefined;
+                    ctx.pendingAgentLaunches.push({
+                      toolCallId: toolCall.toolCallId,
+                      ...(launchTitle !== undefined ? { title: launchTitle } : {}),
+                    });
+                    if (ctx.pendingAgentLaunches.length > DEVIN_MAX_PENDING_AGENT_LAUNCHES) {
+                      ctx.pendingAgentLaunches.shift();
+                    }
+                  }
                   yield* offerRuntimeEvent(
                     makeAcpToolCallEvent({
                       stamp: yield* makeEventStamp(),
@@ -1179,6 +1550,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                       threadId: ctx.threadId,
                       turnId: ctx.activeTurnId,
                       toolCall,
+                      ...(ownerAgentId !== undefined ? { agentId: ownerAgentId } : {}),
                       rawPayload,
                     }),
                   );
@@ -1200,6 +1572,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 return;
               case "UsageUpdated":
                 yield* logNative(ctx.threadId, "session/update", event.rawPayload, "acp.jsonrpc");
+                {
+                  const meta = devinUpdateMeta(event.rawPayload);
+                  const ownerAgentId = devinOwningAgentId(meta);
+                  if (meta !== undefined && ownerAgentId !== undefined) {
+                    yield* emitDevinSubagentUsage(ctx, ownerAgentId, meta, event.rawPayload);
+                    return;
+                  }
+                }
                 yield* emitDevinContextUsage(ctx, event.usage, event.rawPayload);
                 return;
             }
@@ -1309,6 +1689,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               (devinModelSelection
                 ? resolveDevinModelUid(devinModelSelection.model, devinModelSelection.options)
                 : undefined),
+            lastActivityAtMillis: 0,
+            openSubagents: new Map(),
+            pendingAgentLaunches: [],
             stopped: false,
           };
           ctxRef.current = ctx;
@@ -1583,62 +1966,66 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         // can still acquire it while the RPC is in flight.
         ({ ctx, turnId, promptParts, resolvedModel, lease }) =>
           Effect.gen(function* () {
-            const result = yield* ctx.acp
-              .prompt({
-                prompt: promptParts,
-              })
-              .pipe(
-                // Map ACP protocol errors to adapter errors first, before the
-                // timeout wrapper adds a non-ACP error type to the channel.
-                Effect.mapError((error) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+            // session/prompt only returns when the whole turn finishes,
+            // so an absolute timeout would kill healthy long turns.
+            // Race the RPC against an idle watchdog instead: every piece
+            // of ACP session traffic resets the deadline, so only a
+            // genuinely stalled session times out.
+            ctx.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+            const outcome = yield* Effect.race(
+              ctx.acp
+                .prompt({
+                  prompt: promptParts,
+                })
+                .pipe(
+                  // Map ACP protocol errors to adapter errors first, before
+                  // the timeout branch adds a non-ACP outcome to the union.
+                  Effect.mapError((error) =>
+                    mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                  ),
+                  Effect.map((result) => ({ _tag: "completed" as const, result })),
                 ),
-                Effect.timeoutOption(promptTimeout),
-                Effect.flatMap((result) =>
-                  Option.match(result, {
-                    onNone: () =>
-                      withThreadLock(
-                        input.threadId,
-                        Effect.gen(function* () {
-                          // A timeout from an invalidated turn must not reset
-                          // or cancel a replacement prompt on the same ACP
-                          // session.
-                          if (!isDevinPromptLeaseCurrent(ctx, lease)) {
-                            settleDevinPromptLease(ctx, lease);
-                            return;
-                          }
+              promptIdleWatchdog(ctx).pipe(Effect.as({ _tag: "timedOut" as const })),
+            );
+            const result = yield* outcome._tag === "completed"
+              ? Effect.succeed(outcome.result)
+              : withThreadLock(
+                  input.threadId,
+                  Effect.gen(function* () {
+                    // A timeout from an invalidated turn must not reset
+                    // or cancel a replacement prompt on the same ACP
+                    // session.
+                    if (!isDevinPromptLeaseCurrent(ctx, lease)) {
+                      settleDevinPromptLease(ctx, lease);
+                      return;
+                    }
 
-                          const updatedAt = yield* nowIso;
-                          ctx.activePromptLeases.clear();
-                          ctx.activeTurnId = undefined;
-                          ctx.session = {
-                            ...ctx.session,
-                            activeTurnId: undefined,
-                            updatedAt,
-                          };
-                          // Keep cancellation under the thread lock so a new
-                          // prompt cannot become active between the reset and
-                          // the session-wide cancel notification.
-                          yield* Effect.ignore(
-                            ctx.acp.cancel.pipe(
-                              Effect.mapError((error) =>
-                                mapAcpToAdapterError(
-                                  PROVIDER,
-                                  input.threadId,
-                                  "session/cancel",
-                                  error,
-                                ),
-                              ),
-                            ),
-                          );
-                        }),
-                      ).pipe(
-                        Effect.andThen(mapPromptTimeout(PROVIDER, input.threadId, promptTimeout)),
+                    // The canceled turn abandons in-flight subagents; no
+                    // subagent_completed frames will arrive for them.
+                    // Emit stops while activeTurnId still points at the
+                    // dying turn so the terminal rows stay attributed.
+                    yield* emitDevinSubagentStops(ctx);
+
+                    const updatedAt = yield* nowIso;
+                    ctx.activePromptLeases.clear();
+                    ctx.activeTurnId = undefined;
+                    ctx.session = {
+                      ...ctx.session,
+                      activeTurnId: undefined,
+                      updatedAt,
+                    };
+                    // Keep cancellation under the thread lock so a new
+                    // prompt cannot become active between the reset and
+                    // the session-wide cancel notification.
+                    yield* Effect.ignore(
+                      ctx.acp.cancel.pipe(
+                        Effect.mapError((error) =>
+                          mapAcpToAdapterError(PROVIDER, input.threadId, "session/cancel", error),
+                        ),
                       ),
-                    onSome: Effect.succeed,
+                    );
                   }),
-                ),
-              );
+                ).pipe(Effect.andThen(mapPromptTimeout(PROVIDER, input.threadId, promptTimeout)));
 
             // Keep result projection and prompt accounting atomic with
             // interrupt, timeout, and replacement-turn acquisition.
@@ -1722,6 +2109,10 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           const ctx = yield* requireSession(threadId);
           yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
           yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          // The cancel below kills in-flight subagents without emitting
+          // subagent_completed; close their task rows first so the turn
+          // attribution stays intact.
+          yield* emitDevinSubagentStops(ctx);
           // Reset turn accounting so the next sendTurn opens a fresh turn
           // instead of steering into a stuck one. Without this, a cancelled
           // stuck prompt leaves an active lease and the session never
