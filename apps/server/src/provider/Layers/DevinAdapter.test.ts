@@ -1043,6 +1043,150 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
     }),
   );
 
+  it.effect("interruptTurn emits a cancelled turn.completed for the in-flight turn", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-interrupt-terminal");
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnStarted = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) return;
+          runtimeEvents.push(event);
+          if (event.type === "turn.started") {
+            yield* Deferred.succeed(turnStarted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "hang first prompt",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.await(turnStarted).pipe(Effect.timeout("5 seconds"));
+      for (let i = 0; i < 16; i += 1) {
+        yield* Effect.yieldNow;
+      }
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(sendTurnFiber).pipe(Effect.timeout("5 seconds"));
+
+      for (let i = 0; i < 8; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      // Interrupting a turn must close it in the runtime event stream — the
+      // projection settles the session only when a terminal turn event lands,
+      // so without one the session reads as running forever.
+      const startedTurnId = runtimeEvents.find((event) => event.type === "turn.started")?.turnId;
+      assert.isDefined(startedTurnId);
+      const terminalEvents = runtimeEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed",
+      );
+      assert.lengthOf(terminalEvents, 1);
+      assert.equal(String(terminalEvents[0]?.turnId), String(startedTurnId));
+      assert.equal(terminalEvents[0]?.payload.state, "cancelled");
+      assert.equal(terminalEvents[0]?.payload.stopReason, "cancelled");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("interruptTurn abandons a queued steer before its prompt reaches the agent", () =>
+    Effect.gen(function* () {
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-acp-requests-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+        T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("devin-interrupt-queued-steer");
+
+      const turnStarted = yield* Deferred.make<void>();
+      const cancelReceived = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          if (String(event.threadId) !== String(threadId)) return;
+          if (event.type === "turn.started") {
+            yield* Deferred.succeed(turnStarted, undefined).pipe(Effect.ignore);
+          }
+          // The mock only emits this chunk after its session/cancel handler
+          // ran — a receipt that the cancel was received and logged.
+          if (event.type === "content.delta" && event.payload.delta.includes("late after cancel")) {
+            yield* Deferred.succeed(cancelReceived, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const firstSend = yield* adapter
+        .sendTurn({ threadId, input: "hang first prompt", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(turnStarted).pipe(Effect.timeout("5 seconds"));
+      for (let i = 0; i < 16; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      // A sendTurn while a prompt is in flight is a steer: it leases against
+      // the active turn, then queues inside the runtime behind the hung
+      // session/prompt RPC.
+      const steerSend = yield* adapter
+        .sendTurn({ threadId, input: "steer while running", attachments: [] })
+        .pipe(Effect.forkChild);
+      for (let i = 0; i < 16; i += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      yield* adapter.interruptTurn(threadId);
+      yield* Fiber.join(firstSend).pipe(Effect.timeout("5 seconds"));
+      yield* Fiber.join(steerSend).pipe(Effect.timeout("5 seconds"));
+      yield* Deferred.await(cancelReceived).pipe(Effect.timeout("5 seconds"));
+
+      // Stopping the turn must not let the queued steer dispatch a second
+      // session/prompt — that would start fresh agent work after the stop.
+      const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      const promptCalls = requestLog
+        .split("\n")
+        .filter((line) => line.includes('"session/prompt"'));
+      assert.lengthOf(promptCalls, 1);
+      const cancelCalls = requestLog
+        .split("\n")
+        .filter((line) => line.includes('"session/cancel"'));
+      assert.isNotEmpty(cancelCalls);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("concurrent sendTurn calls do not create duplicate turns", () =>
     Effect.gen(function* () {
       const wrapperPath = yield* makeMockDevinWrapper({ T3_ACP_PROMPT_DELAY_MS: "500" });

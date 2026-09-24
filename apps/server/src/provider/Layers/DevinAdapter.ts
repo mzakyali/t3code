@@ -188,6 +188,11 @@ interface DevinSessionContext {
    * means a turn is actively running, so a new sendTurn steers that turn.
    * Lease identity prevents stale finalizers from consuming newer prompts. */
   readonly activePromptLeases: Set<DevinPromptLease>;
+  /** Completed when the active turn is interrupted. sendTurns that captured
+   * it abandon their session/prompt — one queued behind the in-flight RPC
+   * must not dispatch fresh agent work after the interrupt. Rotated so a
+   * follow-up turn races a fresh signal. */
+  turnInterrupt: Deferred.Deferred<void>;
   /** Latest ACP-reported context window values. */
   lastContextWindowUsed: number | undefined;
   lastContextWindowSize: number | undefined;
@@ -1678,6 +1683,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
             activePromptLeases: new Set(),
+            turnInterrupt: yield* Deferred.make<void>(),
             lastContextWindowUsed: undefined,
             lastContextWindowSize: undefined,
             lastAcpUsage: undefined,
@@ -1935,6 +1941,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               Effect.gen(function* () {
                 ctx.activePromptLeases.add(lease);
                 ctx.activeTurnId = turnId;
+                const turnInterrupt = ctx.turnInterrupt;
                 if (steeringTurnId === undefined) {
                   ctx.lastPlanFingerprint = undefined;
                 }
@@ -1957,14 +1964,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                   });
                 }
 
-                return { ctx, turnId, promptParts, resolvedModel, lease };
+                return { ctx, turnId, promptParts, resolvedModel, lease, turnInterrupt };
               }),
             );
           }),
         ).pipe(Effect.interruptible),
         // Run the prompt outside the thread lock so interrupts and steers
         // can still acquire it while the RPC is in flight.
-        ({ ctx, turnId, promptParts, resolvedModel, lease }) =>
+        ({ ctx, turnId, promptParts, resolvedModel, lease, turnInterrupt }) =>
           Effect.gen(function* () {
             // session/prompt only returns when the whole turn finishes,
             // so an absolute timeout would kill healthy long turns.
@@ -1973,20 +1980,35 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             // genuinely stalled session times out.
             ctx.lastActivityAtMillis = yield* Clock.currentTimeMillis;
             const outcome = yield* Effect.race(
-              ctx.acp
-                .prompt({
-                  prompt: promptParts,
-                })
-                .pipe(
-                  // Map ACP protocol errors to adapter errors first, before
-                  // the timeout branch adds a non-ACP outcome to the union.
-                  Effect.mapError((error) =>
-                    mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              Effect.race(
+                ctx.acp
+                  .prompt({
+                    prompt: promptParts,
+                  })
+                  .pipe(
+                    // Map ACP protocol errors to adapter errors first, before
+                    // the timeout branch adds a non-ACP outcome to the union.
+                    Effect.mapError((error) =>
+                      mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                    ),
+                    Effect.map((result) => ({ _tag: "completed" as const, result })),
                   ),
-                  Effect.map((result) => ({ _tag: "completed" as const, result })),
-                ),
+                // The runtime serializes session/prompt behind any in-flight
+                // turn. Without this arm a prompt still queued there would
+                // reach the agent after interruptTurn already settled it.
+                Deferred.await(turnInterrupt).pipe(Effect.as({ _tag: "interrupted" as const })),
+              ),
               promptIdleWatchdog(ctx).pipe(Effect.as({ _tag: "timedOut" as const })),
             );
+            if (outcome._tag === "interrupted") {
+              // interruptTurn emitted the terminal event; this sendTurn just
+              // unwinds without dispatching or settling anything further.
+              return {
+                threadId: input.threadId,
+                turnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
             const result = yield* outcome._tag === "completed"
               ? Effect.succeed(outcome.result)
               : withThreadLock(
@@ -2014,6 +2036,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                       activeTurnId: undefined,
                       updatedAt,
                     };
+                    // Prompts of the dead turn still queued behind the
+                    // runtime's session/prompt serialization must not reach
+                    // the agent after the teardown.
+                    yield* Deferred.succeed(ctx.turnInterrupt, undefined).pipe(Effect.ignore);
+                    ctx.turnInterrupt = yield* Deferred.make<void>();
                     // Keep cancellation under the thread lock so a new
                     // prompt cannot become active between the reset and
                     // the session-wide cancel notification.
@@ -2113,6 +2140,18 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           // subagent_completed; close their task rows first so the turn
           // attribution stays intact.
           yield* emitDevinSubagentStops(ctx);
+          // The turn dies here: once its leases are gone, sendTurn's
+          // completion path treats the prompt result as stale and emits
+          // nothing, so the terminal event has to come from interruptTurn or
+          // the projected session reads as running forever.
+          const interruptedTurnId = ctx.activePromptLeases.size > 0 ? ctx.activeTurnId : undefined;
+          if (interruptedTurnId !== undefined) {
+            // Prompts of the dying turn that are still queued behind the
+            // runtime's session/prompt serialization abandon before their
+            // RPC reaches the agent; the cancel below covers dispatched ones.
+            yield* Deferred.succeed(ctx.turnInterrupt, undefined).pipe(Effect.ignore);
+            ctx.turnInterrupt = yield* Deferred.make<void>();
+          }
           // Reset turn accounting so the next sendTurn opens a fresh turn
           // instead of steering into a stuck one. Without this, a cancelled
           // stuck prompt leaves an active lease and the session never
@@ -2131,6 +2170,16 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               ),
             ),
           );
+          if (interruptedTurnId !== undefined) {
+            yield* offerRuntimeEvent({
+              type: "turn.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId,
+              turnId: interruptedTurnId,
+              payload: { state: "cancelled", stopReason: "cancelled" },
+            });
+          }
         }),
       );
 
