@@ -1130,6 +1130,12 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           matchIndex >= 0
             ? ctx.pendingAgentLaunches.splice(matchIndex, 1)[0]
             : ctx.pendingAgentLaunches.shift();
+        // The run_subagent launch call never reports a terminal status of
+        // its own — spawning the agent is where its work ends. The spawned
+        // container call carries liveness from here on.
+        if (launch !== undefined) {
+          ctx.activeToolCallIds.delete(launch.toolCallId);
+        }
         const identity: DevinSubagentIdentity = {
           ...(started.title !== undefined ? { title: started.title } : {}),
           ...(started.profile !== undefined ? { role: started.profile } : {}),
@@ -1976,6 +1982,10 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 const turnInterrupt = ctx.turnInterrupt;
                 if (steeringTurnId === undefined) {
                   ctx.lastPlanFingerprint = undefined;
+                  // A session/load replay surfaces historical tool_call
+                  // frames whose terminal update may never have existed —
+                  // with no turn in flight, any leftover id is stale.
+                  ctx.activeToolCallIds.clear();
                 }
                 ctx.session = {
                   ...ctx.session,
@@ -2132,6 +2142,12 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
                     settleDevinPromptLease(ctx, lease);
                     if (completionStamp !== undefined) {
+                      // A tool call whose terminal update never arrived
+                      // (cancel, dropped frame, suppressed container call)
+                      // would leak the extended watchdog deadline into the
+                      // next turn; reap at turn end — a still-live tool
+                      // re-adds itself on its next update.
+                      ctx.activeToolCallIds.clear();
                       yield* offerRuntimeEvent({
                         type: "turn.completed",
                         ...completionStamp,

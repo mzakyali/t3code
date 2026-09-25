@@ -918,6 +918,57 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
     }),
   );
 
+  it.effect("a dangling tool call does not leak the extended timeout into the next turn", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_DANGLING_TOOL_THEN_HANG: "1",
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        promptTimeout: "2 seconds",
+        activeToolPromptTimeout: "30 seconds",
+      });
+      const threadId = ThreadId.make("devin-dangling-tool-timeout");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      // First turn ends while its tool call still reports in_progress.
+      yield* adapter.sendTurn({
+        threadId,
+        input: "run a tool that never completes",
+        attachments: [],
+      });
+
+      // The stale id must be reaped at turn end: the next prompt hangs and
+      // stalls at the 2s idle deadline, not the 30s active-tool one.
+      const exit = yield* adapter
+        .sendTurn({ threadId, input: "then go quiet", attachments: [] })
+        .pipe(
+          Effect.map(Exit.succeed),
+          Effect.catch((error) => Effect.succeed(Exit.fail(error))),
+          Effect.timeoutOption("10 seconds"),
+        );
+      assert.isTrue(Option.isSome(exit));
+      if (Option.isSome(exit)) {
+        assert.isTrue(Exit.isFailure(exit.value));
+        if (Exit.isFailure(exit.value)) {
+          const error = Cause.findErrorOption(exit.value.cause);
+          if (Option.isSome(error)) {
+            assert.instanceOf(error.value, ProviderAdapterRequestError);
+            assert.match(error.value.detail, /timed out/i);
+          }
+        }
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("an open Devin subagent holds the prompt timeout open", () =>
     Effect.gen(function* () {
       const wrapperPath = yield* makeMockDevinWrapper({

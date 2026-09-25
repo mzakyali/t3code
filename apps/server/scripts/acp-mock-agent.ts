@@ -33,6 +33,7 @@ const emitXAiAskUserQuestionThenHang =
 const emitContentThenHang = process.env.T3_ACP_EMIT_CONTENT_THEN_HANG === "1";
 const emitPlanThenHang = process.env.T3_ACP_EMIT_PLAN_THEN_HANG === "1";
 const emitActiveToolThenHang = process.env.T3_ACP_EMIT_ACTIVE_TOOL_THEN_HANG === "1";
+const emitDanglingToolThenHang = process.env.T3_ACP_DANGLING_TOOL_THEN_HANG === "1";
 const emitUsageUpdate = process.env.T3_ACP_EMIT_USAGE_UPDATE === "1";
 const emitGrokMonitorPostTurnPoll = process.env.T3_ACP_EMIT_GROK_MONITOR_POST_TURN_POLL === "1";
 const emitGrokBackgroundTaskStarted = process.env.T3_ACP_EMIT_GROK_BACKGROUND_TASK_STARTED === "1";
@@ -786,6 +787,27 @@ const program = Effect.gen(function* () {
             status: "in_progress",
           },
         });
+        return yield* Effect.never;
+      }
+
+      if (emitDanglingToolThenHang) {
+        // The first turn completes while its tool call still reports
+        // in_progress — the terminal update simply never arrives. Later
+        // prompts hang so the adapter must not inherit the stale call's
+        // extended watchdog deadline.
+        if (promptCount === 1) {
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-call-dangling-1",
+              title: "Fire-and-forget tool",
+              kind: "execute",
+              status: "in_progress",
+            },
+          });
+          return { stopReason: "end_turn" };
+        }
         return yield* Effect.never;
       }
 
