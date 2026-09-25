@@ -66,10 +66,13 @@ const WORKSPACE_ROOT = "/tmp/project-from-server";
 const CLAUDE_SESSION_ID = "123e4567-e89b-42d3-a456-426614174000";
 const encodeTranscriptRecord = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
-const makeThread = (source: "codex" | "claudeAgent"): AgentSessionScanner.AgentSessionThread => ({
+const makeThread = (
+  source: "codex" | "claudeAgent" | "devin",
+): AgentSessionScanner.AgentSessionThread => ({
   source,
   providerInstanceId: ProviderInstanceId.make(source),
-  providerSessionId: source === "codex" ? "codex-session" : CLAUDE_SESSION_ID,
+  providerSessionId:
+    source === "codex" ? "codex-session" : source === "devin" ? "devin-session" : CLAUDE_SESSION_ID,
   title: `Imported ${source} thread`,
   model: null,
   createdAt: "2026-08-24T10:00:00.000Z",
@@ -206,6 +209,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         let scannedRoot: string | undefined;
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
           recentThreads: (workspaceRoot) => {
             scannedRoot = workspaceRoot;
             return Stream.concat(
@@ -287,6 +291,62 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       }),
     );
 
+    it.effect("passes the session selection through and stores a Devin resume cursor", () =>
+      Effect.gen(function* () {
+        const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
+        let receivedSelection: unknown;
+        const scanner = AgentSessionScanner.AgentSessionScanner.of({
+          scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
+          recentThreads: (_workspaceRoot, _completed, selection) => {
+            receivedSelection = selection;
+            return Stream.succeed(makeThreadOutcome(makeThread("devin")));
+          },
+        });
+        const engine = OrchestrationEngine.OrchestrationEngineService.of({
+          dispatch: () => Effect.sync(() => ({ sequence: 1 })),
+          readEvents: () => Stream.empty,
+          readThreadEvents: () => Stream.empty,
+          getThreadReplayStats: () => Effect.die("unused"),
+          streamDomainEvents: Stream.empty,
+          subscribeDomainEvents: Effect.succeed(Stream.empty),
+          latestSequence: Effect.succeed(0),
+        });
+        const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+          upsert: (binding) => Effect.sync(() => void bindings.push(binding)),
+          getProvider: () => Effect.die("unused"),
+          recordImportedTranscript: () => Effect.void,
+          getBinding: () => Effect.succeed(Option.none()),
+          listThreadIds: () => Effect.die("unused"),
+          listBindings: () => Effect.die("unused"),
+        });
+
+        const result = yield* importRecentAgentThreads({
+          projectId: PROJECT_ID,
+          sessions: [{ provider: "devin", providerSessionId: "devin-session" }],
+        }).pipe(
+          Effect.provideService(AgentSessionScanner.AgentSessionScanner, scanner),
+          Effect.provideService(OrchestrationEngine.OrchestrationEngineService, engine),
+          Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, directory),
+          Effect.provide(makeSnapshotsLayer({ project: makeProject() })),
+        );
+
+        expect(result).toEqual({ importedCount: 1, skippedCount: 0 });
+        expect(receivedSelection).toEqual([
+          { provider: "devin", providerSessionId: "devin-session" },
+        ]);
+        expect(bindings).toMatchObject([
+          {
+            threadId: "import:devin:devin-session",
+            provider: "devin",
+            providerInstanceId: "devin",
+            resumeCursor: { schemaVersion: 1, sessionId: "devin-session" },
+            runtimePayload: { cwd: WORKSPACE_ROOT },
+          },
+        ]);
+      }),
+    );
+
     it.effect("rejects a changed project root before scanning or writing", () =>
       Effect.gen(function* () {
         const recentThreads = vi.fn(() => Stream.empty);
@@ -298,6 +358,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
             AgentSessionScanner.AgentSessionScanner,
             AgentSessionScanner.AgentSessionScanner.of({
               scan: Effect.die("must not scan a changed project"),
+              listThreads: () => Effect.die("unused"),
               recentThreads,
             }),
           ),
@@ -322,6 +383,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       Effect.gen(function* () {
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
           recentThreads: () => Stream.succeed({ _tag: "Skipped" }),
         });
         const engine = OrchestrationEngine.OrchestrationEngineService.of({
@@ -363,6 +425,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
         const bindings: Array<ProviderSessionDirectory.ProviderRuntimeBinding> = [];
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
           recentThreads: () => Stream.fromIterable([makeThreadOutcome(makeThread("codex"))]),
         });
         const engine = OrchestrationEngine.OrchestrationEngineService.of({
@@ -443,6 +506,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       Effect.gen(function* () {
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
           recentThreads: () => Stream.fromIterable([makeThreadOutcome(makeThread("codex"))]),
         });
         const runningBinding: ProviderSessionDirectory.ProviderRuntimeBinding = {
@@ -491,6 +555,7 @@ it.layer(NodeServices.layer)("AgentSessionImporter", (it) => {
       Effect.gen(function* () {
         const scanner = AgentSessionScanner.AgentSessionScanner.of({
           scan: Effect.die("unused"),
+          listThreads: () => Effect.die("unused"),
           recentThreads: () =>
             Stream.fromIterable([
               makeThreadOutcome({ ...makeThread("claudeAgent"), providerSessionId: "not-a-uuid" }),
@@ -552,6 +617,7 @@ const integrationThread = {
 };
 const integrationScanner = AgentSessionScanner.AgentSessionScanner.of({
   scan: Effect.die("unused"),
+  listThreads: () => Effect.die("unused"),
   recentThreads: () => Stream.fromIterable([makeThreadOutcome(integrationThread)]),
 });
 const integrationServerConfig = ServerConfig.layerTest(process.cwd(), {
@@ -1000,6 +1066,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
             AgentSessionScanner.AgentSessionScanner,
             AgentSessionScanner.AgentSessionScanner.of({
               scan: Effect.die("unused"),
+              listThreads: () => Effect.die("unused"),
               recentThreads: () => Stream.succeed(makeThreadOutcome(sourceThread)),
             }),
           ),
@@ -1020,6 +1087,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
       const threadId = ThreadId.make(`import:codex:${providerSessionId}`);
       const scanner = AgentSessionScanner.AgentSessionScanner.of({
         scan: Effect.die("unused"),
+        listThreads: () => Effect.die("unused"),
         recentThreads: () =>
           Stream.succeed(
             makeThreadOutcome({ ...integrationThread, providerSessionId, title: "Binding race" }),
@@ -1114,6 +1182,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
       const threadId = ThreadId.make(`import:codex:${providerSessionId}`);
       const scanner = AgentSessionScanner.AgentSessionScanner.of({
         scan: Effect.die("unused"),
+        listThreads: () => Effect.die("unused"),
         recentThreads: () =>
           Stream.succeed(
             makeThreadOutcome({ ...integrationThread, providerSessionId, title: "Turn race" }),

@@ -744,6 +744,18 @@ export const DevinSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "devin", clearWhenEmpty: "omit" },
       }),
     ),
+    homePath: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Data directory",
+        description:
+          "Custom Devin CLI data directory holding sessions.db. Leave empty to use the default location.",
+        providerSettingsForm: {
+          placeholder: "~/.local/share/devin/cli",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     agentType: DevinAgentType.pipe(
       Schema.withDecodingDefault(Effect.succeed("default" as const)),
       Schema.annotateKey({
@@ -781,7 +793,7 @@ export const DevinSettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["binaryPath", "agentType", "refusalFallback", "cloud"],
+    order: ["binaryPath", "homePath", "agentType", "refusalFallback", "cloud"],
   },
 );
 export type DevinSettings = typeof DevinSettings.Type;

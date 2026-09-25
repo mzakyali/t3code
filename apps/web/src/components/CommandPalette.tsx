@@ -162,11 +162,19 @@ import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sideb
 import { resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
 import { CommandPaletteContent } from "./CommandPaletteContent";
 import { CommandPaletteResults } from "./CommandPaletteResults";
-import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon, ForgejoIcon } from "./Icons";
+import {
+  AzureDevOpsIcon,
+  BitbucketIcon,
+  DevinIcon,
+  GitHubIcon,
+  GitLabIcon,
+  ForgejoIcon,
+} from "./Icons";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
 import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
+import { openImportDevinSessionsDialog } from "./agentSessions/ImportDevinSessionsDialog";
 import { ProjectContentSearchDialog } from "./search/ProjectContentSearchDialog";
 import { toggleThemeEditorForTheme } from "./settings/themeEditorStore";
 import { searchSettings, SETTINGS_SECTION_LABELS } from "./settings/settingsSearch";
@@ -1874,6 +1882,31 @@ function OpenCommandPaletteDialog(props: {
       openAddProjectFlow();
     },
   });
+
+  const importDevinEnvironmentId =
+    activeThread?.environmentId ?? defaultProjectRef?.environmentId ?? primaryEnvironmentId;
+  if (importDevinEnvironmentId !== null) {
+    actionItems.push({
+      kind: "action",
+      value: "action:import-devin-sessions",
+      searchTerms: [
+        "import",
+        "devin",
+        "session",
+        "history",
+        "resume",
+        "previous",
+        "finished",
+        "conversation",
+      ],
+      title: "Import Devin sessions",
+      description: "Pick finished Devin CLI sessions to continue as threads",
+      icon: <DevinIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        openImportDevinSessionsDialog({ environmentId: importDevinEnvironmentId });
+      },
+    });
+  }
 
   if (wslAddProjectEnvironmentOption) {
     actionItems.push({

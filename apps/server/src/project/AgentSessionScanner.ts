@@ -19,13 +19,18 @@ import {
   AgentSessionScanError,
   ClaudeSettings,
   CodexSettings,
+  DevinSettings,
   ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
   type AgentSessionImportSource,
+  type AgentSessionListedThread,
+  type AgentSessionListThreadsInput,
+  type AgentSessionListThreadsResult,
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
+  type AgentSessionSelection,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -50,8 +55,10 @@ import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
+import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as DevinSessionStore from "./DevinSessionStore.ts";
 import {
   createTranscriptJsonReader,
   createTranscriptJsonSelector,
@@ -137,6 +144,7 @@ const TranscriptRecord = Schema.Struct({
 
 const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
+const decodeDevinSettings = Schema.decodeUnknownOption(DevinSettings);
 const decodeTranscriptRecord = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptRecord));
 const decodeTranscriptValue = Schema.decodeUnknownOption(TranscriptRecord);
 const selectTranscriptPath = createTranscriptJsonSelector(TranscriptRecord);
@@ -192,7 +200,16 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      selection?: ReadonlyArray<AgentSessionSelection>,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /**
+     * Per-session listing for the import picker. `projectId` scopes the list
+     * to sessions recorded under that project's root; without it every
+     * discoverable session is returned.
+     */
+    readonly listThreads: (
+      input: AgentSessionListThreadsInput,
+    ) => Effect.Effect<AgentSessionListThreadsResult, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -208,6 +225,13 @@ interface RawCandidate {
   readonly transcripts: ReadonlyArray<{
     readonly filePath: string;
     readonly mtimeMs: number | null;
+    /**
+     * Devin keeps sessions in one database rather than one file each: the
+     * transcript's `filePath` is a synthetic `${dbPath}#${sessionId}` key and
+     * these two fields carry the real coordinates for the session row.
+     */
+    readonly dbPath?: string;
+    readonly providerSessionId?: string;
   }>;
 }
 
@@ -625,11 +649,13 @@ export const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const baseDir = path.resolve(serverConfig.baseDir);
   const worktreesDir = path.resolve(serverConfig.worktreesDir);
   // Windows filesystems are case-insensitive, so path prefix checks there
   // must case fold.
-  const foldWorktreeCase = (yield* HostProcessPlatform) === "win32";
+  const hostPlatform = yield* HostProcessPlatform;
+  const foldWorktreeCase = hostPlatform === "win32";
   const hostEnvironment = yield* HostProcessEnvironment;
   const homeDir = NodeOS.homedir();
   // `/private/tmp` is what macOS reports for sessions started in `/tmp`.
@@ -684,6 +710,54 @@ export const make = Effect.gen(function* () {
       .pipe(Effect.orElseSucceed(() => resolved));
     return `path:${normalizeProjectPathForComparison(realPath)}`;
   });
+
+  /**
+   * Devin session ids a T3 thread already owns. `claimed` covers both threads
+   * created by an import (`import:` ids) and threads that ran the session
+   * natively; `native` is the subset that must not be re-imported — importing
+   * a T3-owned session would fork a second T3 thread onto the same Devin
+   * session while the original still resumes it.
+   */
+  const devinClaimedSessionIds = Effect.fn("AgentSessionScanner.devinClaimedSessionIds")(
+    function* () {
+      const bindings = yield* providerSessionDirectory
+        .listBindings()
+        .pipe(
+          Effect.orElseSucceed(
+            (): ReadonlyArray<ProviderSessionDirectory.ProviderRuntimeBindingWithMetadata> => [],
+          ),
+        );
+      const claimed = new Set<string>();
+      const native = new Set<string>();
+      for (const binding of bindings) {
+        if (binding.provider !== "devin") continue;
+        const cursor = binding.resumeCursor;
+        const sessionId =
+          typeof cursor === "object" && cursor !== null && "sessionId" in cursor
+            ? cursor.sessionId
+            : undefined;
+        if (typeof sessionId !== "string" || sessionId.length === 0) continue;
+        claimed.add(sessionId);
+        if (!binding.threadId.startsWith("import:")) native.add(sessionId);
+      }
+      return { claimed, native };
+    },
+  );
+
+  /**
+   * Data directories holding `sessions.db` for one Devin instance, deduped by
+   * filesystem identity. The Devin CLI has no home env var, so only the
+   * instance's configured data directory and the platform defaults apply.
+   */
+  const resolveDevinHomes = (instance: ProviderInstanceConfig): ReadonlyArray<string> => {
+    const config = decodeDevinSettings(instance.config ?? {});
+    if (Option.isNone(config)) return [];
+    return DevinSessionStore.resolveDevinDataDirs({
+      homePath: config.value.homePath,
+      platform: hostPlatform,
+      localAppData: hostEnvironment["LOCALAPPDATA"],
+    });
+  };
 
   /**
    * Git identity of a directory, or the reason it has none. Reads `.git`
@@ -1089,14 +1163,20 @@ export const make = Effect.gen(function* () {
 
     const raw: Array<RawCandidate> = [];
     let truncated = false;
+    const devinOwned = yield* devinClaimedSessionIds();
 
-    for (const source of ["claudeAgent", "codex"] as const) {
+    for (const source of ["claudeAgent", "codex", "devin"] as const) {
+      // Devin defaults to disabled because running it needs an installed CLI.
+      // History discovery is read-only, so sessions stay importable whether or
+      // not the provider is enabled — execution still respects the flag.
       const instances: Array<{
         readonly instanceId: ProviderInstanceId;
         readonly config: ProviderInstanceConfig;
       }> = Object.entries(settings.providerInstances)
         .filter(
-          ([, instance]) => instance.driver === source && resolveProviderInstanceEnabled(instance),
+          ([, instance]) =>
+            instance.driver === source &&
+            (source === "devin" || resolveProviderInstanceEnabled(instance)),
         )
         .map(([instanceId, config]) => ({
           instanceId: ProviderInstanceId.make(instanceId),
@@ -1110,7 +1190,7 @@ export const make = Effect.gen(function* () {
             config: settings.providers[source],
           },
         };
-        if (resolveProviderInstanceEnabled(legacyInstance.config)) {
+        if (source === "devin" || resolveProviderInstanceEnabled(legacyInstance.config)) {
           instances.push(legacyInstance);
         }
       }
@@ -1125,17 +1205,20 @@ export const make = Effect.gen(function* () {
       const homes: Array<{ homePath: string; providerInstanceId: ProviderInstanceId }> = [];
       const seenHomes = new Set<string>();
       for (const { instanceId, config: instance } of instances) {
-        const homeVariable = source === "claudeAgent" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
-        const environmentHome =
-          instance.environment?.findLast((variable) => variable.name === homeVariable)?.value ??
-          hostEnvironment[homeVariable];
-
-        let homePath: string;
+        let homePaths: ReadonlyArray<string>;
         if (source === "claudeAgent") {
+          const environmentHome =
+            instance.environment?.findLast((variable) => variable.name === "CLAUDE_CONFIG_DIR")
+              ?.value ?? hostEnvironment["CLAUDE_CONFIG_DIR"];
           const config = decodeClaudeSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
-          homePath = resolveClaudeConfigDir(config.value.homePath, environmentHome);
+          homePaths = [resolveClaudeConfigDir(config.value.homePath, environmentHome)];
+        } else if (source === "devin") {
+          homePaths = resolveDevinHomes(instance);
         } else {
+          const environmentHome =
+            instance.environment?.findLast((variable) => variable.name === "CODEX_HOME")?.value ??
+            hostEnvironment["CODEX_HOME"];
           const config = decodeCodexSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
           const codexSettings =
@@ -1147,13 +1230,50 @@ export const make = Effect.gen(function* () {
           const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
             Effect.provideService(Path.Path, path),
           );
-          homePath = layout.sharedHomePath;
+          homePaths = [layout.sharedHomePath];
         }
 
-        const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
-        if (seenHomes.has(homeKey)) continue;
-        seenHomes.add(homeKey);
-        homes.push({ homePath, providerInstanceId: instanceId });
+        for (const homePath of homePaths) {
+          const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
+          if (seenHomes.has(homeKey)) continue;
+          seenHomes.add(homeKey);
+          homes.push({ homePath, providerInstanceId: instanceId });
+        }
+      }
+
+      if (source === "devin") {
+        for (const home of homes) {
+          const dbPath = path.join(home.homePath, "sessions.db");
+          const dbStats = yield* statOption(dbPath);
+          if (Option.isNone(dbStats) || dbStats.value.type !== "File") continue;
+          const sessions = yield* DevinSessionStore.listSessions(dbPath);
+          const byWorkspace = new Map<string, Array<DevinSessionStore.DevinSessionSummary>>();
+          for (const session of sessions) {
+            if (devinOwned.native.has(session.sessionId)) continue;
+            const group = byWorkspace.get(session.workspaceRoot);
+            if (group === undefined) {
+              byWorkspace.set(session.workspaceRoot, [session]);
+            } else {
+              group.push(session);
+            }
+          }
+          for (const [cwd, group] of byWorkspace) {
+            raw.push({
+              cwd,
+              source,
+              providerInstanceId: home.providerInstanceId,
+              threadCount: group.length,
+              lastActiveAtMs: Math.max(...group.map((session) => session.lastActivityAtMs)),
+              transcripts: group.map((session) => ({
+                filePath: `${dbPath}#${session.sessionId}`,
+                mtimeMs: session.lastActivityAtMs,
+                dbPath,
+                providerSessionId: session.sessionId,
+              })),
+            });
+          }
+        }
+        continue;
       }
 
       const transcriptCandidates: Array<TranscriptCandidate> = [];
@@ -1328,6 +1448,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    selection: ReadonlyArray<AgentSessionSelection> | undefined,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1335,6 +1456,15 @@ export const make = Effect.gen(function* () {
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+    // An explicit selection names resumable session ids directly; those
+    // sessions bypass the recency window because the picker deliberately
+    // offers finished and inactive sessions. Only transcripts that carry
+    // their provider session id (Devin rows, Claude filenames) can match.
+    const selectionSet =
+      selection === undefined
+        ? null
+        : new Set(selection.map((entry) => `${entry.provider}|${entry.providerSessionId}`));
+    const devinOwned = yield* devinClaimedSessionIds();
 
     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
     cachedCandidates = candidates;
@@ -1350,6 +1480,24 @@ export const make = Effect.gen(function* () {
       if ((yield* directoryIdentity(resolved)) !== rootIdentity) continue;
 
       for (const transcript of candidate.transcripts) {
+        if (selectionSet !== null) {
+          const transcriptSessionId =
+            transcript.providerSessionId ??
+            (candidate.source === "claudeAgent"
+              ? path.basename(transcript.filePath, ".jsonl")
+              : null);
+          if (
+            transcriptSessionId === null ||
+            !selectionSet.has(`${candidate.source}|${transcriptSessionId}`)
+          ) {
+            continue;
+          }
+          eligibleTranscripts.push({
+            candidate,
+            transcript: { ...transcript, mtimeMs: transcript.mtimeMs ?? 0 },
+          });
+          continue;
+        }
         if (
           transcript.mtimeMs === null ||
           transcript.mtimeMs < cutoffMs ||
@@ -1382,6 +1530,93 @@ export const make = Effect.gen(function* () {
     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
       Stream.mapEffect(({ candidate, transcript }) =>
         Effect.gen(function* () {
+          if (candidate.source === "devin") {
+            const sessionId = transcript.providerSessionId;
+            const dbPath = transcript.dbPath;
+            if (sessionId === undefined || dbPath === undefined) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            }
+            // A session a T3 thread already runs natively is not importable —
+            // importing would fork a second thread onto the same Devin
+            // session. It contributes no outcome.
+            if (devinOwned.native.has(sessionId)) {
+              return Option.none<AgentSessionRecentThread>();
+            }
+            if (transcriptsRemaining === 0 || bytesRemaining === 0 || recordsRemaining === 0) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            }
+            const thread = yield* DevinSessionStore.readSessionThread(dbPath, sessionId);
+            if (thread === null) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            }
+            // The session row's activity stamp and message bytes stand in for
+            // file identity: either changing invalidates a recorded source
+            // the same way an mtime bump does for transcript files.
+            const identity = {
+              filePath: transcript.filePath,
+              size: thread.messageBytes,
+              mtimeMs: thread.lastActivityAtMs,
+              device: 0,
+              inode: null,
+              birthtimeMs: thread.createdAtMs,
+            };
+            const completedSource = completedSources.find(
+              (source) =>
+                source.provider === "devin" &&
+                source.providerInstanceId === candidate.providerInstanceId &&
+                source.filePath === transcript.filePath &&
+                sameTranscriptIdentity(source, identity),
+            );
+            if (completedSource !== undefined) {
+              const sessionKey = `${completedSource.providerInstanceId}|${completedSource.providerSessionId}`;
+              if (importedSessions.has(sessionKey)) {
+                return Option.none<AgentSessionRecentThread>();
+              }
+              importedSessions.add(sessionKey);
+              return Option.some<AgentSessionRecentThread>({
+                _tag: "AlreadyImported",
+                source: completedSource,
+              });
+            }
+            if (identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES || identity.size > bytesRemaining) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            }
+            transcriptsRemaining -= 1;
+            bytesRemaining -= identity.size;
+            recordsRemaining -= thread.messages.length;
+            const expandedCwd = expandHomePath(thread.workspaceRoot.trim());
+            if (
+              !path.isAbsolute(expandedCwd) ||
+              (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity
+            ) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            }
+            const source: AgentSessionImportSource = {
+              ...identity,
+              provider: "devin",
+              providerInstanceId: candidate.providerInstanceId,
+              providerSessionId: sessionId,
+            };
+            const sessionKey = `${candidate.providerInstanceId}|${sessionId}`;
+            if (importedSessions.has(sessionKey)) {
+              return Option.some<AgentSessionRecentThread>({ _tag: "Duplicate", source });
+            }
+            importedSessions.add(sessionKey);
+            return Option.some<AgentSessionRecentThread>({
+              _tag: "Importable",
+              thread: {
+                source: "devin",
+                providerInstanceId: candidate.providerInstanceId,
+                providerSessionId: sessionId,
+                title: thread.title,
+                model: thread.model,
+                createdAt: thread.createdAt,
+                updatedAt: thread.updatedAt,
+                messages: thread.messages,
+              },
+              source,
+            });
+          }
           const completed = completedByFile.get(
             `${candidate.providerInstanceId}\0${transcript.filePath}`,
           );
@@ -1484,12 +1719,125 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  /**
+   * Devin sessions listed for the picker. Re-resolves homes from settings
+   * instead of reusing `cachedCandidates` so the list reflects sessions
+   * created after the last scan, and marks sessions a T3 thread already owns.
+   */
+  const listThreads: AgentSessionScanner["Service"]["listThreads"] = Effect.fn(
+    "AgentSessionScanner.listThreads",
+  )(function* (input) {
+    const settings = yield* serverSettings.getSettings.pipe(
+      Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
+    );
+    const shellSnapshot = yield* projectionSnapshotQuery
+      .getShellSnapshot()
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const devinOwned = yield* devinClaimedSessionIds();
+
+    const projectsByRoot = new Map<string, (typeof shellSnapshot.projects)[number]>();
+    for (const project of shellSnapshot.projects) {
+      const projectRoot = path.resolve(expandHomePath(project.workspaceRoot));
+      projectsByRoot.set(normalizeProjectPathForComparison(projectRoot), project);
+      projectsByRoot.set(yield* directoryIdentity(projectRoot), project);
+    }
+
+    let scopedRootIdentity: string | null = null;
+    if (input.projectId !== undefined) {
+      const project = shellSnapshot.projects.find((entry) => entry.id === input.projectId);
+      if (project === undefined) return { threads: [] };
+      scopedRootIdentity = yield* directoryIdentity(
+        path.resolve(expandHomePath(project.workspaceRoot)),
+      );
+    }
+
+    // Listing is read-only history discovery, so a disabled Devin provider
+    // still contributes sessions — same policy as collectCandidates.
+    const instances: Array<{
+      readonly instanceId: ProviderInstanceId;
+      readonly config: ProviderInstanceConfig;
+    }> = Object.entries(settings.providerInstances)
+      .filter(([, instance]) => instance.driver === "devin")
+      .map(([instanceId, config]) => ({
+        instanceId: ProviderInstanceId.make(instanceId),
+        config,
+      }));
+    if (!Object.hasOwn(settings.providerInstances, "devin")) {
+      instances.push({
+        instanceId: ProviderInstanceId.make("devin"),
+        config: {
+          driver: ProviderDriverKind.make("devin"),
+          config: settings.providers.devin,
+        },
+      });
+    }
+    instances.sort(
+      (left, right) =>
+        (left.instanceId === "devin" ? 0 : 1) - (right.instanceId === "devin" ? 0 : 1),
+    );
+
+    const threads: Array<AgentSessionListedThread> = [];
+    const seenHomes = new Set<string>();
+    const seenSessions = new Set<string>();
+    for (const { instanceId, config: instance } of instances) {
+      for (const homePath of resolveDevinHomes(instance)) {
+        const homeKey = yield* directoryIdentity(homePath);
+        if (seenHomes.has(homeKey)) continue;
+        seenHomes.add(homeKey);
+        const dbPath = path.join(homePath, "sessions.db");
+        const dbStats = yield* statOption(dbPath);
+        if (Option.isNone(dbStats) || dbStats.value.type !== "File") continue;
+        for (const session of yield* DevinSessionStore.listSessions(dbPath)) {
+          if (seenSessions.has(session.sessionId)) continue;
+          seenSessions.add(session.sessionId);
+          const expanded = expandHomePath(session.workspaceRoot.trim());
+          if (!path.isAbsolute(expanded)) continue;
+          const resolved = path.resolve(expanded);
+          if (isExcludedProjectPath(resolved)) continue;
+          const dirStats = yield* statOption(resolved);
+          // Sessions whose workspace was deleted cannot be imported.
+          if (Option.isNone(dirStats) || dirStats.value.type !== "Directory") continue;
+          const rootIdentity = yield* directoryIdentity(resolved, dirStats.value);
+          if (scopedRootIdentity !== null && rootIdentity !== scopedRootIdentity) continue;
+          const project =
+            projectsByRoot.get(normalizeProjectPathForComparison(resolved)) ??
+            projectsByRoot.get(rootIdentity);
+          threads.push({
+            provider: "devin",
+            providerInstanceId: instanceId,
+            providerSessionId: session.sessionId,
+            title: session.title?.trim() || session.sessionId,
+            model: session.model,
+            workspaceRoot: session.workspaceRoot,
+            createdAt: DateTime.formatIso(DateTime.makeUnsafe(session.createdAtMs)),
+            updatedAt: DateTime.formatIso(DateTime.makeUnsafe(session.lastActivityAtMs)),
+            messageCount: session.messageCount,
+            ...(project === undefined ? {} : { projectId: project.id }),
+            imported: devinOwned.claimed.has(session.sessionId),
+          });
+        }
+      }
+    }
+
+    threads.sort(
+      (left, right) =>
+        (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "") ||
+        left.providerSessionId.localeCompare(right.providerSessionId),
+    );
+    return { threads };
+  });
+
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    selection,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, selection));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  return AgentSessionScanner.of({ scan, recentThreads, listThreads });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make);

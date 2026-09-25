@@ -39,6 +39,7 @@ import {
   canPickExternalProjectFavicon,
   ProjectFaviconPickerDialog,
 } from "./ProjectFaviconPickerDialog";
+import { openImportDevinSessionsDialog } from "../agentSessions/ImportDevinSessionsDialog";
 import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
@@ -491,6 +492,37 @@ function ProjectDetail({
         </SettingsSection>
         <ProjectDefaultsSettings category="project" />
         <ProjectActionsSettings />
+        <SettingsSection title="Sessions">
+          {group.memberProjects.map((member) => (
+            <SettingsRow
+              key={member.physicalProjectKey}
+              title={
+                group.memberProjects.length > 1
+                  ? (member.environmentLabel ?? "Environment")
+                  : "Import Devin sessions"
+              }
+              description={
+                group.memberProjects.length > 1
+                  ? member.workspaceRoot
+                  : "Browse sessions the Devin CLI recorded in this project's folder and continue them as threads."
+              }
+              control={
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    openImportDevinSessionsDialog({
+                      environmentId: member.environmentId,
+                      projectId: member.id,
+                    })
+                  }
+                >
+                  Import Devin sessions
+                </Button>
+              }
+            />
+          ))}
+        </SettingsSection>
         {hasMultipleCheckouts ? checkoutChoices : null}
         <SettingsSection title="Danger">
           <SettingsRow

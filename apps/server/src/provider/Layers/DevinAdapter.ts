@@ -95,7 +95,8 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("devin");
-const DEVIN_RESUME_VERSION = 1 as const;
+/** Resume cursor schema version. Shared with the agent-session importer, which writes cursors for sessions created outside T3. */
+export const DEVIN_RESUME_VERSION = 1 as const;
 const ACP_PLAN_MODE_ALIASES = ["plan"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["accept-edits", "smart", "bypass"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];

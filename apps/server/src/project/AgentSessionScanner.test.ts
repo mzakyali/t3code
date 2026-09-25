@@ -1,5 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
+import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it } from "@effect/vitest";
 import {
   type OrchestrationProjectShell,
@@ -7,6 +9,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerSettings as ContractServerSettings,
+  ThreadId,
 } from "@t3tools/contracts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as Effect from "effect/Effect";
@@ -20,6 +23,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
@@ -74,11 +78,36 @@ const makeProjectionSnapshotQueryLayer = (importedWorkspaceRoots: ReadonlyArray<
 interface ScannerTestInput {
   readonly claudeHomePath: string;
   readonly codexHomePath: string;
+  readonly devinHomePath?: string;
   readonly importedWorkspaceRoots?: ReadonlyArray<string>;
+  /** Devin sessions already bound to T3 threads, keyed by the owning thread. */
+  readonly devinBindings?: ReadonlyArray<{
+    readonly threadId: string;
+    readonly sessionId: string;
+  }>;
   /** Base dir for the test ServerConfig; worktreesDir derives from it. */
   readonly configBaseDir?: string;
   readonly providerInstances?: ContractServerSettings["providerInstances"];
 }
+
+const makeProviderSessionDirectoryLayer = (input: ScannerTestInput) =>
+  Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, {
+    upsert: () => Effect.die("unused"),
+    recordImportedTranscript: () => Effect.die("unused"),
+    getProvider: () => Effect.die("unused"),
+    getBinding: () => Effect.die("unused"),
+    listThreadIds: () => Effect.die("unused"),
+    listBindings: () =>
+      Effect.succeed(
+        (input.devinBindings ?? []).map((binding) => ({
+          threadId: ThreadId.make(binding.threadId),
+          provider: ProviderDriverKind.make("devin"),
+          status: "stopped" as const,
+          resumeCursor: { schemaVersion: 1, sessionId: binding.sessionId },
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+        })),
+      ),
+  });
 
 const makeScannerTestLayer = (input: ScannerTestInput) =>
   AgentSessionScanner.layer.pipe(
@@ -88,6 +117,10 @@ const makeScannerTestLayer = (input: ScannerTestInput) =>
           providers: {
             claudeAgent: { homePath: input.claudeHomePath },
             codex: { homePath: input.codexHomePath },
+            // Without a configured home the scanner falls back to the real
+            // platform default data dir — keep tests pointed at a path that
+            // never exists instead.
+            devin: { homePath: input.devinHomePath ?? `${input.claudeHomePath}-no-devin` },
           },
           ...(input.providerInstances === undefined
             ? {}
@@ -98,6 +131,7 @@ const makeScannerTestLayer = (input: ScannerTestInput) =>
           input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
         ),
         makeProjectionSnapshotQueryLayer(input.importedWorkspaceRoots ?? []),
+        makeProviderSessionDirectoryLayer(input),
       ),
     ),
   );
@@ -108,12 +142,28 @@ const runScan = (input: ScannerTestInput) =>
     return yield* scanner.scan;
   }).pipe(Effect.provide(makeScannerTestLayer(input)));
 
-const runRecentThreadOutcomes = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
+const runRecentThreadOutcomes = (
+  input: ScannerTestInput & {
+    readonly workspaceRoot: string;
+    readonly selection?: ReadonlyArray<{
+      readonly provider: "claudeAgent" | "codex" | "devin";
+      readonly providerSessionId: string;
+    }>;
+  },
+) =>
   Effect.gen(function* () {
     const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-    return yield* scanner.recentThreads(input.workspaceRoot).pipe(
+    return yield* scanner.recentThreads(input.workspaceRoot, [], input.selection).pipe(
       Stream.runCollect,
       Effect.map((outcomes) => Array.from(outcomes)),
+    );
+  }).pipe(Effect.provide(makeScannerTestLayer(input)));
+
+const runListThreads = (input: ScannerTestInput & { readonly projectId?: ProjectId }) =>
+  Effect.gen(function* () {
+    const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+    return yield* scanner.listThreads(
+      input.projectId === undefined ? {} : { projectId: input.projectId },
     );
   }).pipe(Effect.provide(makeScannerTestLayer(input)));
 
@@ -143,6 +193,95 @@ const writeTranscript = Effect.fn("AgentSessionScanner.test.writeTranscript")(fu
   const seconds = input.mtimeMs / 1000;
   yield* fileSystem.utimes(input.filePath, seconds, seconds);
 });
+
+/**
+ * Build a Devin CLI `sessions.db` fixture with the real schema. Columns the
+ * reader never touches are filled with placeholders.
+ */
+const writeDevinDb = Effect.fn("AgentSessionScanner.test.writeDevinDb")(function* (input: {
+  readonly dbPath: string;
+  readonly sessions: ReadonlyArray<{
+    readonly id: string;
+    readonly workingDirectory: string;
+    readonly title?: string | null;
+    readonly model?: string;
+    readonly createdAt: number;
+    readonly lastActivityAt: number;
+    readonly mainChainId?: number | null;
+    readonly hidden?: boolean;
+  }>;
+  readonly nodes: ReadonlyArray<{
+    readonly sessionId: string;
+    readonly nodeId: number;
+    readonly parentNodeId?: number | null;
+    readonly chatMessage: string;
+    readonly createdAt: number;
+  }>;
+}) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  yield* fileSystem.makeDirectory(path.dirname(input.dbPath), { recursive: true });
+  yield* Effect.acquireUseRelease(
+    Effect.sync(() => new NodeSqlite.DatabaseSync(input.dbPath)),
+    (db) =>
+      Effect.sync(() => {
+        db.exec(`CREATE TABLE sessions (
+          id TEXT PRIMARY KEY,
+          working_directory TEXT NOT NULL,
+          backend_type TEXT NOT NULL DEFAULT 'local',
+          model TEXT NOT NULL DEFAULT '',
+          agent_mode TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          last_activity_at INTEGER NOT NULL,
+          title TEXT,
+          main_chain_id INTEGER,
+          hidden INTEGER NOT NULL DEFAULT 0
+        )`);
+        db.exec(`CREATE TABLE message_nodes (
+          row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          node_id INTEGER NOT NULL,
+          parent_node_id INTEGER,
+          chat_message TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )`);
+        const insertSession = db.prepare(
+          `INSERT INTO sessions
+            (id, working_directory, model, created_at, last_activity_at, title, main_chain_id, hidden)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        for (const session of input.sessions) {
+          insertSession.run(
+            session.id,
+            session.workingDirectory,
+            session.model ?? "adaptive",
+            session.createdAt,
+            session.lastActivityAt,
+            session.title ?? null,
+            session.mainChainId ?? null,
+            session.hidden === true ? 1 : 0,
+          );
+        }
+        const insertNode = db.prepare(
+          `INSERT INTO message_nodes
+            (session_id, node_id, parent_node_id, chat_message, created_at)
+          VALUES (?, ?, ?, ?, ?)`,
+        );
+        for (const node of input.nodes) {
+          insertNode.run(
+            node.sessionId,
+            node.nodeId,
+            node.parentNodeId ?? null,
+            node.chatMessage,
+            node.createdAt,
+          );
+        }
+      }),
+    (db) => Effect.sync(() => db.close()),
+  );
+});
+
+const devinChatMessage = (role: string, content: string) => JSON.stringify({ role, content });
 
 /** Claude session line: the first record carries the real `cwd`. */
 const claudeSessionLine = (cwd: string) =>
@@ -2608,6 +2747,308 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
             outcome._tag === "Importable" ? [outcome.thread.providerSessionId] : [],
           ),
         ).toEqual(["recent-session"]);
+      }),
+    );
+  });
+
+  describe("devin sessions", () => {
+    it.effect("groups database sessions by workspace during scan", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const devinHomePath = yield* makeTempDir("t3code-devin-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-devin-");
+
+        yield* writeDevinDb({
+          dbPath: path.join(devinHomePath, "sessions.db"),
+          sessions: [
+            {
+              id: "devin-old",
+              workingDirectory: workspace,
+              title: "Old work",
+              createdAt: 1_577_836_800,
+              lastActivityAt: 1_577_900_000,
+            },
+            {
+              id: "devin-new",
+              workingDirectory: workspace,
+              title: "New work",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_100,
+            },
+            {
+              id: "devin-hidden",
+              workingDirectory: workspace,
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_200,
+              hidden: true,
+            },
+          ],
+          nodes: [
+            {
+              sessionId: "devin-old",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "old prompt"),
+              createdAt: 1_577_836_900,
+            },
+            {
+              sessionId: "devin-new",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "new prompt"),
+              createdAt: 1_700_000_050,
+            },
+          ],
+        });
+
+        const result = yield* runScan({ claudeHomePath, codexHomePath, devinHomePath });
+
+        expect(result.candidates).toEqual([
+          {
+            path: workspace,
+            title: path.basename(workspace),
+            sources: ["devin"],
+            threadCount: 2,
+            lastActiveAt: "2023-11-14T22:15:00.000Z",
+            alreadyImported: false,
+            git: null,
+          },
+        ]);
+      }),
+    );
+
+    it.effect("imports an explicitly selected session outside the recency window", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const devinHomePath = yield* makeTempDir("t3code-devin-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-devin-");
+
+        // 2020: far outside the 30-day recent window. Only an explicit
+        // selection should import it.
+        yield* writeDevinDb({
+          dbPath: path.join(devinHomePath, "sessions.db"),
+          sessions: [
+            {
+              id: "devin-finished",
+              workingDirectory: workspace,
+              title: "Finished work",
+              model: "opus",
+              createdAt: 1_577_836_800,
+              lastActivityAt: 1_577_900_000,
+            },
+          ],
+          nodes: [
+            {
+              sessionId: "devin-finished",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "fix the flaky test"),
+              createdAt: 1_577_836_900,
+            },
+            {
+              sessionId: "devin-finished",
+              nodeId: 2,
+              parentNodeId: 1,
+              chatMessage: devinChatMessage("assistant", "done"),
+              createdAt: 1_577_837_000,
+            },
+          ],
+        });
+
+        const input = { claudeHomePath, codexHomePath, devinHomePath, workspaceRoot: workspace };
+        const unselected = yield* runRecentThreads(input);
+        expect(unselected).toEqual([]);
+
+        const outcomes = yield* runRecentThreadOutcomes({
+          ...input,
+          selection: [{ provider: "devin", providerSessionId: "devin-finished" }],
+        });
+        const threads = outcomes.flatMap((outcome) =>
+          outcome._tag === "Importable" ? [outcome.thread] : [],
+        );
+        expect(threads).toHaveLength(1);
+        expect(threads[0]).toMatchObject({
+          source: "devin",
+          providerSessionId: "devin-finished",
+          title: "Finished work",
+          model: "opus",
+          messages: [
+            { role: "user", text: "fix the flaky test" },
+            { role: "assistant", text: "done" },
+          ],
+        });
+      }),
+    );
+
+    it.effect("does not offer sessions a T3 thread already runs natively", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const devinHomePath = yield* makeTempDir("t3code-devin-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-devin-");
+
+        yield* writeDevinDb({
+          dbPath: path.join(devinHomePath, "sessions.db"),
+          sessions: [
+            {
+              id: "devin-native",
+              workingDirectory: workspace,
+              title: "Running in T3",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_100,
+            },
+            {
+              id: "devin-free",
+              workingDirectory: workspace,
+              title: "Importable",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_200,
+            },
+          ],
+          nodes: [
+            {
+              sessionId: "devin-native",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "native prompt"),
+              createdAt: 1_700_000_010,
+            },
+            {
+              sessionId: "devin-free",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "free prompt"),
+              createdAt: 1_700_000_020,
+            },
+          ],
+        });
+
+        const input = {
+          claudeHomePath,
+          codexHomePath,
+          devinHomePath,
+          workspaceRoot: workspace,
+          devinBindings: [{ threadId: "thread-native-owner", sessionId: "devin-native" }],
+          selection: [
+            { provider: "devin" as const, providerSessionId: "devin-native" },
+            { provider: "devin" as const, providerSessionId: "devin-free" },
+          ],
+        };
+        const outcomes = yield* runRecentThreadOutcomes(input);
+        expect(
+          outcomes.flatMap((outcome) =>
+            outcome._tag === "Importable" ? [outcome.thread.providerSessionId] : [],
+          ),
+        ).toEqual(["devin-free"]);
+
+        // The scan already drops native-owned sessions, so a project
+        // candidate only counts the free one.
+        const scan = yield* runScan(input);
+        expect(scan.candidates.map((candidate) => candidate.threadCount)).toEqual([1]);
+      }),
+    );
+
+    it.effect("lists sessions for the picker, scoped to the project and marked imported", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const devinHomePath = yield* makeTempDir("t3code-devin-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-devin-");
+        const otherWorkspace = yield* makeTempDir("t3code-workspace-other-");
+
+        yield* writeDevinDb({
+          dbPath: path.join(devinHomePath, "sessions.db"),
+          sessions: [
+            {
+              id: "devin-bound",
+              workingDirectory: workspace,
+              title: "Already in T3",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_300,
+            },
+            {
+              id: "devin-free",
+              workingDirectory: workspace,
+              title: "Free session",
+              model: "opus",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_100,
+            },
+            {
+              id: "devin-elsewhere",
+              workingDirectory: otherWorkspace,
+              title: "Other folder",
+              createdAt: 1_700_000_000,
+              lastActivityAt: 1_700_000_200,
+            },
+          ],
+          nodes: [
+            {
+              sessionId: "devin-bound",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "bound prompt"),
+              createdAt: 1_700_000_010,
+            },
+            {
+              sessionId: "devin-free",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "free prompt"),
+              createdAt: 1_700_000_020,
+            },
+            {
+              sessionId: "devin-elsewhere",
+              nodeId: 1,
+              chatMessage: devinChatMessage("user", "other prompt"),
+              createdAt: 1_700_000_030,
+            },
+          ],
+        });
+
+        const input = {
+          claudeHomePath,
+          codexHomePath,
+          devinHomePath,
+          importedWorkspaceRoots: [workspace],
+          devinBindings: [{ threadId: "import:devin:devin-bound", sessionId: "devin-bound" }],
+        };
+
+        const scoped = yield* runListThreads({ ...input, projectId: ProjectId.make("project-1") });
+        expect(scoped.threads).toEqual([
+          {
+            provider: "devin",
+            providerInstanceId: "devin",
+            providerSessionId: "devin-bound",
+            title: "Already in T3",
+            model: "adaptive",
+            workspaceRoot: workspace,
+            createdAt: "2023-11-14T22:13:20.000Z",
+            updatedAt: "2023-11-14T22:18:20.000Z",
+            messageCount: 1,
+            projectId: ProjectId.make("project-1"),
+            imported: true,
+          },
+          {
+            provider: "devin",
+            providerInstanceId: "devin",
+            providerSessionId: "devin-free",
+            title: "Free session",
+            model: "opus",
+            workspaceRoot: workspace,
+            createdAt: "2023-11-14T22:13:20.000Z",
+            updatedAt: "2023-11-14T22:15:00.000Z",
+            messageCount: 1,
+            projectId: ProjectId.make("project-1"),
+            imported: false,
+          },
+        ]);
+
+        const unscoped = yield* runListThreads(input);
+        expect(unscoped.threads.map((thread) => thread.providerSessionId)).toEqual([
+          "devin-bound",
+          "devin-elsewhere",
+          "devin-free",
+        ]);
       }),
     );
   });

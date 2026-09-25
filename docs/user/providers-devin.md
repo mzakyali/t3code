@@ -48,6 +48,19 @@ configured. Sessions outside T3 remain visible in Devin's Billing/Session Insigh
 Provider event logs are retained for a limited period by the server's observability policy. Export
 or review a Usage window before rotating logs if you need a longer local record.
 
+## Importing existing sessions
+
+Sessions the Devin CLI already recorded on this machine — including finished or inactive ones — can
+be continued in T3 Code. Use the command palette's **Import Devin sessions** action or the
+**Sessions** section in a project's settings to browse sessions grouped by the folder they ran in,
+select the ones you want, and import them. A project is created when the session's folder has none.
+
+Import copies the visible conversation (user and assistant text, newest 200 messages) into a new
+thread and keeps the Devin session id, so sending a message resumes the original session instead of
+starting over. Sessions a T3 thread already owns are marked as imported and cannot be selected again.
+If the Devin CLI data directory is not the default, set **Data directory** in the Devin provider
+settings.
+
 ## Capability limits
 
 Devin sessions use T3's shared ACP integration paths. The current Devin CLI does not provide

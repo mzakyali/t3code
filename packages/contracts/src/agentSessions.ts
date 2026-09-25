@@ -3,7 +3,7 @@ import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from ".
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /** Coding agent home directories the scanner knows how to read. */
-export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex"]);
+export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "devin"]);
 export type AgentSessionSource = typeof AgentSessionSource.Type;
 
 /** File identity saved with an imported session so bounded retries can skip unchanged history. */
@@ -73,9 +73,21 @@ export const AgentSessionScanResult = Schema.Struct({
 });
 export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
 
+/**
+ * One provider session picked by the user. Present in an import request to
+ * restrict it to exactly these sessions instead of everything recent under
+ * the project root.
+ */
+export const AgentSessionSelection = Schema.Struct({
+  provider: AgentSessionSource,
+  providerSessionId: TrimmedNonEmptyString,
+});
+export type AgentSessionSelection = typeof AgentSessionSelection.Type;
+
 export const AgentSessionImportInput = Schema.Struct({
   projectId: ProjectId,
   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
+  sessions: Schema.optionalKey(Schema.Array(AgentSessionSelection)),
 });
 export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
 
@@ -101,6 +113,37 @@ export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
 });
+
+/**
+ * Per-session listing for the import picker. Scoped to one project when
+ * `projectId` is present; otherwise every session the sources know about.
+ */
+export const AgentSessionListThreadsInput = Schema.Struct({
+  projectId: Schema.optionalKey(ProjectId),
+});
+export type AgentSessionListThreadsInput = typeof AgentSessionListThreadsInput.Type;
+
+export const AgentSessionListedThread = Schema.Struct({
+  provider: AgentSessionSource,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  model: Schema.NullOr(Schema.String),
+  workspaceRoot: TrimmedNonEmptyString,
+  createdAt: Schema.NullOr(IsoDateTime),
+  updatedAt: Schema.NullOr(IsoDateTime),
+  messageCount: NonNegativeInt,
+  /** Set when an active project already exists at `workspaceRoot`. */
+  projectId: Schema.optionalKey(ProjectId),
+  /** True when a T3 thread already owns this provider session. */
+  imported: Schema.Boolean,
+});
+export type AgentSessionListedThread = typeof AgentSessionListedThread.Type;
+
+export const AgentSessionListThreadsResult = Schema.Struct({
+  threads: Schema.Array(AgentSessionListedThread),
+});
+export type AgentSessionListThreadsResult = typeof AgentSessionListThreadsResult.Type;
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(

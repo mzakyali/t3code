@@ -26,6 +26,7 @@ import * as Stream from "effect/Stream";
 
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { DEVIN_RESUME_VERSION } from "../provider/Layers/DevinAdapter.ts";
 import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
@@ -131,6 +132,7 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
   const threads = scanner.recentThreads(
     workspaceRoot,
     completedSources.map((entry) => entry.source),
+    input.sessions,
   );
   const importedThreadIds = new Set<ThreadId>();
   let importedCount = 0;
@@ -233,7 +235,12 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
               resumeCursor:
                 thread.source === "codex"
                   ? { threadId: thread.providerSessionId }
-                  : { threadId, resume: thread.providerSessionId },
+                  : thread.source === "devin"
+                    ? {
+                        schemaVersion: DEVIN_RESUME_VERSION,
+                        sessionId: thread.providerSessionId,
+                      }
+                    : { threadId, resume: thread.providerSessionId },
               runtimePayload: { cwd: workspaceRoot },
             },
             { onConflict: "ignore" },
