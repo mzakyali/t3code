@@ -100,7 +100,12 @@ export const DEVIN_RESUME_VERSION = 1 as const;
 const ACP_PLAN_MODE_ALIASES = ["plan"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["accept-edits", "smart", "bypass"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
-const DEFAULT_PROMPT_TIMEOUT = Duration.seconds(300);
+// Devin's backend routinely goes silent for many minutes inside a single
+// model call (long generations, internal retry/backoff) — nothing reaches
+// the ACP stream meanwhile, so the idle deadline has to be generous. An
+// in-flight tool call gets the longer leash below; an open subagent or a
+// pending approval holds the deadline open entirely.
+const DEFAULT_PROMPT_TIMEOUT = Duration.seconds(900);
 const DEFAULT_ACTIVE_TOOL_PROMPT_TIMEOUT = Duration.seconds(1800);
 
 export interface DevinPromptAccountingState {
@@ -161,7 +166,7 @@ export interface DevinAdapterLiveOptions {
    * the latest snapshot so the closure isn't stale.
    */
   readonly resolveSettings?: Effect.Effect<DevinSettings>;
-  /** Override the default prompt timeout (5 minutes) in focused tests. */
+  /** Override the default prompt timeout (15 minutes) in focused tests. */
   readonly promptTimeout?: Duration.Input;
   /** Override the extended timeout used while a tool call or subagent is
    * in flight (30 minutes) in focused tests. */
