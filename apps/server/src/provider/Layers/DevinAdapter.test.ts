@@ -868,6 +868,103 @@ it.layer(devinAdapterTestLayer, { excludeTestServices: true })("DevinAdapterLive
     }),
   );
 
+  it.effect("an in-flight tool call extends the prompt timeout instead of stalling", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_EMIT_ACTIVE_TOOL_THEN_HANG: "1",
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        promptTimeout: "2 seconds",
+        activeToolPromptTimeout: "5 seconds",
+      });
+      const threadId = ThreadId.make("devin-active-tool-timeout");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const turnFiber = yield* adapter
+        .sendTurn({ threadId, input: "run a long tool", attachments: [] })
+        .pipe(
+          Effect.map(Exit.succeed),
+          Effect.catch((error) => Effect.succeed(Exit.fail(error))),
+          Effect.forkChild,
+        );
+
+      // The tool call starts emitting nothing after its initial updates.
+      // The 2s idle deadline must not fire while it remains in flight.
+      yield* Effect.sleep("3 seconds");
+      assert.isUndefined(turnFiber.pollUnsafe());
+
+      // The extended active-tool deadline still bounds silent work.
+      const result = yield* Fiber.join(turnFiber).pipe(Effect.timeoutOption("4 seconds"));
+      assert.isTrue(Option.isSome(result));
+      if (Option.isSome(result)) {
+        assert.isTrue(Exit.isFailure(result.value));
+        if (Exit.isFailure(result.value)) {
+          const error = Cause.findErrorOption(result.value.cause);
+          if (Option.isSome(error)) {
+            assert.instanceOf(error.value, ProviderAdapterRequestError);
+            assert.match(error.value.detail, /timed out/i);
+          }
+        }
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("an open Devin subagent holds the prompt timeout open", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* makeMockDevinWrapper({
+        T3_ACP_EMIT_DEVIN_SUBAGENT: "1",
+        T3_ACP_HANG_DEVIN_SUBAGENT: "1",
+      });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        promptTimeout: "2 seconds",
+        activeToolPromptTimeout: "5 seconds",
+      });
+      const threadId = ThreadId.make("devin-subagent-timeout");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: devinModelSelection("default"),
+      });
+
+      const turnFiber = yield* adapter
+        .sendTurn({ threadId, input: "spawn a subagent and wait", attachments: [] })
+        .pipe(
+          Effect.map(Exit.succeed),
+          Effect.catch((error) => Effect.succeed(Exit.fail(error))),
+          Effect.forkChild,
+        );
+
+      // The subagent started but never completes. Neither the 2s idle
+      // deadline nor the 5s active-tool deadline may fire while Devin
+      // still reports it open.
+      yield* Effect.sleep("3 seconds");
+      assert.isUndefined(turnFiber.pollUnsafe());
+      yield* Effect.sleep("4 seconds");
+      assert.isUndefined(turnFiber.pollUnsafe());
+
+      yield* adapter.interruptTurn(threadId);
+      const result = yield* Fiber.join(turnFiber).pipe(Effect.timeoutOption("4 seconds"));
+      assert.isTrue(Option.isSome(result));
+      if (Option.isSome(result)) {
+        assert.isTrue(Exit.isSuccess(result.value));
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("maps Devin subagent lifecycle to task events and agent-owned items", () =>
     Effect.gen(function* () {
       const wrapperPath = yield* makeMockDevinWrapper({ T3_ACP_EMIT_DEVIN_SUBAGENT: "1" });

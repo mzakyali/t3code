@@ -101,6 +101,7 @@ const ACP_PLAN_MODE_ALIASES = ["plan"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["accept-edits", "smart", "bypass"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
 const DEFAULT_PROMPT_TIMEOUT = Duration.seconds(300);
+const DEFAULT_ACTIVE_TOOL_PROMPT_TIMEOUT = Duration.seconds(1800);
 
 export interface DevinPromptAccountingState {
   activeTurnId: TurnId | undefined;
@@ -162,6 +163,9 @@ export interface DevinAdapterLiveOptions {
   readonly resolveSettings?: Effect.Effect<DevinSettings>;
   /** Override the default prompt timeout (5 minutes) in focused tests. */
   readonly promptTimeout?: Duration.Input;
+  /** Override the extended timeout used while a tool call or subagent is
+   * in flight (30 minutes) in focused tests. */
+  readonly activeToolPromptTimeout?: Duration.Input;
 }
 
 interface PendingApproval {
@@ -207,6 +211,10 @@ interface DevinSessionContext {
   /** Epoch millis of the most recent ACP session traffic. The prompt
    * watchdog only fires after promptTimeout with no activity at all. */
   lastActivityAtMillis: number;
+  /** Non-terminal tool call ids. An in-flight tool can legitimately emit
+   * no session traffic for longer than the idle prompt timeout, so the
+   * watchdog gives the turn a longer deadline while this set is non-empty. */
+  readonly activeToolCallIds: Set<string>;
   /** Devin subagents still running, keyed by the agentId Devin stamps
    * on subagent-owned session updates. */
   readonly openSubagents: Map<string, DevinSubagentIdentity>;
@@ -776,6 +784,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
     const promptTimeout = Duration.fromInputUnsafe(
       options?.promptTimeout ?? DEFAULT_PROMPT_TIMEOUT,
     );
+    const activeToolPromptTimeout = Duration.fromInputUnsafe(
+      options?.activeToolPromptTimeout ?? DEFAULT_ACTIVE_TOOL_PROMPT_TIMEOUT,
+    );
     const mapExtensionFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
         Effect.mapError(
@@ -1068,22 +1079,32 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
     /**
      * Resolves once the session has gone promptTimeout without any ACP
-     * traffic. session/prompt only returns when the whole turn finishes,
-     * so an absolute timeout kills healthy long turns; resetting the
-     * deadline on every session update makes it a genuine-stall detector
-     * instead. A pending permission/user-input request also holds the
-     * deadline open — the agent is waiting on the user, not hung.
+     * traffic, returning the deadline that elapsed. session/prompt only
+     * returns when the whole turn finishes, so an absolute timeout kills
+     * healthy long turns; resetting the deadline on every session update
+     * makes it a genuine-stall detector instead. A pending
+     * permission/user-input request also holds the deadline open — the
+     * agent is waiting on the user, not hung. An in-flight tool call can
+     * legitimately stay silent far longer than the idle deadline (builds,
+     * installs, long commands), so those turns get activeToolPromptTimeout
+     * instead. An open subagent holds the deadline open entirely: Devin
+     * owns its lifecycle, delegated work can run for arbitrarily long,
+     * and silence while it is open is expected rather than a stall.
      */
-    const promptIdleWatchdog = (ctx: DevinSessionContext): Effect.Effect<void> =>
+    const promptIdleWatchdog = (ctx: DevinSessionContext): Effect.Effect<Duration.Duration> =>
       Effect.gen(function* () {
-        const timeoutMillis = Duration.toMillis(promptTimeout);
         for (;;) {
-          const awaitingUserDecision =
-            ctx.pendingApprovals.size > 0 || ctx.pendingUserInputs.size > 0;
+          const deadlineHeldOpen =
+            ctx.pendingApprovals.size > 0 ||
+            ctx.pendingUserInputs.size > 0 ||
+            ctx.openSubagents.size > 0;
+          const timeout = ctx.activeToolCallIds.size > 0 ? activeToolPromptTimeout : promptTimeout;
           const remaining =
-            timeoutMillis - (yield* Clock.currentTimeMillis) + ctx.lastActivityAtMillis;
-          if (remaining <= 0 && !awaitingUserDecision) {
-            return;
+            Duration.toMillis(timeout) -
+            (yield* Clock.currentTimeMillis) +
+            ctx.lastActivityAtMillis;
+          if (remaining <= 0 && !deadlineHeldOpen) {
+            return timeout;
           }
           yield* Effect.sleep(Duration.millis(Math.min(Math.max(remaining, 250), 30_000)));
         }
@@ -1509,6 +1530,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 return;
               case "ToolCallUpdated":
                 {
+                  if (event.toolCall.status === "completed" || event.toolCall.status === "failed") {
+                    ctx.activeToolCallIds.delete(event.toolCall.toolCallId);
+                  } else {
+                    ctx.activeToolCallIds.add(event.toolCall.toolCallId);
+                  }
                   const toolCall = sanitizeDevinToolCall(event.toolCall);
                   const rawPayload = sanitizeDevinToolCallRawPayload(event.rawPayload, toolCall);
                   yield* logNative(ctx.threadId, "session/update", rawPayload, "acp.jsonrpc");
@@ -1524,6 +1550,10 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                     return;
                   }
                   if (meta?.subagentCompleted !== undefined) {
+                    // The subagent's container tool_call (toolCallId ===
+                    // agentId) is suppressed in favor of task events and
+                    // may never report a terminal status.
+                    ctx.activeToolCallIds.delete(meta.subagentCompleted.agentId);
                     yield* emitDevinSubagentCompleted(
                       ctx,
                       meta.subagentCompleted,
@@ -1697,6 +1727,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 ? resolveDevinModelUid(devinModelSelection.model, devinModelSelection.options)
                 : undefined),
             lastActivityAtMillis: 0,
+            activeToolCallIds: new Set(),
             openSubagents: new Map(),
             pendingAgentLaunches: [],
             stopped: false,
@@ -1999,7 +2030,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 // reach the agent after interruptTurn already settled it.
                 Deferred.await(turnInterrupt).pipe(Effect.as({ _tag: "interrupted" as const })),
               ),
-              promptIdleWatchdog(ctx).pipe(Effect.as({ _tag: "timedOut" as const })),
+              promptIdleWatchdog(ctx).pipe(
+                Effect.map((timeout) => ({ _tag: "timedOut" as const, timeout })),
+              ),
             );
             if (outcome._tag === "interrupted") {
               // interruptTurn emitted the terminal event; this sendTurn just
@@ -2031,6 +2064,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
                     const updatedAt = yield* nowIso;
                     ctx.activePromptLeases.clear();
+                    ctx.activeToolCallIds.clear();
                     ctx.activeTurnId = undefined;
                     ctx.session = {
                       ...ctx.session,
@@ -2053,7 +2087,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                       ),
                     );
                   }),
-                ).pipe(Effect.andThen(mapPromptTimeout(PROVIDER, input.threadId, promptTimeout)));
+                ).pipe(Effect.andThen(mapPromptTimeout(PROVIDER, input.threadId, outcome.timeout)));
 
             // Keep result projection and prompt accounting atomic with
             // interrupt, timeout, and replacement-turn acquisition.
@@ -2158,6 +2192,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           // stuck prompt leaves an active lease and the session never
           // recovers.
           ctx.activePromptLeases.clear();
+          ctx.activeToolCallIds.clear();
           ctx.activeTurnId = undefined;
           ctx.session = {
             ...ctx.session,

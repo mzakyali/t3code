@@ -18,6 +18,7 @@ const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitDevinResourceToolCall = process.env.T3_ACP_EMIT_DEVIN_RESOURCE_TOOL_CALL === "1";
 const emitDevinSubagent = process.env.T3_ACP_EMIT_DEVIN_SUBAGENT === "1";
+const hangDevinSubagent = process.env.T3_ACP_HANG_DEVIN_SUBAGENT === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
 const emitGenericToolPlaceholders = process.env.T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS === "1";
@@ -1056,6 +1057,12 @@ const program = Effect.gen(function* () {
             },
           },
         });
+        // The subagent started but never finishes — proves the adapter's
+        // watchdog tolerates a long-running subagent instead of treating
+        // the silent wait as a stalled turn.
+        if (hangDevinSubagent) {
+          return yield* Effect.never;
+        }
         writeJsonRpcNotification("session/update", {
           sessionId: requestedSessionId,
           update: {
