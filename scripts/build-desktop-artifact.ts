@@ -2027,9 +2027,21 @@ export const copyDirectoryPreservingSymlinks = Effect.fn("copyDirectoryPreservin
 );
 
 const verifyPackagedBundleIsSelfContained = Effect.fn("verifyPackagedBundleIsSelfContained")(
-  function* (input: { readonly asarPath: string; readonly verbose: boolean }) {
+  function* (input: {
+    readonly asarPath: string;
+    readonly targetArch: typeof BuildArch.Type;
+    readonly verbose: boolean;
+  }) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+
+    // The probe executes the bundle's module graph on the build host, which
+    // resolves host-specific native packages (e.g. @yuuang/ffi-rs-darwin-*)
+    // that a Windows closure correctly does not contain. Cross-builds can only
+    // run it when the host matches the target.
+    const hostPlatform = yield* HostProcessPlatform;
+    const hostArchitecture = yield* HostProcessArchitecture;
+    if (hostPlatform !== "win32" || hostArchitecture !== input.targetArch) return;
 
     const probeRoot = yield* fs.makeTempDirectoryScoped({
       prefix: "t3code-bundle-selfcheck-",
@@ -3310,6 +3322,7 @@ export const validateWindowsPackagedPayload = Effect.fn(
 
   yield* verifyPackagedBundleIsSelfContained({
     asarPath,
+    targetArch: input.targetArch,
     verbose: input.verbose ?? false,
   });
 
