@@ -2937,6 +2937,55 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("seeds a column-only cursor into resumeCursors when switching away", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-provider-cursor-column-seed");
+      const importedCursor = { sessionId: "imported-codex-session" };
+
+      // Bindings written before cursor history (and by the session importer)
+      // carry their cursor only in the resumeCursor column.
+      yield* directory.upsert({
+        threadId,
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        status: "stopped",
+        runtimeMode: "full-access",
+        resumeCursor: importedCursor,
+        runtimePayload: { cwd: fixtureCwd("project-column-seed") },
+      });
+
+      const claudeSession = yield* provider.startSession(threadId, {
+        provider: CLAUDE_AGENT_DRIVER,
+        providerInstanceId: claudeAgentInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-column-seed"),
+        runtimeMode: "full-access",
+      });
+
+      const switched = yield* directory.getBinding(threadId);
+      assert(Option.isSome(switched));
+      assert.equal(switched.value.providerInstanceId, claudeAgentInstanceId);
+      const resumeCursors = (
+        switched.value.runtimePayload as { resumeCursors?: Record<string, unknown> } | null
+      )?.resumeCursors;
+      assert.deepEqual(resumeCursors?.["codex"], importedCursor);
+      assert.deepEqual(resumeCursors?.["claudeAgent"], claudeSession.resumeCursor);
+
+      routing.codex.startSession.mockClear();
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-column-seed"),
+        runtimeMode: "full-access",
+      });
+      assert.equal(routing.codex.startSession.mock.calls.length, 1);
+      assert.deepEqual(routing.codex.startSession.mock.calls[0]?.[0].resumeCursor, importedCursor);
+    }),
+  );
+
   it.effect("stores then consumes the pending handoff context once", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

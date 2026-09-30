@@ -1123,9 +1123,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "ProviderService.upsertSessionBinding",
         session,
       );
-      const existingPayload = Option.getOrUndefined(
-        yield* directory.getBinding(threadId),
-      )?.runtimePayload;
+      const existingBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
       yield* directory.upsert({
         threadId,
         provider: session.provider,
@@ -1138,7 +1136,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(session.resumeCursor !== undefined
             ? {
                 resumeCursors: {
-                  ...readPersistedResumeCursors(existingPayload),
+                  // Bindings created before cursor history (or by the session
+                  // importer) keep their cursor only in the column; switching
+                  // away must seed it for the outgoing instance before the new
+                  // binding's cursor overwrites the column.
+                  ...(existingBinding?.providerInstanceId !== undefined &&
+                  existingBinding.providerInstanceId !== providerInstanceId &&
+                  existingBinding.resumeCursor !== null &&
+                  existingBinding.resumeCursor !== undefined
+                    ? { [existingBinding.providerInstanceId]: existingBinding.resumeCursor }
+                    : {}),
+                  ...readPersistedResumeCursors(existingBinding?.runtimePayload),
                   [providerInstanceId]: session.resumeCursor,
                 },
               }
