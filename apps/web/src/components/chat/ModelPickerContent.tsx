@@ -65,6 +65,7 @@ type ModelPickerItem = {
   subProvider?: string;
   aliases?: ReadonlyArray<string>;
   badge?: "new" | "beta";
+  costTier?: string;
   instanceId: ProviderInstanceId;
   driverKind: ProviderDriverKind;
   instanceDisplayName: string;
@@ -408,6 +409,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           ...(model.subProvider ? { subProvider: model.subProvider } : {}),
           ...(model.aliases && model.aliases.length > 0 ? { aliases: model.aliases } : {}),
           ...(model.badge ? { badge: model.badge } : {}),
+          ...(model.costTier ? { costTier: model.costTier } : {}),
           ...(model.isLegacy ? { isLegacy: true } : {}),
           ...(model.isUnavailable ? { isUnavailable: true } : {}),
           instanceId,
@@ -1134,6 +1136,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                         preferShortName={!isLocked}
                         useTriggerLabel={false}
                         badge={model.badge}
+                        costTier={model.costTier}
                         unavailable={model.isUnavailable === true}
                         jumpLabel={modelJumpLabelByKey.get(modelKey) ?? null}
                         disabledReason={disabledReason}

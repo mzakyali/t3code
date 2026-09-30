@@ -37,6 +37,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
   preferShortName?: boolean;
   useTriggerLabel?: boolean;
   badge?: "new" | "beta" | undefined;
+  /** Provider-advertised cost band (e.g. "Free", "High"). "Free" gets a badge; other tiers render as muted text. */
+  costTier?: string | undefined;
   unavailable?: boolean;
   jumpLabel?: string | null;
   disabledReason?: string | null;
@@ -116,6 +118,20 @@ export const ModelListRow = memo(function ModelListRow(props: {
             >
               {props.badge === "new" ? "New" : "Beta"}
             </span>
+          ) : null}
+          {props.costTier ? (
+            props.costTier.trim().toLowerCase() === "free" ? (
+              <span
+                className="shrink-0 rounded border border-success/35 bg-success/15 px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide text-success-foreground"
+                aria-label="Free model"
+              >
+                Free
+              </span>
+            ) : (
+              <span className="shrink-0 truncate text-[10px] font-medium text-muted-foreground">
+                {props.costTier}
+              </span>
+            )
           ) : null}
           {props.unavailable ? (
             <Badge variant="outline" size="sm">

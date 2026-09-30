@@ -85,6 +85,24 @@ describe("instance-scoped model selection", () => {
     );
   });
 
+  it("preserves server-provided cost tier metadata", () => {
+    const baseProvider = provider({
+      instanceId: "claudeAgent",
+      models: ["claude-opus-4-8"],
+    });
+    const providers = [
+      {
+        ...baseProvider,
+        models: [{ ...baseProvider.models[0]!, costTier: "Free" }],
+      },
+    ];
+    const stock = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(getAppModelOptionsForInstance(settingsWithProviderInstances(), stock)[0]?.costTier).toBe(
+      "Free",
+    );
+  });
+
   it("keeps custom models on the provider instance that declared them", () => {
     const providers = [
       provider({

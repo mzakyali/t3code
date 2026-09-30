@@ -37,6 +37,7 @@ export type ModelEsque = {
   badge?: "new" | "beta" | undefined;
   isLegacy?: boolean | undefined;
   isUnavailable?: boolean | undefined;
+  costTier?: string | undefined;
 };
 
 export type ModelProviderBrand = {

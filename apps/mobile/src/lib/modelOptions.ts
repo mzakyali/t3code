@@ -18,6 +18,7 @@ export type ModelOption = {
   readonly isDefault: boolean;
   readonly isLegacy: boolean;
   readonly isUnavailable?: boolean;
+  readonly costTier?: string;
   readonly capabilities: ModelCapabilities | null;
   readonly selection: ModelSelection;
 };
@@ -176,6 +177,7 @@ export function buildModelOptions(
         providerDriver: provider.driver,
         isDefault: model.isDefault === true,
         isLegacy: model.isLegacy === true,
+        ...(model.costTier ? { costTier: model.costTier } : {}),
         capabilities: model.capabilities,
         selection: normalizeSelectionOptions(
           {
@@ -223,6 +225,7 @@ export function buildModelOptions(
         providerDriver,
         isDefault: false,
         isLegacy: model?.isLegacy === true,
+        ...(model?.costTier ? { costTier: model.costTier } : {}),
         ...(isModelSelectionUnavailable(config, fallbackModelSelection)
           ? { isUnavailable: true }
           : {}),

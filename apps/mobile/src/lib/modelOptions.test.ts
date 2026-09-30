@@ -54,6 +54,41 @@ describe("mobile model options", () => {
     ]);
   });
 
+  it("carries server-provided cost tier onto model options", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "devin",
+          driver: "devin",
+          displayName: "Devin",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          models: [
+            {
+              slug: "swe-2-max",
+              name: "SWE-2 Max",
+              isCustom: false,
+              costTier: "Free",
+              capabilities: null,
+            },
+            {
+              slug: "adaptive",
+              name: "Adaptive",
+              isCustom: false,
+              capabilities: null,
+            },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    const options = buildModelOptions(config, null);
+
+    expect(options.find((option) => option.key === "devin:swe-2-max")?.costTier).toBe("Free");
+    expect(options.find((option) => option.key === "devin:adaptive")?.costTier).toBeUndefined();
+  });
+
   it("distinguishes same-name OpenCode models without changing their routing", () => {
     const sources = [
       { id: "anthropic", label: "Anthropic" },

@@ -83,6 +83,17 @@ export function ModelRowContent(
                 <Text className="text-3xs font-t3-bold text-foreground-muted">Legacy</Text>
               </View>
             ) : null}
+            {props.option.costTier ? (
+              props.option.costTier.trim().toLowerCase() === "free" ? (
+                <View className="rounded-md bg-emerald-500/10 px-1.5 py-0.5">
+                  <Text className="text-3xs font-t3-bold text-adaptive-emerald-600-400">Free</Text>
+                </View>
+              ) : (
+                <Text className="shrink-0 text-3xs font-t3-medium text-foreground-muted">
+                  {props.option.costTier}
+                </Text>
+              )
+            ) : null}
             {props.option.isUnavailable ? (
               <Text className="text-xs text-foreground">Unavailable</Text>
             ) : null}
