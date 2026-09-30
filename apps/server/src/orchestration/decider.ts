@@ -1882,12 +1882,45 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.provider.handoff": {
-      // The command ships in the contract before the handoff flow is wired;
-      // accepting it now would emit an intent event no reactor consumes.
-      return yield* new OrchestrationCommandInvariantError({
-        commandType: command.type,
-        detail: "provider handoff is not supported yet",
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
       });
+      const hasStarted =
+        thread.latestTurn !== null || thread.messages.length > 0 || thread.session !== null;
+      if (!hasStarted) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' has not started; there is no provider session to hand off.`,
+        });
+      }
+      // Handoff only makes sense between turns: the reactor replays the
+      // thread onto a new provider instance, so a turn in flight or a
+      // session still coming alive must finish first.
+      const sessionBusy =
+        thread.session?.activeTurnId != null ||
+        thread.session?.status === "running" ||
+        thread.session?.status === "starting";
+      if (sessionBusy) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' has a turn in flight and cannot be handed off yet.`,
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.provider-handoff-requested",
+        payload: {
+          threadId: command.threadId,
+          modelSelection: command.modelSelection,
+        },
+      };
     }
 
     case "thread.session.set": {
