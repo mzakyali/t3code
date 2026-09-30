@@ -12,9 +12,19 @@ export interface UsageRecord {
   readonly provider: UsageProviderKind;
   readonly timestampMs: number;
   readonly model: string;
+  /**
+   * Rate-table key when the provider's display name carries tiers the table
+   * does not know, such as Cursor's `claude-opus-5-5-high`. Defaults to `model`.
+   */
+  readonly rateModel?: string;
   readonly sessionId: string;
   readonly totals: UsageTokenTotals;
   readonly reportedCostUsd: number | null;
+  /**
+   * Whether the request ran in fast mode, which bills at a model-specific
+   * multiple of the standard rate. Only Claude Code records this.
+   */
+  readonly fast: boolean;
   /**
    * Key for cross-file de-duplication, or `null` when the record is inherently
    * unique and needs no dedup.
@@ -38,111 +48,6 @@ function parseTimestampMs(value: unknown): number | null {
   if (typeof value !== "string") return null;
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : parsed;
-}
-
-function parseProviderEventLogLine(line: string): {
-  readonly loggedAtMs: number | null;
-  readonly event: Record<string, unknown>;
-} | null {
-  // EventNdjsonLogger prefixes every record with a human-readable timestamp
-  // and stream label. Only canonical records are useful here; native ACP
-  // payloads do not have stable token accounting semantics.
-  const match = /^\[([^\]\r\n]+)\]\s+([A-Z]+):\s+(.+)$/u.exec(line);
-  if (!match || match[2] !== "CANON") return null;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(match[3] ?? "");
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-
-  return {
-    loggedAtMs: parseTimestampMs(match[1]),
-    event: parsed as Record<string, unknown>,
-  };
-}
-
-function nonNegative(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
-}
-
-/**
- * Parses a canonical Devin ACP token-usage event from a provider event log.
- *
- * Context-only `usage_update` notifications are intentionally ignored. The
- * corresponding canonical event carries `usedTokens`/`maxTokens`, but no
- * per-turn token delta, so counting it would double count the prompt record.
- */
-export function parseDevinCanonicalLogLine(line: string): UsageRecord | null {
-  const parsed = parseProviderEventLogLine(line);
-  if (parsed === null) return null;
-
-  const event = parsed.event;
-  if (event.provider !== "devin" || event.type !== "thread.token-usage.updated") return null;
-  const payload = event.payload;
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
-  const usage = (payload as Record<string, unknown>)["usage"];
-  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return null;
-  const usageRecord = usage as Record<string, unknown>;
-
-  const hasTurnBreakdown = [
-    "lastInputTokens",
-    "lastCachedInputTokens",
-    "lastCacheCreationTokens",
-    "lastOutputTokens",
-    "lastReasoningOutputTokens",
-  ].some((key) => typeof usageRecord[key] === "number" && Number.isFinite(usageRecord[key]));
-  if (!hasTurnBreakdown) return null;
-
-  const lastInputTokens = nonNegative(usageRecord["lastInputTokens"]);
-  const cachedInputTokens = nonNegative(usageRecord["lastCachedInputTokens"]);
-  const cacheCreationTokens = nonNegative(usageRecord["lastCacheCreationTokens"]);
-  const outputTokens = nonNegative(usageRecord["lastOutputTokens"]);
-  const reasoningTokens = Math.min(
-    outputTokens,
-    nonNegative(usageRecord["lastReasoningOutputTokens"]),
-  );
-  const totals: UsageTokenTotals = {
-    uncachedInputTokens: Math.max(0, lastInputTokens - cachedInputTokens - cacheCreationTokens),
-    cachedInputTokens,
-    cacheCreationTokens,
-    outputTokens,
-    reasoningTokens,
-  };
-  if (totalTokens(totals) === 0) return null;
-
-  const createdAtMs = parseTimestampMs(event.createdAt) ?? parsed.loggedAtMs;
-  if (createdAtMs === null) return null;
-
-  const model =
-    typeof usageRecord.model === "string" && usageRecord.model.trim().length > 0
-      ? usageRecord.model.trim()
-      : "devin";
-  const sessionId =
-    typeof usageRecord.providerSessionId === "string" &&
-    usageRecord.providerSessionId.trim().length > 0
-      ? usageRecord.providerSessionId.trim()
-      : typeof event.threadId === "string"
-        ? event.threadId
-        : "";
-  const reportedCostUsd =
-    typeof usageRecord.lastCostUsd === "number" &&
-    Number.isFinite(usageRecord.lastCostUsd) &&
-    usageRecord.lastCostUsd >= 0
-      ? usageRecord.lastCostUsd
-      : null;
-
-  return {
-    provider: "devin",
-    timestampMs: createdAtMs,
-    model,
-    sessionId,
-    totals,
-    reportedCostUsd,
-    dedupeKey: typeof event.eventId === "string" ? event.eventId : null,
-  };
 }
 
 export function addTotals(a: UsageTokenTotals, b: UsageTokenTotals): UsageTokenTotals {
@@ -208,6 +113,10 @@ export function parseClaudeLine(line: string): UsageRecord | null {
   } catch {
     return null;
   }
+  return parseClaudeRecord(parsed);
+}
+
+export function parseClaudeRecord(parsed: unknown): UsageRecord | null {
   if (typeof parsed !== "object" || parsed === null) return null;
 
   const record = parsed as Record<string, unknown>;
@@ -250,6 +159,7 @@ export function parseClaudeLine(line: string): UsageRecord | null {
       reasoningTokens: 0,
     },
     reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) ? cost : null,
+    fast: usageRecord["speed"] === "fast",
     dedupeKey,
   };
 }
@@ -322,6 +232,10 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
   } catch {
     return null;
   }
+  return parseCodexRecord(parsed, state);
+}
+
+export function parseCodexRecord(parsed: unknown, state: CodexScanState): UsageRecord | null {
   if (typeof parsed !== "object" || parsed === null) return null;
 
   const record = parsed as Record<string, unknown>;
@@ -409,6 +323,7 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
     totals,
     // Codex does not report cost in the rollout.
     reportedCostUsd: null,
+    fast: false,
     // Events surviving the fork-copy suppression above are unique to this
     // rollout, so they need no global dedup.
     dedupeKey: null,
@@ -478,6 +393,10 @@ export function parseGrokLine(line: string): readonly UsageRecord[] {
   } catch {
     return [];
   }
+  return parseGrokRecord(parsed);
+}
+
+export function parseGrokRecord(parsed: unknown): readonly UsageRecord[] {
   if (typeof parsed !== "object" || parsed === null) return [];
 
   const record = parsed as Record<string, unknown>;
@@ -538,6 +457,7 @@ export function parseGrokLine(line: string): readonly UsageRecord[] {
         sessionId,
         totals: grokTotalsToUsage(topLevel),
         reportedCostUsd: grokCostTicksToUsd(topLevel.costUsdTicks),
+        fast: false,
         // No prompt id means we cannot tell two same-second updates apart.
         dedupeKey: promptId === null ? null : `${sessionId}:${promptId}:grok`,
       },
@@ -584,6 +504,7 @@ export function parseGrokLine(line: string): readonly UsageRecord[] {
       sessionId,
       totals,
       reportedCostUsd,
+      fast: false,
       dedupeKey: promptId === null ? null : `${sessionId}:${promptId}:${entry.model}`,
     });
   }

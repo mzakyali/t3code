@@ -1077,7 +1077,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                           aria-hidden="true"
                         >
                           {ProviderIcon ? <ProviderIcon className="size-3.5 shrink-0" /> : null}
-                          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                          <span className="text-2xs font-semibold uppercase tracking-wide text-muted-foreground/80">
                             {getProviderGroupLabel(providerGroupKind)}
                           </span>
                         </div>

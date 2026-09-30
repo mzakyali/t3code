@@ -230,11 +230,28 @@ const resolveClientFilePath = Effect.fn("AntigravityAdapter.resolveClientFilePat
   }) {
     const { path } = input;
     const resolved = path.resolve(input.requestPath);
-    // Follow symlinks on the parent so a link out of the workspace cannot escape it.
-    const parent = yield* input.fileSystem
-      .realPath(path.dirname(resolved))
-      .pipe(Effect.orElseSucceed(() => path.dirname(resolved)));
-    const real = path.join(parent, path.basename(resolved));
+    // Follow symlinks on the nearest existing ancestor so a link out of the
+    // workspace cannot escape it. The target file and its parent may not exist
+    // yet, so walk up until realPath succeeds. Stopping at the immediate parent
+    // would leave a non-canonical prefix (/var vs /private/var on macOS) and
+    // falsely compare outside a canonicalized root.
+    const missing: string[] = [];
+    let ancestor = resolved;
+    let canonicalAncestor: string | undefined;
+    for (let depth = 0; depth < 64; depth += 1) {
+      const realAncestor = yield* input.fileSystem
+        .realPath(ancestor)
+        .pipe(Effect.orElseSucceed(() => undefined));
+      if (realAncestor !== undefined) {
+        canonicalAncestor = realAncestor;
+        break;
+      }
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+    const real = path.join(canonicalAncestor ?? ancestor, ...missing);
     const roots = yield* Effect.forEach(input.allowedRoots, (root) =>
       input.fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root)),
     );
@@ -786,9 +803,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             stopOwned,
             Effect.gen(function* () {
               const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
-              // The attachments dir grant lets the agent read pasted files at
-              // the paths ProviderService injects into the turn text. It is a
-              // leaf directory holding only uploads.
+              // The attachments dir grant lets the agent read path-only uploads
+              // at the paths ProviderService injects into the turn text. It is
+              // a leaf directory holding only uploads.
               const runtime = yield* options.makeRuntime({
                 cwd,
                 clientInfo: { name: "t3-code", version: "0.0.0" },
@@ -844,7 +861,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               const model = yield* applyAntigravityAcpModelSelection({
                 runtime,
                 model: input.modelSelection?.model,
-                defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+                defaultModel: yield* options.defaultModel ?? Effect.undefined,
                 mapError: (cause) => cause,
               });
               yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
@@ -1035,7 +1052,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           const model = resolveAntigravityModel({
             configOptions,
             model: requestedModel,
-            defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+            defaultModel: yield* options.defaultModel ?? Effect.undefined,
           });
           const availableModels = antigravityModelOptions(configOptions);
           if (model && !availableModels.some((option) => option.value === model)) {
@@ -1165,14 +1182,36 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
   const interruptTurn: Adapter["interruptTurn"] = (threadId) =>
     Effect.gen(function* () {
       const context = yield* requireSession(threadId);
+      // A command that outlived its turn keeps running in the agent, and
+      // session/cancel only stops a prompt. The agent kills its background
+      // commands when its session closes, so Stop with nothing else running
+      // ends the session, as Claude's does. The next turn resumes it.
+      let idleWithCommands = false;
       yield* context.promptLock
         .withPermit(
           Effect.gen(function* () {
+            // Decided under the prompt lock so a turn cannot start in between.
+            if (!context.promptFiber && [...context.commands.values()].some((c) => c.promoted)) {
+              context.stopped = true;
+              idleWithCommands = true;
+              return;
+            }
             yield* cancelRequests(context);
             yield* context.runtime.cancel;
           }),
         )
-        .pipe(Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)));
+        .pipe(
+          Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)),
+          // Once marked stopped the session must close, even if this call is
+          // interrupted, or it is left unreachable with its commands running.
+          Effect.ensuring(
+            Effect.suspend(() =>
+              idleWithCommands
+                ? withThreadLock(threadId, stopContext(context)).pipe(Effect.ignore)
+                : Effect.void,
+            ),
+          ),
+        );
     });
 
   const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>

@@ -12,6 +12,7 @@ const rates: RateTable = new Map([
       outputCostPerToken: 5e-5,
       cacheReadCostPerToken: 1e-6,
       cacheCreationCostPerToken: 1.25e-5,
+      fastMultiplier: 1,
     },
   ],
 ]);
@@ -31,6 +32,7 @@ function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
       reasoningTokens: 0,
     },
     reportedCostUsd: null,
+    fast: false,
     dedupeKey: null,
     ...overrides,
   };
@@ -76,6 +78,7 @@ describe("UsageAggregator", () => {
               outputCostPerToken: 8e-5,
               cacheReadCostPerToken: 2e-6,
               cacheCreationCostPerToken: 3e-5,
+              fastMultiplier: 1,
             },
           ],
         ]),

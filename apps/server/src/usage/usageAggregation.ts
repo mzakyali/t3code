@@ -113,7 +113,7 @@ export class UsageAggregator {
    * can derive per-window facts (distinct sessions, for one) from the records
    * that landed rather than everything the mtime prefilter happened to admit.
    */
-  add(record: UsageRecord): boolean {
+  add(record: UsageRecord, sourcePath?: string): boolean {
     if (record.dedupeKey !== null) {
       if (this.#seen.has(record.dedupeKey)) {
         this.#duplicatesDropped += 1;
@@ -147,7 +147,7 @@ export class UsageAggregator {
             this.#hourlyWindow.sinceTimeMs +
               Math.floor((record.timestampMs - this.#hourlyWindow.sinceTimeMs) / HOUR_MS) * HOUR_MS,
           ).toISOString();
-    const key = `${day}\u0000${hourStart}\u0000${record.provider}\u0000${record.model}`;
+    const key = `${day}\u0000${hourStart}\u0000${record.provider}\u0000${record.model}\u0000${sourcePath ?? ""}`;
     let bucket = this.#buckets.get(key);
     if (bucket === undefined) {
       bucket = {
@@ -163,22 +163,11 @@ export class UsageAggregator {
     }
 
     const rates = this.#options.providerRates?.[record.provider] ?? this.#options.rates;
-    const priced = priceUsage(
-      rates,
-      record.model,
-      record.totals,
-      record.reportedCostUsd,
-      this.#options.priceOverrides,
-    );
+    const priced = priceUsage(rates, record, this.#options.priceOverrides);
 
     bucket.totals = addTotals(bucket.totals, record.totals);
     bucket.costUsd += priced.costUsd;
-    bucket.cacheSavingsUsd += cacheSavingsUsd(
-      rates,
-      record.model,
-      record.totals,
-      this.#options.priceOverrides,
-    );
+    bucket.cacheSavingsUsd += cacheSavingsUsd(rates, record, this.#options.priceOverrides);
     bucket.records += 1;
     if (priced.costSource === "unpriced") bucket.unpricedRecords += 1;
     if (priced.costSource === "providerReported") bucket.providerReportedRecords += 1;
@@ -189,12 +178,14 @@ export class UsageAggregator {
   finish(): AggregateResult {
     const buckets: UsageBucket[] = [];
     for (const [key, bucket] of this.#buckets) {
-      const [day = "", hourStart = "", provider = "", model = ""] = key.split("\u0000");
+      const [day = "", hourStart = "", provider = "", model = "", sourcePath = ""] =
+        key.split("\u0000");
       buckets.push({
         day: day as UsageDay,
         ...(hourStart === "" ? {} : { hourStart }),
         provider: provider as UsageBucket["provider"],
         model,
+        ...(sourcePath === "" ? {} : { sourcePath }),
         totals: bucket.totals,
         costUsd: bucket.costUsd,
         cacheSavingsUsd: bucket.cacheSavingsUsd,

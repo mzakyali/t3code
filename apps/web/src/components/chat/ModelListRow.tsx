@@ -109,7 +109,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
           {props.badge ? (
             <span
               className={cn(
-                "shrink-0 rounded border px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide",
+                "shrink-0 rounded border px-0.5 py-px text-3xs font-bold uppercase leading-none tracking-wide",
                 props.badge === "new"
                   ? "border-update/35 bg-update/15 text-update-foreground"
                   : "border-warning/35 bg-warning/15 text-warning-foreground",
@@ -122,13 +122,13 @@ export const ModelListRow = memo(function ModelListRow(props: {
           {props.costTier ? (
             props.costTier.trim().toLowerCase() === "free" ? (
               <span
-                className="shrink-0 rounded border border-success/35 bg-success/15 px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide text-success-foreground"
+                className="shrink-0 rounded border border-success/35 bg-success/15 px-0.5 py-px text-3xs font-bold uppercase leading-none tracking-wide text-success-foreground"
                 aria-label="Free model"
               >
                 Free
               </span>
             ) : (
-              <span className="shrink-0 truncate text-[10px] font-medium text-muted-foreground">
+              <span className="shrink-0 truncate text-3xs font-medium text-muted-foreground">
                 {props.costTier}
               </span>
             )
@@ -145,7 +145,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
                   <button
                     type="button"
                     className={cn(
-                      "shrink-0 rounded border border-border/70 bg-muted/60 px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground transition-colors",
+                      "shrink-0 rounded border border-border/70 bg-muted/60 px-1.5 py-px text-3xs font-medium leading-none text-muted-foreground transition-colors",
                       props.onReasoningLevelChange &&
                         "cursor-pointer hover:border-border hover:bg-muted hover:text-foreground",
                     )}
@@ -206,7 +206,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
                 <StarIcon
                   className={cn(
                     "size-3.5 sm:size-3",
-                    props.isFavorite && "fill-current text-yellow-500",
+                    props.isFavorite && "fill-current text-warning",
                   )}
                 />
               </Button>
