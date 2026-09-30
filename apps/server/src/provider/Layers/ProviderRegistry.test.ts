@@ -292,6 +292,11 @@ function hangingScopedSpawnerLayer(killCalls: Ref.Ref<number>) {
   );
 }
 
+const makeStubAdapter = (supportsCrossProviderHandoff = true): ProviderInstance["adapter"] =>
+  ({
+    capabilities: { sessionModelSwitch: "in-session", supportsCrossProviderHandoff },
+  }) as ProviderInstance["adapter"];
+
 const codexModelCapabilities = createModelCapabilities({
   optionDescriptors: [
     selectDescriptor("reasoningEffort", "Reasoning", [
@@ -1167,7 +1172,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              adapter: makeStubAdapter(),
               textGeneration: {} as ProviderInstance["textGeneration"],
             } satisfies ProviderInstance;
             const instanceRegistryLayer = Layer.succeed(
@@ -1534,7 +1539,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            adapter: makeStubAdapter(),
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -1563,7 +1568,9 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
           ).pipe(Scope.provide(scope));
           yield* Effect.gen(function* () {
             const registry = yield* ProviderRegistry.ProviderRegistry;
-            assert.deepStrictEqual(yield* registry.getProviders, [initialProvider]);
+            assert.deepStrictEqual(yield* registry.getProviders, [
+              { ...initialProvider, supportsProviderHandoff: true },
+            ]);
             assert.strictEqual(yield* Ref.get(refreshCalls), 0);
           }).pipe(Effect.provide(runtimeServices));
         }),
@@ -1628,7 +1635,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               applyUsageLimits: () => Effect.void,
             },
             snapshotForCwd,
-            adapter: {} as ProviderInstance["adapter"],
+            adapter: makeStubAdapter(),
             textGeneration: {} as ProviderInstance["textGeneration"],
           });
           const firstInstance = makeInstance(machineProvider, () =>
@@ -1821,7 +1828,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              adapter: makeStubAdapter(),
               textGeneration: {} as ProviderInstance["textGeneration"],
             },
             {
@@ -1848,7 +1855,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.empty,
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              adapter: makeStubAdapter(),
               textGeneration: {} as ProviderInstance["textGeneration"],
             },
           ] satisfies ReadonlyArray<ProviderInstance>;
@@ -1894,7 +1901,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             );
             assert.deepStrictEqual(
               recoveredProviders.find((provider) => provider.instanceId === codexInstanceId),
-              withBundledCompatibility(codexProvider),
+              { ...withBundledCompatibility(codexProvider), supportsProviderHandoff: true },
             );
 
             yield* Ref.set(catalogSnapshot, changedCatalogProvider);
@@ -1906,7 +1913,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             );
             assert.deepStrictEqual(
               changedProviders.find((provider) => provider.instanceId === codexInstanceId),
-              withBundledCompatibility(codexProvider),
+              { ...withBundledCompatibility(codexProvider), supportsProviderHandoff: true },
             );
           }).pipe(Effect.provide(runtimeServices));
 
@@ -1973,7 +1980,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.fromPubSub(changes),
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            adapter: makeStubAdapter(),
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -2021,13 +2028,13 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
 
             const cachedProvider = yield* readProviderStatusCache(filePath);
 
-            assert.deepStrictEqual(
-              cachedProvider,
-              withBundledCompatibility({
+            assert.deepStrictEqual(cachedProvider, {
+              ...withBundledCompatibility({
                 ...refreshedProvider,
                 models: [...initialProvider.models],
               }),
-            );
+              supportsProviderHandoff: true,
+            });
           }).pipe(Effect.provide(runtimeServices));
         }),
       );
@@ -2102,7 +2109,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 streamChanges: Stream.fromPubSub(changes),
                 applyUsageLimits: () => Effect.void,
               },
-              adapter: {} as ProviderInstance["adapter"],
+              adapter: makeStubAdapter(),
               textGeneration: {} as ProviderInstance["textGeneration"],
             } satisfies ProviderInstance;
             const instanceRegistryLayer = Layer.succeed(
@@ -2205,7 +2212,7 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            adapter: makeStubAdapter(),
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const instanceRegistryLayer = Layer.succeed(
@@ -2238,15 +2245,15 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
 
           yield* Effect.gen(function* () {
             const registry = yield* ProviderRegistry.ProviderRegistry;
+            const expectedProvider = {
+              ...withBundledCompatibility(cachedProvider),
+              supportsProviderHandoff: true,
+            };
 
-            assert.deepStrictEqual(yield* registry.getProviders, [
-              withBundledCompatibility(cachedProvider),
-            ]);
-            assert.deepStrictEqual(yield* registry.refresh(codexDriver), [
-              withBundledCompatibility(cachedProvider),
-            ]);
+            assert.deepStrictEqual(yield* registry.getProviders, [expectedProvider]);
+            assert.deepStrictEqual(yield* registry.refresh(codexDriver), [expectedProvider]);
             assert.deepStrictEqual(yield* registry.refreshInstance(codexInstanceId), [
-              withBundledCompatibility(cachedProvider),
+              expectedProvider,
             ]);
           }).pipe(Effect.provide(runtimeServices));
         }),
@@ -2284,7 +2291,25 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
             slashCommands: [],
             skills: [],
           } as const satisfies ServerProvider;
-          const makeInstance = (provider: ServerProvider): ProviderInstance => ({
+          const devinDriver = ProviderDriverKind.make("devin");
+          const devinInstanceId = ProviderInstanceId.make("devin");
+          const devinProvider = {
+            instanceId: devinInstanceId,
+            driver: devinDriver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-04-29T10:02:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          } as const satisfies ServerProvider;
+          const makeInstance = (
+            provider: ServerProvider,
+            supportsCrossProviderHandoff = true,
+          ): ProviderInstance => ({
             instanceId: provider.instanceId,
             driverKind: provider.driver,
             continuationIdentity: {
@@ -2306,11 +2331,12 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            adapter: {} as ProviderInstance["adapter"],
+            adapter: makeStubAdapter(supportsCrossProviderHandoff),
             textGeneration: {} as ProviderInstance["textGeneration"],
           });
           const codexInstance = makeInstance(codexProvider);
           const claudeInstance = makeInstance(claudeProvider);
+          const devinInstance = makeInstance(devinProvider, false);
           const changes = yield* PubSub.unbounded<void>();
           const instancesRef = yield* Ref.make<ReadonlyArray<ProviderInstance>>([codexInstance]);
           const failNextList = yield* Ref.make(false);
@@ -2355,13 +2381,13 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
           yield* Effect.gen(function* () {
             const registry = yield* ProviderRegistry.ProviderRegistry;
             assert.deepStrictEqual(yield* registry.getProviders, [
-              withBundledCompatibility(codexProvider),
+              { ...withBundledCompatibility(codexProvider), supportsProviderHandoff: true },
             ]);
 
             yield* Ref.set(failNextList, true);
             yield* PubSub.publish(changes, undefined);
 
-            yield* Ref.set(instancesRef, [codexInstance, claudeInstance]);
+            yield* Ref.set(instancesRef, [codexInstance, claudeInstance, devinInstance]);
             yield* PubSub.publish(changes, undefined);
 
             let providers = yield* registry.getProviders;
@@ -2377,8 +2403,16 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
 
             assert.deepStrictEqual(
               providers.map((provider) => provider.instanceId).toSorted(),
-              [codexInstanceId, claudeInstanceId].toSorted(),
+              [codexInstanceId, claudeInstanceId, devinInstanceId].toSorted(),
             );
+            const handoffByInstance = new Map(
+              providers.map(
+                (provider) => [provider.instanceId, provider.supportsProviderHandoff] as const,
+              ),
+            );
+            assert.strictEqual(handoffByInstance.get(codexInstanceId), true);
+            assert.strictEqual(handoffByInstance.get(claudeInstanceId), true);
+            assert.strictEqual(handoffByInstance.get(devinInstanceId), false);
           }).pipe(Effect.provide(runtimeServices));
         }),
       );
@@ -2798,6 +2832,14 @@ it.layer(Layer.mergeAll(TestNodeServices, ServerSettingsModule.layerTest(), Test
                 "Cursor is disabled in T3 Code settings.",
               );
               assert.strictEqual(cursorSpawned, false);
+
+              for (const provider of providers) {
+                assert.strictEqual(
+                  provider.supportsProviderHandoff,
+                  provider.driver !== "devin",
+                  `supportsProviderHandoff mismatch for ${provider.instanceId}`,
+                );
+              }
             }).pipe(Effect.provide(runtimeServices));
           }),
       );

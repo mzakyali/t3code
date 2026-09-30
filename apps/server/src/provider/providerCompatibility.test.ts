@@ -234,7 +234,9 @@ it.effect("a remote policy refresh preserves a newer health result on the regist
             makeManualOnlyProviderMaintenanceCapabilities({ provider: driver, packageName: null }),
           ),
       },
-      adapter: {} as ProviderInstance["adapter"],
+      adapter: {
+        capabilities: { sessionModelSwitch: "in-session", supportsCrossProviderHandoff: true },
+      } as ProviderInstance["adapter"],
       textGeneration: {} as ProviderInstance["textGeneration"],
     };
     const refresh = Deferred.succeed(started, undefined).pipe(

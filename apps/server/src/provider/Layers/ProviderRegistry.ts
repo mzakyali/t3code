@@ -294,13 +294,22 @@ const snapshotInstanceKey = (provider: ServerProvider): ProviderInstanceId => {
 // after `ProviderInstanceRegistry` rebuilds an instance (e.g. because
 // its settings changed), a fresh source rides the new PubSub instead
 // of a closed one.
-const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource => ({
-  instanceId: instance.instanceId,
-  driverKind: instance.driverKind,
-  getSnapshot: instance.snapshot.getSnapshot,
-  refresh: instance.snapshot.refresh,
-  streamChanges: instance.snapshot.streamChanges,
-});
+const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource => {
+  // Adapter capabilities live off the snapshot, but clients only ever read
+  // snapshots — stamp them onto every emission so they stay consistent
+  // whether the snapshot came from `getSnapshot`, `refresh`, or the stream.
+  const withAdapterCapabilities = (snapshot: ServerProvider): ServerProvider => ({
+    ...snapshot,
+    supportsProviderHandoff: instance.adapter.capabilities.supportsCrossProviderHandoff,
+  });
+  return {
+    instanceId: instance.instanceId,
+    driverKind: instance.driverKind,
+    getSnapshot: instance.snapshot.getSnapshot.pipe(Effect.map(withAdapterCapabilities)),
+    refresh: instance.snapshot.refresh.pipe(Effect.map(withAdapterCapabilities)),
+    streamChanges: instance.snapshot.streamChanges.pipe(Stream.map(withAdapterCapabilities)),
+  };
+};
 
 export const ProviderRegistryLive = Layer.effect(
   ProviderRegistry,
