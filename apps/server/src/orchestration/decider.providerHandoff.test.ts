@@ -1,5 +1,6 @@
 import {
   CommandId,
+  EventId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -8,6 +9,7 @@ import {
   type OrchestrationReadModel,
   type OrchestrationSession,
   type OrchestrationThread,
+  type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -93,6 +95,18 @@ const completedTurn: OrchestrationThread["latestTurn"] = {
   assistantMessageId: MessageId.make("assistant-1"),
 };
 
+function requestActivity(kind: string, requestId: string): OrchestrationThreadActivity {
+  return {
+    id: EventId.make(`activity-${requestId}-${kind}`),
+    kind,
+    summary: kind,
+    tone: "approval",
+    turnId: null,
+    createdAt: NOW,
+    payload: { requestId },
+  };
+}
+
 it.layer(NodeServices.layer)("provider handoff decider", (it) => {
   it.effect("emits thread.provider-handoff-requested for a started, settled thread", () =>
     Effect.gen(function* () {
@@ -174,6 +188,102 @@ it.layer(NodeServices.layer)("provider handoff decider", (it) => {
           commandType: "thread.provider.handoff",
         });
       }
+    }),
+  );
+
+  it.effect("emits between turns on an interrupted or stopped session", () =>
+    Effect.gen(function* () {
+      for (const status of ["interrupted", "stopped"] as const) {
+        const result = yield* decideOrchestrationCommand({
+          command,
+          readModel: makeReadModel(
+            makeThread({ latestTurn: completedTurn, session: makeSession(status) }),
+          ),
+        });
+        const events = Array.isArray(result) ? result : [result];
+        expect(events.map((event) => event.type)).toEqual(["thread.provider-handoff-requested"]);
+      }
+    }),
+  );
+
+  it.effect("rejects while an approval or user-input request is still open", () =>
+    Effect.gen(function* () {
+      for (const kind of ["approval.requested", "user-input.requested"]) {
+        const error = yield* decideOrchestrationCommand({
+          command,
+          readModel: makeReadModel(
+            makeThread({
+              latestTurn: completedTurn,
+              session: makeSession("ready"),
+              activities: [requestActivity(kind, `req-${kind}`)],
+            }),
+          ),
+        }).pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "OrchestrationCommandInvariantError",
+          commandType: "thread.provider.handoff",
+          detail: expect.stringContaining("pending approval or user-input request"),
+        });
+      }
+    }),
+  );
+
+  it.effect("emits once the pending request is resolved", () =>
+    Effect.gen(function* () {
+      const result = yield* decideOrchestrationCommand({
+        command,
+        readModel: makeReadModel(
+          makeThread({
+            latestTurn: completedTurn,
+            session: makeSession("ready"),
+            activities: [
+              requestActivity("approval.requested", "req-1"),
+              {
+                ...requestActivity("approval.resolved", "req-1"),
+                id: EventId.make("activity-req-1-resolved"),
+              },
+            ],
+          }),
+        ),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.provider-handoff-requested"]);
+    }),
+  );
+
+  it.effect("rejects while a turn start is queued behind an unanswered message", () =>
+    Effect.gen(function* () {
+      const queuedMessage: OrchestrationThread["messages"][number] = {
+        id: MessageId.make("message-queued"),
+        role: "user",
+        text: "Continue",
+        turnId: null,
+        streaming: false,
+        createdAt: NOW,
+        updatedAt: NOW,
+      };
+      // The last turn finished before the message arrived, so the message
+      // reads as a queued turn start inside the adoption window.
+      const error = yield* decideOrchestrationCommand({
+        command,
+        readModel: makeReadModel(
+          makeThread({
+            latestTurn: {
+              ...completedTurn,
+              requestedAt: "2025-12-31T23:00:00.000Z",
+              startedAt: "2025-12-31T23:00:01.000Z",
+              completedAt: "2025-12-31T23:00:02.000Z",
+            },
+            session: makeSession("ready"),
+            messages: [queuedMessage],
+          }),
+        ),
+      }).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.provider.handoff",
+        detail: expect.stringContaining("queued turn start"),
+      });
     }),
   );
 });

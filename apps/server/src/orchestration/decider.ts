@@ -1905,7 +1905,26 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       if (sessionBusy) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
-          detail: `Thread '${command.threadId}' has a turn in flight and cannot be handed off yet.`,
+          detail: `Thread '${command.threadId}' has a turn in flight or a session still coming alive and cannot be handed off yet.`,
+        });
+      }
+      // An unanswered approval or user-input request outlives its turn:
+      // the destination provider cannot resolve it, so it must be
+      // answered or interrupted first.
+      if (openRequests(thread).size > 0) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' has a pending approval or user-input request and cannot be handed off.`,
+        });
+      }
+      // A queued turn start — a user message no turn has adopted yet —
+      // is invisible pending work: no session, no pending flags. Handing
+      // off in that window lets the turn begin on the outgoing provider
+      // mid-replay.
+      if (hasQueuedTurnStartForThread(thread, command.createdAt)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' has a queued turn start and cannot be handed off yet.`,
         });
       }
       return {
