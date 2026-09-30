@@ -6,6 +6,7 @@ import {
   EventId,
   MessageId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
@@ -3735,5 +3736,138 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+});
+
+describe("provider handoff rows", () => {
+  const baseInput = {
+    isWorking: false,
+    activeTurnStartedAt: null,
+    turnDiffSummaries: [],
+    supportsConversationRollback: false,
+  } satisfies Pick<
+    Parameters<typeof deriveMessagesTimelineRows>[0],
+    "isWorking" | "activeTurnStartedAt" | "turnDiffSummaries" | "supportsConversationRollback"
+  >;
+
+  const handoffWork: WorkLogEntry = {
+    id: "work-handoff",
+    turnId: null,
+    createdAt: "2026-01-01T00:00:05Z",
+    label: "Handed off to codex",
+    tone: "info",
+    providerHandoff: {
+      outcome: "success",
+      fromProvider: ProviderDriverKind.make("claudeAgent"),
+      fromInstanceId: "claudeAgent",
+      toInstanceId: "codex",
+      brief: "We were mid-refactor.",
+      degraded: false,
+    },
+    sourceActivityKind: "provider.handoff",
+  };
+
+  const toolWork = (id: string, createdAt: string): WorkLogEntry => ({
+    id,
+    turnId: null,
+    createdAt,
+    label: "Ran command",
+    tone: "tool",
+    toolCallId: id,
+    toolLifecycleStatus: "completed",
+    sourceActivityKind: "tool.completed",
+  });
+
+  it("renders a handoff activity as its own row, never a generic work row", () => {
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      timelineEntries: [
+        {
+          id: "entry-handoff",
+          kind: "work",
+          createdAt: handoffWork.createdAt,
+          entry: handoffWork,
+        },
+      ],
+    });
+
+    expect(rows).toEqual([
+      {
+        kind: "provider-handoff",
+        id: "entry-handoff",
+        createdAt: handoffWork.createdAt,
+        entry: handoffWork,
+      },
+    ]);
+  });
+
+  it("splits a work group rather than absorbing the handoff entry", () => {
+    const before = toolWork("work-before", "2026-01-01T00:00:01Z");
+    const after = toolWork("work-after", "2026-01-01T00:00:10Z");
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      timelineEntries: [
+        { id: "e-before", kind: "work", createdAt: before.createdAt, entry: before },
+        { id: "e-handoff", kind: "work", createdAt: handoffWork.createdAt, entry: handoffWork },
+        { id: "e-after", kind: "work", createdAt: after.createdAt, entry: after },
+      ],
+    });
+
+    expect(rows.map((row) => row.kind)).toEqual(["work", "provider-handoff", "work"]);
+    const grouped = rows.flatMap((row) =>
+      row.kind === "work" || row.kind === "work-live" ? row.groupedEntries : [],
+    );
+    expect(grouped).not.toContain(handoffWork);
+  });
+
+  it("keeps a failed handoff out of the generic error-row path", () => {
+    const failedWork: WorkLogEntry = {
+      id: "work-handoff-failed",
+      turnId: null,
+      createdAt: "2026-01-01T00:00:05Z",
+      label: "Provider handoff failed",
+      tone: "error",
+      providerHandoff: {
+        outcome: "failure",
+        detail: "Provider codex does not support provider handoff.",
+      },
+      sourceActivityKind: "provider.handoff.failed",
+    };
+
+    const rows = deriveMessagesTimelineRows({
+      ...baseInput,
+      timelineEntries: [
+        { id: "e-failed", kind: "work", createdAt: failedWork.createdAt, entry: failedWork },
+      ],
+    });
+
+    expect(rows).toEqual([
+      {
+        kind: "provider-handoff",
+        id: "e-failed",
+        createdAt: failedWork.createdAt,
+        entry: failedWork,
+      },
+    ]);
+  });
+
+  it("reuses the rendered row while the decoded entry is unchanged", () => {
+    const derive = () =>
+      deriveMessagesTimelineRows({
+        ...baseInput,
+        timelineEntries: [
+          {
+            id: "entry-handoff",
+            kind: "work",
+            createdAt: handoffWork.createdAt,
+            entry: handoffWork,
+          },
+        ],
+      });
+
+    const initial = computeStableMessagesTimelineRows(derive(), { byId: new Map(), result: [] });
+    const repeated = computeStableMessagesTimelineRows(derive(), initial);
+
+    expect(repeated).toBe(initial);
   });
 });

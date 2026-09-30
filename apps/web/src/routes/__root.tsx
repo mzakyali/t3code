@@ -19,6 +19,7 @@ import { resolveServerBackedAppDisplayName } from "../branding.logic";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
 import { CommandPalette } from "../components/CommandPalette";
 import { CustomSnoozeDialogHost } from "../components/CustomSnoozeDialog";
+import { ProviderHandoffDialogHost } from "../components/ProviderHandoffDialog";
 import { ConfirmDialogHost } from "../components/ConfirmDialogHost";
 import { ImportDevinSessionsDialogHost } from "../components/agentSessions/ImportDevinSessionsDialog";
 import { FirstRunGate } from "../components/onboarding/FirstRunGate";
@@ -181,6 +182,7 @@ function RootRouteView() {
           <FontAppearanceSync />
           <ProviderAuthCallbackCoordinator />
           <CustomSnoozeDialogHost />
+          <ProviderHandoffDialogHost />
           <CommandPalette>
             <AppSidebarLayout>
               <Outlet />
@@ -237,6 +239,7 @@ function RootRouteView() {
           <QueuedMessageSender />
           <ConfirmDialogHost />
           <CustomSnoozeDialogHost />
+          <ProviderHandoffDialogHost />
           <ImportDevinSessionsDialogHost />
           <SlowRpcRequestToastCoordinator />
           <ProjectCloneToastCoordinator />

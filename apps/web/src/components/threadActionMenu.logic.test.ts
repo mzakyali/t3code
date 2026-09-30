@@ -12,12 +12,14 @@ const baseState: ThreadActionMenuState = {
   canSnoozeNow: true,
   isRegeneratingTitle: false,
   isRunning: false,
+  hasStarted: true,
   supports: {
     settlement: true,
     autoSettleOptOut: true,
     snooze: true,
     pinning: true,
     titleRegeneration: true,
+    providerHandoff: true,
   },
   snoozePresets: [
     { id: "hour", label: "In 1 hour", whenLabel: "3:00 PM", snoozedUntil: "2026-08-07T15:00:00Z" },
@@ -45,6 +47,7 @@ describe("buildThreadActionMenuItems", () => {
           snooze: false,
           pinning: false,
           titleRegeneration: false,
+          providerHandoff: false,
         },
       }),
     ).toEqual(["rename", "mark-unread", "copy", "project-settings", "archive", "delete"]);
@@ -155,6 +158,7 @@ describe("buildThreadActionMenuItems", () => {
           snooze: false,
           pinning: false,
           titleRegeneration: false,
+          providerHandoff: false,
         },
       }),
     ).toContain("archive");
@@ -165,5 +169,36 @@ describe("buildThreadActionMenuItems", () => {
       (item) => item.id === "archive",
     );
     expect(archiveItem?.disabled).toBe(true);
+  });
+
+  it("offers provider handoff with the lifecycle verbs once the thread has started", () => {
+    const items = buildThreadActionMenuItems(baseState);
+    const handoff = items.find((item) => item.id === "handoff-provider");
+    expect(handoff).toMatchObject({
+      label: "Continue with another provider…",
+      icon: "arrow-right-left",
+      disabled: false,
+    });
+    // Between the snooze group and the rename separator block.
+    expect(items.findIndex((item) => item.id === "handoff-provider")).toBeLessThan(
+      items.findIndex((item) => item.id === "rename"),
+    );
+  });
+
+  it("hides provider handoff before the thread has started", () => {
+    expect(ids({ ...baseState, hasStarted: false })).not.toContain("handoff-provider");
+  });
+
+  it("hides provider handoff when no destination instance can receive the thread", () => {
+    expect(
+      ids({ ...baseState, supports: { ...baseState.supports, providerHandoff: false } }),
+    ).not.toContain("handoff-provider");
+  });
+
+  it("disables provider handoff while the thread is running", () => {
+    const item = buildThreadActionMenuItems({ ...baseState, isRunning: true }).find(
+      (candidate) => candidate.id === "handoff-provider",
+    );
+    expect(item?.disabled).toBe(true);
   });
 });

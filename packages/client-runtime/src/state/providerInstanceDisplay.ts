@@ -15,9 +15,10 @@ import {
 /**
  * Title-case a slug: splits on `_` / `-` and camelCase boundaries, so
  * `codex_personal` becomes "Codex Personal" and `myCustomInstance` becomes
- * "My Custom Instance".
+ * "My Custom Instance". Used for instance ids whose snapshot is gone (for
+ * example a provider deleted after a handoff was recorded).
  */
-function humanizeSlug(slug: string): string {
+export function humanizeSlug(slug: string): string {
   return slug
     .replace(/([a-z])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")

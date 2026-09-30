@@ -261,6 +261,25 @@ describe("adjacentModelPickerProvider", () => {
     ).toBe(unavailable.instanceId);
   });
 
+  it("omits the favorites stop when the rail is hidden", () => {
+    expect(
+      adjacentModelPickerProvider({
+        ...input,
+        showFavorites: false,
+        selectedInstanceId: claude.instanceId,
+        direction: 1,
+      }),
+    ).toBe(codex.instanceId);
+    expect(
+      adjacentModelPickerProvider({
+        ...input,
+        showFavorites: false,
+        selectedInstanceId: codex.instanceId,
+        direction: -1,
+      }),
+    ).toBe(claude.instanceId);
+  });
+
   it("handles an empty catalog and a removed selection in either direction", () => {
     expect(
       adjacentModelPickerProvider({

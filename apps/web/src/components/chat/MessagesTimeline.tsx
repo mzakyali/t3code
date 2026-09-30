@@ -18,6 +18,7 @@ import {
   type EnvironmentId,
   type MessageId,
   type ScopedThreadRef,
+  type ServerProvider,
   type ServerProviderSkill,
   type ToolActivityIcon,
   type TurnId,
@@ -91,6 +92,7 @@ import {
   workEntrySignalsSevereFailure,
   workLogEntryIsToolLike,
 } from "../../session-logic";
+import { providerHandoffCardModel } from "../../providerHandoffTimeline";
 import {
   type ChatMessage,
   type ChatFileAttachment,
@@ -107,11 +109,13 @@ import {
 } from "../../lib/diffRendering";
 import { PREFERRED_HIGHLIGHTER } from "../../lib/syntaxHighlighting";
 import ChatMarkdown, { ChatMarkdownAssetImage } from "../ChatMarkdown";
+import { Badge } from "../ui/badge";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Root, RootContent } from "mdast";
 import { T3Wordmark } from "../T3Wordmark";
 import {
+  ArrowLeftRightIcon,
   BotIcon,
   BrainIcon,
   CheckIcon,
@@ -281,6 +285,8 @@ interface TimelineRowSharedState {
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  /** Live provider catalog for the rendered environment — handoff cards resolve current instance display names from it. */
+  providers: ReadonlyArray<ServerProvider>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
@@ -375,6 +381,7 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const EMPTY_TIMELINE_PROVIDERS: ReadonlyArray<ServerProvider> = [];
 const TIMELINE_MAINTAIN_SCROLL_AT_END = {
   animated: false,
   on: {
@@ -444,6 +451,8 @@ interface MessagesTimelineProps {
   timestampFormat: TimestampFormat;
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  /** Provider snapshots for the environment the timeline renders — used to label handoff cards. Defaults to none (ids render humanized). */
+  providers?: ReadonlyArray<ServerProvider>;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   contentInsetEndAdjustment: number;
@@ -514,6 +523,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   timestampFormat,
   workspaceRoot,
   skills = EMPTY_TIMELINE_SKILLS,
+  providers = EMPTY_TIMELINE_PROVIDERS,
   anchorMessageId,
   onAnchorReady,
   contentInsetEndAdjustment,
@@ -1155,6 +1165,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       skills,
+      providers,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onUseArtifactTemplate,
@@ -1191,6 +1202,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       skills,
+      providers,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onUseArtifactTemplate,
@@ -1737,6 +1749,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "work-toggle" ? <WorkGroupToggleTimelineRow row={row} /> : null}
       {row.kind === "turn-fold" ? <TurnFoldTimelineRow row={row} /> : null}
       {row.kind === "context-compaction" ? <ContextCompactionTimelineRow row={row} /> : null}
+      {row.kind === "provider-handoff" ? <ProviderHandoffTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "user" ? <UserTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "assistant" ? (
         <AssistantTimelineRow row={row} />
@@ -1899,6 +1912,108 @@ function ContextCompactionTimelineRow({
         {row.label}
       </span>
       <span className="h-px flex-1 bg-border/70" />
+    </div>
+  );
+}
+
+/**
+ * A provider handoff rendered as its own card: the instance transition heads
+ * it, the handoff brief sits behind a disclosure, and a badge marks handoffs
+ * that fell back to the deterministic brief. Failures carry the server's
+ * detail as an error card. Disclosure state rides the shared work-entry
+ * expanded set so virtualization does not reset it.
+ */
+function ProviderHandoffTimelineRow({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "provider-handoff" }>;
+}) {
+  const { providers, markdownCwd, threadRef, workGroupViewState, onToggleWorkEntry } =
+    use(TimelineRowCtx);
+  const [expanded, setExpanded] = useState(() => workGroupViewState.expandedEntries.has(row.id));
+  const model = providerHandoffCardModel({ info: row.entry.providerHandoff, providers });
+  if (model === null) {
+    return null;
+  }
+  const canExpand = !model.failed && model.body !== null;
+  const toggleExpanded = () => {
+    const next = !expanded;
+    onToggleWorkEntry(row.id, !next);
+    if (next) workGroupViewState.expandedEntries.add(row.id);
+    else workGroupViewState.expandedEntries.delete(row.id);
+    setExpanded(next);
+  };
+  const header = (
+    <>
+      <span
+        className={cn(
+          "flex size-6 shrink-0 items-center justify-center",
+          model.failed ? "text-destructive" : "text-icon-muted",
+        )}
+      >
+        {model.failed ? (
+          <CircleAlertIcon aria-hidden="true" className="size-4" />
+        ) : (
+          <ArrowLeftRightIcon aria-hidden="true" className="size-4" />
+        )}
+      </span>
+      <h3
+        className={cn(
+          "min-w-0 flex-1 truncate text-sm",
+          model.failed ? "font-medium text-destructive" : "text-foreground/80",
+        )}
+      >
+        {model.title}
+      </h3>
+      {model.degraded ? <Badge variant="warning">Fallback brief</Badge> : null}
+      {canExpand ? (
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn(
+            "size-3.5 shrink-0 text-muted-foreground transition-transform",
+            expanded && "rotate-90",
+          )}
+        />
+      ) : null}
+    </>
+  );
+  return (
+    <div className="px-1 py-0.5">
+      <div
+        className={cn(
+          "rounded-lg border px-3 py-2",
+          model.failed ? "border-destructive/40 bg-destructive/5" : "border-border/70 bg-card/60",
+        )}
+      >
+        {canExpand ? (
+          <button
+            type="button"
+            className="flex w-full items-center gap-1.5 text-left"
+            aria-expanded={expanded}
+            onClick={toggleExpanded}
+          >
+            {header}
+          </button>
+        ) : (
+          <div className="flex items-center gap-1.5">{header}</div>
+        )}
+        {model.failed && model.body !== null ? (
+          <p className="mt-1.5 whitespace-pre-wrap break-words pl-7 text-sm text-destructive/90">
+            {model.body}
+          </p>
+        ) : null}
+        {canExpand && expanded && model.body !== null ? (
+          <div className="mt-2 border-t border-border/60 pt-2 pl-7">
+            <ChatMarkdown
+              text={model.body}
+              cwd={markdownCwd}
+              threadRef={threadRef ?? undefined}
+              isStreaming={false}
+              headingLevelOffset={3}
+            />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

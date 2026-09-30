@@ -20,6 +20,7 @@ export type ThreadActionMenuId =
   | "snooze"
   | `snooze:${string}`
   | "unsnooze"
+  | "handoff-provider"
   | "rename"
   | "regenerate-title"
   | "mark-unread"
@@ -50,6 +51,11 @@ export interface ThreadActionMenuState {
   readonly isRegeneratingTitle: boolean;
   /** Archive rejects a thread with an active turn, so disable it here rather than let the action fail. */
   readonly isRunning: boolean;
+  /**
+   * The thread has run at least one turn (or has a session). Handoff
+   * replays provider state, so it is meaningless before the thread starts.
+   */
+  readonly hasStarted: boolean;
   readonly supports: {
     readonly settlement: boolean;
     /** Server understands thread.auto-settle.set. */
@@ -57,6 +63,13 @@ export interface ThreadActionMenuState {
     readonly snooze: boolean;
     readonly pinning: boolean;
     readonly titleRegeneration: boolean;
+    /**
+     * At least one provider instance in the environment can receive this
+     * thread (advertises `supportsProviderHandoff`, picker-ready, different
+     * driver). False when no destination exists — the menu entry hides
+     * rather than opening an empty picker.
+     */
+    readonly providerHandoff: boolean;
   };
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
 }
@@ -113,6 +126,20 @@ export function buildThreadActionMenuItems(
                   { id: "snooze:custom" as const, label: "Custom…", separatorBefore: true },
                 ],
               },
+        ]
+      : []),
+    // Continuation sits with the lifecycle verbs: it replays this thread on
+    // a different provider driver, which is only meaningful once the thread
+    // has started and only offered when a destination exists. Disabled while
+    // a turn is in flight — the decider rejects busy threads anyway.
+    ...(state.supports.providerHandoff && state.hasStarted
+      ? [
+          {
+            id: "handoff-provider" as const,
+            label: "Continue with another provider…",
+            icon: "arrow-right-left",
+            disabled: state.isRunning,
+          },
         ]
       : []),
     { id: "rename", label: "Rename thread", icon: "pencil", separatorBefore: true },

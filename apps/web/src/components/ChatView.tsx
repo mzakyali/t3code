@@ -9984,6 +9984,14 @@ export default function ChatView(props: ChatViewProps) {
                     ? resolveProviderSkillsForCwd(activeProviderStatus, gitCwd)
                     : EMPTY_PROVIDER_SKILLS
                 }
+                providers={
+                  // Handoff cards label their endpoints from the environment
+                  // that owns the painted thread, which can differ from the
+                  // active one while a jump still holds the previous list.
+                  environmentById.get(
+                    displayedThreadRef?.environmentId ?? activeThread.environmentId,
+                  )?.serverConfig?.providers ?? providerStatuses
+                }
                 anchorMessageId={paintOnlyDisplayedTimeline ? null : timelineAnchorMessageId}
                 onAnchorReady={onTimelineAnchorReady}
                 contentInsetEndAdjustment={composerTimelineInset}

@@ -132,9 +132,11 @@ export function adjacentModelPickerProvider(input: {
   direction: 1 | -1;
   disabledInstanceIds: ReadonlySet<ProviderInstanceId> | undefined;
   selectableUnavailableInstanceIds: ReadonlySet<ProviderInstanceId> | undefined;
+  /** Mirrors `ModelPickerContent.showFavorites`; false keeps the rail cycle off "favorites". */
+  showFavorites?: boolean | undefined;
 }) {
   const providers: Array<ProviderInstanceId | "favorites"> = [
-    "favorites",
+    ...(input.showFavorites === false ? [] : (["favorites"] as const)),
     ...input.entries
       .filter(
         (entry) =>
@@ -175,6 +177,13 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
    */
   lockedProvider: ProviderDriverKind | null;
   lockedContinuationGroupKey?: string | null;
+  /**
+   * Render the favorites rail entry and allow opening on it. Defaults true;
+   * pickers scoped to a fixed destination set (provider handoff) pass false —
+   * favorites outside the destination list can never be selected there, so
+   * the rail would only show an empty list.
+   */
+  showFavorites?: boolean | undefined;
   /**
    * All configured provider instances in display order. Used to render
    * the sidebar (one button per instance) and to resolve display names
@@ -272,6 +281,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       activeEntry,
       modelOptionsByInstance.get(props.activeInstanceId) ?? [],
     );
+  const showFavorites = props.showFavorites ?? true;
   const [selectedInstanceId, setSelectedInstanceId] = useState<ProviderInstanceId | "favorites">(
     () => {
       if (
@@ -282,7 +292,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
         // Keep the active instance visible when it is locked or needs setup.
         return props.activeInstanceId;
       }
-      return favorites.length > 0 ? "favorites" : props.activeInstanceId;
+      return showFavorites && favorites.length > 0 ? "favorites" : props.activeInstanceId;
     },
   );
   const [expandedLegacyInstances, setExpandedLegacyInstances] = useState(
@@ -866,6 +876,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           direction: command === "modelPicker.nextProvider" ? 1 : -1,
           disabledInstanceIds: lockedDisabledInstanceIds,
           selectableUnavailableInstanceIds,
+          showFavorites,
         });
         setSearchQuery("");
         handleSelectInstance(next);
@@ -903,6 +914,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     modelJumpShortcutContext,
     selectableUnavailableInstanceIds,
     selectedInstanceId,
+    showFavorites,
     sidebarInstanceEntries,
   ]);
 
@@ -933,7 +945,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             onSelectInstance={handleSelectInstance}
             onFocusSearch={focusSearchInput}
             instanceEntries={sidebarInstanceEntries}
-            showFavorites
+            showFavorites={showFavorites}
             {...(selectableUnavailableInstanceIds ? { selectableUnavailableInstanceIds } : {})}
             {...(lockedDisabledInstanceIds
               ? {

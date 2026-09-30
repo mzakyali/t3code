@@ -343,6 +343,7 @@ function isActivityEntry(entry: TimelineEntry): entry is ActivityEntry {
     : entry.kind === "work" &&
         entry.entry.agentSpawn === undefined &&
         entry.entry.questionAnswer === undefined &&
+        entry.entry.providerHandoff === undefined &&
         entry.entry.sourceActivityKind !== "context-compaction" &&
         entry.entry.tone !== "error";
 }
@@ -404,6 +405,12 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       label: string;
+    }
+  | {
+      kind: "provider-handoff";
+      id: string;
+      createdAt: string;
+      entry: WorkLogEntry;
     }
   | {
       kind: "message";
@@ -1039,6 +1046,7 @@ export function deriveMessagesTimelineRows(input: {
     if (
       !entryBelongsToActiveTurn(entry, index) ||
       entry.kind !== "work" ||
+      entry.entry.providerHandoff !== undefined ||
       entry.entry.questionAnswer !== undefined ||
       entry.entry.sourceActivityKind === "context-compaction" ||
       entry.entry.tone === "error"
@@ -1217,6 +1225,18 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    // Handoff cards render on their own row: they are turn boundaries, not
+    // tool output, so they never join a work group or a foldable trace.
+    if (timelineEntry.kind === "work" && timelineEntry.entry.providerHandoff !== undefined) {
+      nextRows.push({
+        kind: "provider-handoff",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        entry: timelineEntry.entry,
+      });
+      continue;
+    }
+
     if (timelineEntry.kind === "work") {
       if (
         timelineEntry.entry.agentSpawn !== undefined ||
@@ -1247,6 +1267,7 @@ export function deriveMessagesTimelineRows(input: {
           nextEntry.kind !== "work" ||
           nextEntry.entry.agentSpawn !== undefined ||
           nextEntry.entry.questionAnswer !== undefined ||
+          nextEntry.entry.providerHandoff !== undefined ||
           nextEntry.entry.sourceActivityKind === "context-compaction" ||
           nextEntry.entry.tone === "error" ||
           activeWorkEntryIds.has(nextEntry.id) ||
@@ -1634,6 +1655,9 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
       const bc = b as typeof a;
       return a.createdAt === bc.createdAt && a.label === bc.label;
     }
+
+    case "provider-handoff":
+      return a.entry === (b as typeof a).entry;
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;

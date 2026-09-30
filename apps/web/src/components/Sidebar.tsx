@@ -1,4 +1,5 @@
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import { requestProviderHandoff } from "./ProviderHandoffDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
@@ -126,7 +127,11 @@ import { useThreadActions } from "../hooks/useThreadActions";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
-import { useClientSettings } from "../hooks/useSettings";
+import {
+  getClientSettings,
+  mergeEnvironmentSettings,
+  useClientSettings,
+} from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useLocalStorage } from "../hooks/useLocalStorage";
 import { useNowMinute } from "../hooks/useNowMinute";
@@ -155,6 +160,11 @@ import { cn } from "~/lib/utils";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { ProjectEnvironmentBadge } from "./ProjectEnvironmentBadge";
 import { buildThreadActionMenuItems } from "./threadActionMenu.logic";
+import { threadShellHasStarted } from "./ChatView.logic";
+import {
+  deriveProviderHandoffDestinations,
+  providerHandoffSourceInstanceId,
+} from "../providerHandoff";
 import {
   animateSidebarLayoutChanges,
   applySidebarThreadDrop,
@@ -2202,6 +2212,9 @@ export default function Sidebar() {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const handoffProvider = useAtomCommand(threadEnvironment.handoffProvider, {
+    reportFailure: false,
+  });
   const { copyToClipboard: copyPathToClipboard } = useCopyToClipboard<{ path: string }>({
     onCopy: ({ path }) => {
       toastManager.add({
@@ -4055,19 +4068,28 @@ export default function Sidebar() {
         // Un-settle pins the thread active until real activity clears the pin.
         // Environments without
         // the settlement capability get no lifecycle items at all.
+        const threadServerConfig = serverConfigs.get(thread.environmentId);
         const supportsSettlement =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
-          true;
-        const supportsSnooze =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
-        const supportsPinning =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadPinning === true;
+          threadServerConfig?.environment.capabilities.threadSettlement === true;
+        const supportsSnooze = threadServerConfig?.environment.capabilities.threadSnooze === true;
+        const supportsPinning = threadServerConfig?.environment.capabilities.threadPinning === true;
         const supportsAutoSettleOptOut =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities
-            .threadAutoSettleOptOut === true;
+          threadServerConfig?.environment.capabilities.threadAutoSettleOptOut === true;
         const supportsTitleRegeneration =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities
-            .threadTitleRegeneration === true;
+          threadServerConfig?.environment.capabilities.threadTitleRegeneration === true;
+        const handoffSettings = threadServerConfig
+          ? mergeEnvironmentSettings(threadServerConfig.settings, getClientSettings())
+          : null;
+        // Offered only when a real destination exists — the same filter the
+        // dialog applies, so the menu never opens an empty picker.
+        const supportsProviderHandoff =
+          threadServerConfig !== undefined &&
+          handoffSettings !== null &&
+          deriveProviderHandoffDestinations({
+            providers: threadServerConfig.providers,
+            settings: handoffSettings,
+            currentInstanceId: providerHandoffSourceInstanceId(thread),
+          }).length > 0;
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
@@ -4100,12 +4122,14 @@ export default function Sidebar() {
               isRegeneratingTitle,
               isRunning:
                 thread.session?.status === "running" && thread.session.activeTurnId != null,
+              hasStarted: threadShellHasStarted(thread),
               supports: {
                 settlement: supportsSettlement,
                 autoSettleOptOut: supportsAutoSettleOptOut,
                 snooze: supportsSnooze,
                 pinning: supportsPinning,
                 titleRegeneration: supportsTitleRegeneration,
+                providerHandoff: supportsProviderHandoff,
               },
               snoozePresets,
             }),
@@ -4213,6 +4237,31 @@ export default function Sidebar() {
             }
             return;
           }
+          case "handoff-provider": {
+            if (!threadServerConfig || !handoffSettings) return;
+            const selection = await requestProviderHandoff({
+              threadTitle: thread.title,
+              providers: threadServerConfig.providers,
+              settings: handoffSettings,
+              currentInstanceId: providerHandoffSourceInstanceId(thread),
+            });
+            if (!selection) return;
+            const result = await handoffProvider({
+              environmentId: threadRef.environmentId,
+              input: { threadId: threadRef.threadId, modelSelection: selection },
+            });
+            if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+              const error = squashAtomCommandFailure(result);
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Failed to continue with another provider",
+                  description: error instanceof Error ? error.message : "An error occurred.",
+                }),
+              );
+            }
+            return;
+          }
           case "mark-unread":
             markThreadUnread(threadKey, thread.latestTurn?.completedAt);
             return;
@@ -4312,6 +4361,7 @@ export default function Sidebar() {
       copyThreadIdToClipboard,
       deleteThread,
       handleMultiSelectContextMenu,
+      handoffProvider,
       markThreadUnread,
       openProjectSettings,
       projectScopeKey,

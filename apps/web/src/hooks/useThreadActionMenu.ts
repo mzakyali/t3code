@@ -1,4 +1,5 @@
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
+import { requestProviderHandoff } from "../components/ProviderHandoffDialog";
 import { scopeProjectRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
   type AtomCommandResult,
@@ -12,11 +13,19 @@ import { useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 
 import { resolveSnoozePresets } from "../components/Sidebar.snooze";
+import { threadShellHasStarted } from "../components/ChatView.logic";
 import {
   buildThreadActionMenuItems,
   type ThreadActionMenuId,
 } from "../components/threadActionMenu.logic";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
+import {
+  deriveProviderHandoffDestinations,
+  providerHandoffSourceInstanceId,
+} from "../providerHandoff";
+import { appAtomRegistry } from "../rpc/atomRegistry";
+import { environmentServerConfigsAtom } from "../state/server";
+import { getClientSettings, mergeEnvironmentSettings, useClientSettings } from "./useSettings";
 import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
 import {
@@ -39,7 +48,6 @@ import { buildPhysicalToLogicalProjectKeyMap } from "../sidebarProjectGrouping";
 import { useUiStateStore } from "../uiStateStore";
 import { useCopyToClipboard } from "./useCopyToClipboard";
 import { useNewThreadHandler } from "./useHandleNewThread";
-import { useClientSettings } from "./useSettings";
 import { useThreadActions } from "./useThreadActions";
 
 function failureToast(title: string, error: unknown) {
@@ -96,6 +104,9 @@ export function useThreadActionMenu(input: {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const handoffProvider = useAtomCommand(threadEnvironment.handoffProvider, {
+    reportFailure: false,
+  });
   const handleNewThread = useNewThreadHandler();
   const markThreadUnread = useUiStateStore((s) => s.markThreadUnread);
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
@@ -132,12 +143,28 @@ export function useThreadActionMenu(input: {
         const thread = readThreadShell(threadRef);
         if (!thread) return;
         const now = new Date();
+        const serverConfig = appAtomRegistry
+          .get(environmentServerConfigsAtom)
+          .get(threadRef.environmentId);
+        const handoffSettings = serverConfig
+          ? mergeEnvironmentSettings(serverConfig.settings, getClientSettings())
+          : null;
         const supports = {
           settlement: readEnvironmentSupportsSettlement(threadRef.environmentId),
           autoSettleOptOut: readEnvironmentSupportsAutoSettleOptOut(threadRef.environmentId),
           snooze: readEnvironmentSupportsSnooze(threadRef.environmentId),
           pinning: readEnvironmentSupportsPinning(threadRef.environmentId),
           titleRegeneration: readEnvironmentSupportsTitleRegeneration(threadRef.environmentId),
+          // Offered only when a real destination exists — the same filter the
+          // dialog applies, so the menu never opens an empty picker.
+          providerHandoff:
+            serverConfig !== undefined &&
+            handoffSettings !== null &&
+            deriveProviderHandoffDestinations({
+              providers: serverConfig.providers,
+              settings: handoffSettings,
+              currentInstanceId: providerHandoffSourceInstanceId(thread),
+            }).length > 0,
         };
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const snoozePresets = resolveSnoozePresets(now, timestampFormat);
@@ -153,6 +180,7 @@ export function useThreadActionMenu(input: {
           canSnoozeNow: canSnooze(thread, { now: now.toISOString() }),
           isRegeneratingTitle,
           isRunning: thread.session?.status === "running" && thread.session.activeTurnId != null,
+          hasStarted: threadShellHasStarted(thread),
           supports,
           snoozePresets,
         });
@@ -247,6 +275,23 @@ export function useThreadActionMenu(input: {
               }),
             );
             return;
+          case "handoff-provider": {
+            if (!serverConfig || !handoffSettings) return;
+            const selection = await requestProviderHandoff({
+              threadTitle: thread.title,
+              providers: serverConfig.providers,
+              settings: handoffSettings,
+              currentInstanceId: providerHandoffSourceInstanceId(thread),
+            });
+            if (!selection) return;
+            await reportFailure("Failed to continue with another provider", () =>
+              handoffProvider({
+                environmentId: threadRef.environmentId,
+                input: { threadId: threadRef.threadId, modelSelection: selection },
+              }),
+            );
+            return;
+          }
           case "mark-unread":
             markThreadUnread(scopedThreadKey(threadRef), thread.latestTurn?.completedAt);
             return;
@@ -335,6 +380,7 @@ export function useThreadActionMenu(input: {
       copyThreadIdToClipboard,
       deleteThread,
       handleNewThread,
+      handoffProvider,
       logicalProjectKeyByPhysicalKey,
       markThreadUnread,
       onStartRename,

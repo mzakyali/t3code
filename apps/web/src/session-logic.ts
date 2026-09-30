@@ -45,6 +45,7 @@ import {
   type ThreadSession,
   type TurnDiffSummary,
 } from "./types";
+import { decodeProviderHandoffInfo, type ProviderHandoffInfo } from "./providerHandoffTimeline";
 
 export type { PendingApproval, PendingUserInput } from "@t3tools/client-runtime/pending-requests";
 
@@ -102,6 +103,8 @@ export {
 
 export interface WorkLogEntry {
   questionAnswer?: UserInputAttachmentAnswerPayload;
+  /** Decoded `provider.handoff`/`provider.handoff.failed` payload — the timeline renders the dedicated card instead of the generic row. */
+  providerHandoff?: ProviderHandoffInfo;
   id: string;
   createdAt: string;
   turnId?: TurnId | null;
@@ -637,6 +640,10 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
           : activity.tone,
     sourceActivityKind: activity.kind,
   };
+  const providerHandoff = decodeProviderHandoffInfo(activity);
+  if (providerHandoff !== null) {
+    entry.providerHandoff = providerHandoff;
+  }
   if (activity.kind === "user-input.answer-submitted") {
     const answer = decodeQuestionAttachmentAnswer(payload);
     if (Option.isSome(answer)) entry.questionAnswer = answer.value;
