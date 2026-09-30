@@ -1,4 +1,5 @@
 import {
+  CheckpointRef,
   CommandId,
   EventId,
   MessageId,
@@ -284,6 +285,210 @@ it.layer(NodeServices.layer)("provider handoff decider", (it) => {
         commandType: "thread.provider.handoff",
         detail: expect.stringContaining("queued turn start"),
       });
+    }),
+  );
+});
+
+function checkpoint(
+  turnCount: number,
+  completedAt: string,
+): OrchestrationThread["checkpoints"][number] {
+  return {
+    turnId: TurnId.make(`turn-${turnCount}`),
+    checkpointTurnCount: turnCount,
+    checkpointRef: CheckpointRef.make(`refs/t3/checkpoints/${threadId}/turn/${turnCount}`),
+    status: "ready",
+    files: [],
+    assistantMessageId: null,
+    completedAt,
+  };
+}
+
+function handoffActivity(
+  createdAt: string,
+  id = `handoff-${createdAt}`,
+): OrchestrationThreadActivity {
+  return {
+    id: EventId.make(id),
+    kind: "provider.handoff",
+    summary: "Handed off to claude",
+    tone: "info",
+    turnId: null,
+    createdAt,
+    payload: {
+      fromProvider: "codex",
+      fromInstanceId: "codex",
+      toInstanceId: "claude",
+      brief: "carry on",
+      degraded: false,
+      createdAt,
+    },
+  };
+}
+
+// Two pre-handoff turns (checkpoints 1-2), the handoff card, then two turns
+// on the destination provider (checkpoints 3-4).
+const handedOffThread = makeThread({
+  latestTurn: {
+    turnId: TurnId.make("turn-4"),
+    state: "completed",
+    requestedAt: "2026-01-01T00:00:04.000Z",
+    startedAt: "2026-01-01T00:00:04.000Z",
+    completedAt: "2026-01-01T00:00:05.000Z",
+    assistantMessageId: null,
+  },
+  checkpoints: [
+    checkpoint(1, "2026-01-01T00:00:01.000Z"),
+    checkpoint(2, "2026-01-01T00:00:02.000Z"),
+    checkpoint(3, "2026-01-01T00:00:04.000Z"),
+    checkpoint(4, "2026-01-01T00:00:05.000Z"),
+  ],
+  activities: [handoffActivity("2026-01-01T00:00:03.000Z")],
+});
+
+it.layer(NodeServices.layer)("conversation revert across provider handoff", (it) => {
+  const revertCommand = (
+    turnCount: number,
+    type: "thread.conversation.revert" | "thread.checkpoint.revert" = "thread.conversation.revert",
+  ) => ({
+    type,
+    commandId: CommandId.make(`cmd-${type}-${turnCount}`),
+    threadId,
+    turnCount,
+    createdAt: NOW,
+  });
+
+  // Both revert kinds roll back the bound provider's session — the checkpoint
+  // variant just restores files on top — so both are gated the same way.
+  it.effect("rejects a revert that lands on or before the last provider handoff", () =>
+    Effect.gen(function* () {
+      for (const type of ["thread.conversation.revert", "thread.checkpoint.revert"] as const) {
+        for (const turnCount of [0, 1, 2]) {
+          const error = yield* decideOrchestrationCommand({
+            command: revertCommand(turnCount, type),
+            readModel: makeReadModel(handedOffThread),
+          }).pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "OrchestrationCommandInvariantError",
+            commandType: type,
+          });
+        }
+      }
+    }),
+  );
+
+  it.effect("emits for a revert that stays on the destination provider's turns", () =>
+    Effect.gen(function* () {
+      const conversationResult = yield* decideOrchestrationCommand({
+        command: revertCommand(3),
+        readModel: makeReadModel(handedOffThread),
+      });
+      const conversationEvents = Array.isArray(conversationResult)
+        ? conversationResult
+        : [conversationResult];
+      expect(conversationEvents[0]).toMatchObject({
+        type: "thread.checkpoint-revert-requested",
+        payload: {
+          threadId,
+          turnCount: 3,
+          restoreFiles: false,
+        },
+      });
+
+      const checkpointResult = yield* decideOrchestrationCommand({
+        command: revertCommand(3, "thread.checkpoint.revert"),
+        readModel: makeReadModel(handedOffThread),
+      });
+      const checkpointEvents = Array.isArray(checkpointResult)
+        ? checkpointResult
+        : [checkpointResult];
+      expect(checkpointEvents).toHaveLength(1);
+      expect(checkpointEvents[0]).toMatchObject({
+        type: "thread.checkpoint-revert-requested",
+        payload: { threadId, turnCount: 3 },
+      });
+      expect(checkpointEvents[0]?.payload).not.toHaveProperty("restoreFiles");
+    }),
+  );
+
+  it.effect("emits when the thread has no provider handoff activity", () =>
+    Effect.gen(function* () {
+      const result = yield* decideOrchestrationCommand({
+        command: revertCommand(0),
+        readModel: makeReadModel(
+          makeThread({
+            latestTurn: completedTurn,
+            checkpoints: [checkpoint(1, "2026-01-01T00:00:01.000Z")],
+          }),
+        ),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
+    }),
+  );
+
+  it.effect("ignores a failed handoff when locating the boundary", () =>
+    Effect.gen(function* () {
+      const failedHandoff: OrchestrationThreadActivity = {
+        ...handoffActivity("2026-01-01T00:00:03.000Z"),
+        kind: "provider.handoff.failed",
+      };
+      const result = yield* decideOrchestrationCommand({
+        command: revertCommand(0),
+        readModel: makeReadModel(
+          makeThread({
+            latestTurn: completedTurn,
+            checkpoints: [
+              checkpoint(1, "2026-01-01T00:00:01.000Z"),
+              checkpoint(2, "2026-01-01T00:00:02.000Z"),
+            ],
+            activities: [failedHandoff],
+          }),
+        ),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
+    }),
+  );
+
+  it.effect("gates against the most recent handoff when several exist", () =>
+    Effect.gen(function* () {
+      const thread = makeThread({
+        latestTurn: {
+          turnId: TurnId.make("turn-6"),
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:08.000Z",
+          startedAt: "2026-01-01T00:00:08.000Z",
+          completedAt: "2026-01-01T00:00:09.000Z",
+          assistantMessageId: null,
+        },
+        checkpoints: [
+          checkpoint(1, "2026-01-01T00:00:01.000Z"),
+          checkpoint(2, "2026-01-01T00:00:02.000Z"),
+          checkpoint(3, "2026-01-01T00:00:04.000Z"),
+          checkpoint(4, "2026-01-01T00:00:05.000Z"),
+          checkpoint(5, "2026-01-01T00:00:07.000Z"),
+          checkpoint(6, "2026-01-01T00:00:09.000Z"),
+        ],
+        activities: [
+          handoffActivity("2026-01-01T00:00:03.000Z", "handoff-1"),
+          handoffActivity("2026-01-01T00:00:06.000Z", "handoff-2"),
+        ],
+      });
+      const error = yield* decideOrchestrationCommand({
+        command: revertCommand(4),
+        readModel: makeReadModel(thread),
+      }).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.conversation.revert",
+      });
+      const result = yield* decideOrchestrationCommand({
+        command: revertCommand(5),
+        readModel: makeReadModel(thread),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
     }),
   );
 });

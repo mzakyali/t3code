@@ -131,6 +131,30 @@ function hasQueuedTurnStartForThread(
   );
 }
 
+/**
+ * Turn index of the latest provider boundary: the highest checkpointed turn
+ * count completed at or before the most recent `provider.handoff` activity.
+ * Turns at or below it ran under a previous provider's session, so a revert
+ * landing there would restore that provider's history as the visible head
+ * while the binding belongs to the destination provider.
+ * Null when the thread has never handed off.
+ */
+function providerHandoffBoundaryTurnCount(
+  thread: Pick<OrchestrationThread, "activities" | "checkpoints">,
+): number | null {
+  const handoff = thread.activities.findLast((activity) => activity.kind === "provider.handoff");
+  if (handoff === undefined) {
+    return null;
+  }
+  let boundaryTurnCount = 0;
+  for (const checkpoint of thread.checkpoints) {
+    if (compareDateTimeStrings(checkpoint.completedAt, handoff.createdAt) <= 0) {
+      boundaryTurnCount = Math.max(boundaryTurnCount, checkpoint.checkpointTurnCount);
+    }
+  }
+  return boundaryTurnCount;
+}
+
 function findPullRequestLink(
   thread: Pick<OrchestrationThread, "pullRequests">,
   key: ThreadPullRequestKey,
@@ -1819,11 +1843,24 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
 
     case "thread.conversation.revert":
     case "thread.checkpoint.revert": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      // Both revert kinds rewind the bound provider's session — the
+      // checkpoint variant restores files on top, but the history rollback is
+      // shared. Landing on or before the last handoff would delete the
+      // destination provider's turns and restore the previous provider's
+      // history while the session belongs to the destination — a state
+      // neither side owns.
+      const boundaryTurnCount = providerHandoffBoundaryTurnCount(thread);
+      if (boundaryTurnCount !== null && command.turnCount <= boundaryTurnCount) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' cannot rewind to turn ${command.turnCount}: it crosses the provider handoff at turn ${boundaryTurnCount}. Turns before a handoff belong to a previous provider's session.`,
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
