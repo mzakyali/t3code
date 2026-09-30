@@ -2336,7 +2336,11 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        supportsConversationRollback: false,
+        supportsCrossProviderHandoff: false,
+      },
       startSession,
       sendTurn,
       interruptTurn,

@@ -1881,6 +1881,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.provider.handoff": {
+      // The command ships in the contract before the handoff flow is wired;
+      // accepting it now would emit an intent event no reactor consumes.
+      return yield* new OrchestrationCommandInvariantError({
+        commandType: command.type,
+        detail: "provider handoff is not supported yet",
+      });
+    }
+
     case "thread.session.set": {
       const thread = yield* requireThread({
         readModel,

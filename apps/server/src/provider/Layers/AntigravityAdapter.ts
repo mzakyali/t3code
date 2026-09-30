@@ -1286,7 +1286,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
   return {
     provider: PROVIDER,
-    capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+    capabilities: {
+      sessionModelSwitch: "in-session",
+      supportsConversationRollback: false,
+      supportsCrossProviderHandoff: true,
+    },
     compaction: { type: "slash-command", command: "/compact" },
     startSession,
     sendTurn,

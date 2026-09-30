@@ -451,6 +451,7 @@ it.effect.each(["opt-in desktop restart", "marked remote update"] as const)(
               Effect.succeed({
                 sessionModelSwitch: "in-session",
                 promptlessTurnContinuation: true,
+                supportsCrossProviderHandoff: true,
               }),
             sendTurn: (input) =>
               Deferred.succeed(sent, input).pipe(

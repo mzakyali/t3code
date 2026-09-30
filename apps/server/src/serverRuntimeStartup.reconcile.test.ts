@@ -235,6 +235,7 @@ it.effect.each(
         getCapabilities: (instanceId) =>
           Effect.succeed({
             sessionModelSwitch: "in-session",
+            supportsCrossProviderHandoff: true,
             ...(instanceId === providerInstanceId ? { promptlessTurnContinuation: true } : {}),
           }),
         sendTurn: (input) =>
@@ -826,6 +827,7 @@ for (const preparedStatus of [
             Effect.succeed({
               sessionModelSwitch: "in-session" as const,
               promptlessTurnContinuation: true,
+              supportsCrossProviderHandoff: true,
             }),
           sendTurn: (input: ProviderSendTurnInput) =>
             Effect.sync(() => {
@@ -931,7 +933,11 @@ it.effect("settles failed opt-in recovery without retrying the provider turn", (
       providerService: {
         ...makeProviderService(),
         getCapabilities: () =>
-          Effect.succeed({ sessionModelSwitch: "in-session", promptlessTurnContinuation: true }),
+          Effect.succeed({
+            sessionModelSwitch: "in-session",
+            promptlessTurnContinuation: true,
+            supportsCrossProviderHandoff: true,
+          }),
         sendTurn: (input) =>
           Effect.gen(function* () {
             sends.push(input);

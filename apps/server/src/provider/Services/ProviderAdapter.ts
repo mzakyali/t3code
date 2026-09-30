@@ -52,6 +52,8 @@ export interface ProviderAdapterCapabilities {
   readonly promptlessTurnContinuation?: boolean;
   /** False when native conversation history cannot be rewound. */
   readonly supportsConversationRollback?: boolean;
+  /** True when this driver can act as handoff source or destination. */
+  readonly supportsCrossProviderHandoff: boolean;
 }
 
 export interface ProviderThreadTurnSnapshot {

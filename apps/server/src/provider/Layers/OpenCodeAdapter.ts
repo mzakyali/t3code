@@ -4038,6 +4038,7 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        supportsCrossProviderHandoff: true,
       },
       startSession,
       sendTurn,
