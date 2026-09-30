@@ -218,6 +218,7 @@ describe("ProviderSessionReaper", () => {
       rollbackConversation: () => unsupported(),
       uploadFeedback: () => unsupported(),
       setPendingHandoffContext: () => unsupported(),
+      getPendingHandoffContext: () => unsupported(),
       consumePendingHandoffContext: () => unsupported(),
       streamEvents: Stream.empty,
     };

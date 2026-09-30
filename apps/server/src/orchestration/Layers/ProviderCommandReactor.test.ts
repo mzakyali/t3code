@@ -50,6 +50,7 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Lay
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
+  type PendingHandoffContext,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
 import { ProviderAuthService } from "../../provider/Services/ProviderAuthService.ts";
@@ -187,6 +188,12 @@ describe("ProviderCommandReactor", () => {
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderServiceError>;
+    readonly summarizeForHandoffEffect?: (
+      threadId: ThreadId,
+    ) => Effect.Effect<string, ProviderServiceError>;
+    readonly supportsCrossProviderHandoff?: (instanceId: ProviderInstanceId) => boolean;
+    readonly disabledInstanceIds?: ReadonlyArray<string>;
+    readonly failSessionSetForProviderInstanceId?: ProviderInstanceId;
     readonly tryHandlePromptCommandEffect?: ProviderAuthService["Service"]["tryHandlePromptCommand"];
   }) {
     const now = "2026-01-01T00:00:00.000Z";
@@ -267,13 +274,37 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
-    const sendTurn = vi.fn((_: unknown) =>
+    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>(() =>
       Effect.succeed({
         threadId: ThreadId.make("thread-1"),
         turnId: asTurnId("turn-1"),
       }),
     );
     const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
+    const pendingHandoffContexts = new Map<ThreadId, PendingHandoffContext>();
+    const summarizeForHandoff = vi.fn<ProviderServiceShape["summarizeForHandoff"]>((threadId) =>
+      input?.summarizeForHandoffEffect !== undefined
+        ? input.summarizeForHandoffEffect(threadId)
+        : Effect.succeed("The outgoing provider's handoff brief."),
+    );
+    const getPendingHandoffContext = vi.fn<ProviderServiceShape["getPendingHandoffContext"]>(
+      (threadId) => Effect.succeed(pendingHandoffContexts.get(threadId)),
+    );
+    const setPendingHandoffContext = vi.fn<ProviderServiceShape["setPendingHandoffContext"]>(
+      (threadId, context) =>
+        Effect.sync(() => {
+          pendingHandoffContexts.set(threadId, context);
+        }),
+    );
+    const consumePendingHandoffContext = vi.fn<
+      ProviderServiceShape["consumePendingHandoffContext"]
+    >((threadId) =>
+      Effect.sync(() => {
+        const pending = pendingHandoffContexts.get(threadId);
+        pendingHandoffContexts.delete(threadId);
+        return pending?.brief;
+      }),
+    );
     const interruptTurn = vi.fn((_: unknown) => input?.interruptTurnEffect?.() ?? Effect.void);
     const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
     const respondToUserInput = vi.fn<ProviderServiceShape["respondToUserInput"]>(() => Effect.void);
@@ -361,16 +392,16 @@ describe("ProviderCommandReactor", () => {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
       compactThread,
-      summarizeForHandoff: () => unsupported(),
+      summarizeForHandoff,
       interruptTurn: interruptTurn as ProviderServiceShape["interruptTurn"],
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
       respondToUserInput: respondToUserInput as ProviderServiceShape["respondToUserInput"],
       stopSession: stopSession as ProviderServiceShape["stopSession"],
       listSessions: () => Effect.succeed(runtimeSessions),
-      getCapabilities: (_provider) =>
+      getCapabilities: (instanceId) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
-          supportsCrossProviderHandoff: true,
+          supportsCrossProviderHandoff: input?.supportsCrossProviderHandoff?.(instanceId) ?? true,
         }),
       assertConversationRollbackSupported: () => unsupported(),
       getInstanceInfo: (instanceId) => {
@@ -388,7 +419,7 @@ describe("ProviderCommandReactor", () => {
           instanceId,
           driverKind,
           displayName: undefined,
-          enabled: true,
+          enabled: !(input?.disabledInstanceIds ?? []).includes(raw),
           continuationIdentity: {
             driverKind,
             continuationKey:
@@ -400,8 +431,9 @@ describe("ProviderCommandReactor", () => {
       },
       rollbackConversation: () => unsupported(),
       uploadFeedback: () => unsupported(),
-      setPendingHandoffContext: () => unsupported(),
-      consumePendingHandoffContext: () => unsupported(),
+      setPendingHandoffContext,
+      getPendingHandoffContext,
+      consumePendingHandoffContext,
       get streamEvents() {
         return Stream.fromPubSub(runtimeEventPubSub);
       },
@@ -441,6 +473,14 @@ describe("ProviderCommandReactor", () => {
               ) {
                 return Effect.die(new Error("Injected title regeneration completion failure"));
               }
+            }
+            if (
+              input?.failSessionSetForProviderInstanceId !== undefined &&
+              command.type === "thread.session.set" &&
+              command.commandId.startsWith("server:provider-session-set:") &&
+              command.session.providerInstanceId === input.failSessionSetForProviderInstanceId
+            ) {
+              return Effect.die(new Error("Injected provider session-set failure"));
             }
             const isReplay =
               command.type === "thread.turn.start" &&
@@ -625,6 +665,11 @@ describe("ProviderCommandReactor", () => {
       respondToRequest,
       respondToUserInput,
       stopSession,
+      summarizeForHandoff,
+      getPendingHandoffContext,
+      setPendingHandoffContext,
+      consumePendingHandoffContext,
+      pendingHandoffContexts,
       renameBranch,
       pruneWorktrees,
       createWorktree,
@@ -3678,6 +3723,512 @@ describe("ProviderCommandReactor", () => {
         detail: expect.stringContaining("cannot switch to 'claudeAgent'"),
       },
     });
+  });
+
+  let handoffCommandSeq = 0;
+  const setReadyCodexSession = async (harness: Awaited<ReturnType<typeof createHarness>>) => {
+    const now = "2026-01-01T00:00:00.000Z";
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make(`cmd-session-set-handoff-${++handoffCommandSeq}`),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+  };
+
+  const dispatchHandoff = async (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    modelSelection: ModelSelection = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-4-6",
+    },
+  ) => {
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.provider.handoff",
+        commandId: CommandId.make(`cmd-provider-handoff-${++handoffCommandSeq}`),
+        threadId: ThreadId.make("thread-1"),
+        modelSelection,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+  };
+
+  const readThread = async (harness: Awaited<ReturnType<typeof createHarness>>) => {
+    const readModel = await harness.readModel();
+    return readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+  };
+
+  const waitForActivity = async (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    kind: string,
+  ) =>
+    waitFor(async () => {
+      const thread = await readThread(harness);
+      return thread?.activities.some((activity) => activity.kind === kind) ?? false;
+    });
+
+  it("hands a started thread off to another provider", async () => {
+    const harness = await createHarness();
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+
+    await waitForActivity(harness, "provider.handoff");
+    await harness.drain();
+
+    // ensure (start #1 on codex) → summarize → stop → start dest (#2)
+    expect(harness.startSession.mock.calls.length).toBe(2);
+    expect(harness.summarizeForHandoff.mock.calls.length).toBe(1);
+    expect(harness.summarizeForHandoff.mock.calls[0]?.[0]).toBe(ThreadId.make("thread-1"));
+    expect(harness.stopSession.mock.calls.length).toBe(1);
+
+    const summarizeOrder = harness.summarizeForHandoff.mock.invocationCallOrder[0]!;
+    const stopOrder = harness.stopSession.mock.invocationCallOrder[0]!;
+    const destStartOrder = harness.startSession.mock.invocationCallOrder[1]!;
+    expect(summarizeOrder).toBeLessThan(stopOrder);
+    expect(stopOrder).toBeLessThan(destStartOrder);
+
+    const destStartInput = harness.startSession.mock.calls[1]?.[1] as {
+      provider?: string;
+      providerInstanceId?: string;
+      modelSelection?: { instanceId: string; model: string };
+    };
+    expect(destStartInput.provider).toBe("claudeAgent");
+    expect(destStartInput.providerInstanceId).toBe("claudeAgent");
+    expect(destStartInput.modelSelection).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-opus-4-6",
+    });
+
+    expect(harness.setPendingHandoffContext.mock.calls.length).toBe(1);
+    const pending = harness.pendingHandoffContexts.get(ThreadId.make("thread-1"));
+    expect(pending).toMatchObject({
+      brief: "The outgoing provider's handoff brief.",
+      fromInstanceId: "codex",
+      toInstanceId: "claudeAgent",
+      degraded: false,
+    });
+
+    // The meta update lands after the handoff activity, still inside the
+    // handoff fiber — wait for the projection instead of the worker drain.
+    await waitFor(async () => {
+      const latest = await readThread(harness);
+      return latest?.modelSelection.instanceId === ProviderInstanceId.make("claudeAgent");
+    });
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff");
+    expect(activity?.tone).toBe("info");
+    expect(activity?.payload).toMatchObject({
+      fromProvider: "codex",
+      fromInstanceId: "codex",
+      toInstanceId: "claudeAgent",
+      brief: "The outgoing provider's handoff brief.",
+      degraded: false,
+    });
+    expect(thread?.session?.providerName).toBe("claudeAgent");
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("claudeAgent"));
+    expect(thread?.modelSelection.instanceId).toBe(ProviderInstanceId.make("claudeAgent"));
+  });
+
+  it("fails the handoff without provider calls when the destination cannot accept handoffs", async () => {
+    const harness = await createHarness({
+      supportsCrossProviderHandoff: (instanceId) => String(instanceId) !== "claudeAgent",
+    });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+
+    await waitForActivity(harness, "provider.handoff.failed");
+    await harness.drain();
+
+    expect(harness.summarizeForHandoff).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.tone).toBe("error");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("does not support provider handoff"),
+    });
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(thread?.modelSelection.instanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(harness.pendingHandoffContexts.size).toBe(0);
+  });
+
+  it("rejects a handoff to an instance on the same provider driver", async () => {
+    const harness = await createHarness();
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness, {
+      instanceId: ProviderInstanceId.make("codex-eu"),
+      model: "gpt-5-codex",
+    });
+
+    await waitForActivity(harness, "provider.handoff.failed");
+    await harness.drain();
+
+    expect(harness.summarizeForHandoff).not.toHaveBeenCalled();
+    expect(harness.startSession).not.toHaveBeenCalled();
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("same provider driver"),
+    });
+  });
+
+  it("fails the handoff when the destination instance is disabled", async () => {
+    const harness = await createHarness({ disabledInstanceIds: ["claudeAgent"] });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+
+    await waitForActivity(harness, "provider.handoff.failed");
+    await harness.drain();
+
+    expect(harness.summarizeForHandoff).not.toHaveBeenCalled();
+    expect(harness.startSession).not.toHaveBeenCalled();
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("disabled"),
+    });
+  });
+
+  it("completes the handoff with a degraded deterministic brief when the summary fails", async () => {
+    const harness = await createHarness({
+      summarizeForHandoffEffect: () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: ProviderDriverKind.make("codex"),
+            method: "turn/start",
+            detail: "summary exploded",
+          }),
+        ),
+    });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+
+    await waitForActivity(harness, "provider.handoff");
+    await harness.drain();
+
+    expect(harness.summarizeForHandoff.mock.calls.length).toBe(1);
+    expect(harness.startSession.mock.calls.length).toBe(2);
+
+    const pending = harness.pendingHandoffContexts.get(ThreadId.make("thread-1"));
+    expect(pending?.degraded).toBe(true);
+    expect(pending?.brief).toContain("Verification state");
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff");
+    expect(activity?.payload).toMatchObject({ degraded: true });
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("claudeAgent"));
+  });
+
+  it("prepends the pending handoff brief to the next turn and consumes it once", async () => {
+    const harness = await createHarness();
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+    await waitForActivity(harness, "provider.handoff");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-handoff"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-after-handoff"),
+          role: "user",
+          text: "keep going",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    // The send runs in a forked fiber, so wait for the consume's observable
+    // effect rather than the worker drain alone.
+    await waitFor(() => harness.pendingHandoffContexts.size === 0);
+    await harness.drain();
+
+    const sentInput = harness.sendTurn.mock.calls[0]?.[0] as { input?: string };
+    expect(sentInput.input).toContain("<handoff-context>");
+    expect(sentInput.input).toContain("The outgoing provider's handoff brief.");
+    expect(sentInput.input).toContain("</handoff-context>");
+    expect(sentInput.input).toContain("keep going");
+    expect(harness.consumePendingHandoffContext).toHaveBeenCalledTimes(1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-after-handoff-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-after-handoff-2"),
+          role: "user",
+          text: "and again",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await harness.drain();
+
+    const secondInput = harness.sendTurn.mock.calls[1]?.[0] as { input?: string };
+    expect(secondInput.input).toBe("and again");
+    expect(harness.consumePendingHandoffContext).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the pending handoff brief when the delivering turn fails to send", async () => {
+    const harness = await createHarness();
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+    await waitForActivity(harness, "provider.handoff");
+
+    harness.sendTurn.mockImplementationOnce(() =>
+      Effect.fail(
+        new ProviderAdapterRequestError({
+          provider: ProviderDriverKind.make("claudeAgent"),
+          method: "turn/start",
+          detail: "send exploded",
+        }),
+      ),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-handoff-send-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-handoff-send-failure"),
+          role: "user",
+          text: "keep going",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitForActivity(harness, "provider.turn.start.failed");
+    await harness.drain();
+
+    // The consume effect is skipped when the send fails — the context stays
+    // persisted for the retry. (The mock records pipe construction eagerly, so
+    // assert on the map rather than call counts.)
+    expect(harness.pendingHandoffContexts.size).toBe(1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-handoff-send-retry"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-handoff-send-retry"),
+          role: "user",
+          text: "retry the work",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    await waitFor(() => harness.pendingHandoffContexts.size === 0);
+    await harness.drain();
+
+    const retryInput = harness.sendTurn.mock.calls[1]?.[0] as { input?: string };
+    expect(retryInput.input).toContain("<handoff-context>");
+    expect(retryInput.input).toContain("retry the work");
+    expect(harness.pendingHandoffContexts.size).toBe(0);
+  });
+
+  it("queues a turn start dispatched while a handoff is in progress", async () => {
+    const gate = Deferred.makeUnsafe<void>();
+    const harness = await createHarness({
+      summarizeForHandoffEffect: () => Deferred.await(gate).pipe(Effect.as("Gated brief.")),
+    });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+    await waitFor(() => harness.summarizeForHandoff.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-during-handoff"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-during-handoff"),
+          role: "user",
+          text: "queued while handing off",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await harness.drain();
+    expect(harness.sendTurn.mock.calls.length).toBe(0);
+
+    await Effect.runPromise(Deferred.succeed(gate, undefined));
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await waitForActivity(harness, "provider.handoff");
+  });
+
+  it("keeps the source binding and resumes queued turns when the destination start fails", async () => {
+    const gate = Deferred.makeUnsafe<void>();
+    const harness = await createHarness({
+      summarizeForHandoffEffect: () => Deferred.await(gate).pipe(Effect.as("Brief.")),
+      startSessionEffect: (session) =>
+        String(session.providerInstanceId) === "claudeAgent"
+          ? Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: ProviderDriverKind.make("claudeAgent"),
+                method: "session/start",
+                detail: "destination exploded",
+              }),
+            )
+          : Effect.succeed(session),
+    });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+    await waitFor(() => harness.summarizeForHandoff.mock.calls.length === 1);
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-during-failed-handoff"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-during-failed-handoff"),
+          role: "user",
+          text: "still works on the source",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await harness.drain();
+    expect(harness.sendTurn.mock.calls.length).toBe(0);
+
+    await Effect.runPromise(Deferred.succeed(gate, undefined));
+    await waitForActivity(harness, "provider.handoff.failed");
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("destination exploded"),
+    });
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(thread?.modelSelection.instanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(harness.pendingHandoffContexts.size).toBe(0);
+
+    const sentInput = harness.sendTurn.mock.calls[0]?.[0] as { input?: string };
+    expect(sentInput.input).toBe("still works on the source");
+  });
+
+  it("appends a failed activity when post-start bookkeeping fails mid-handoff", async () => {
+    const harness = await createHarness({
+      failSessionSetForProviderInstanceId: ProviderInstanceId.make("claudeAgent"),
+    });
+    await setReadyCodexSession(harness);
+    await dispatchHandoff(harness);
+
+    await waitForActivity(harness, "provider.handoff.failed");
+    await harness.drain();
+
+    // summarize → stop → destination start all ran; the failure hit the
+    // session projection update after the destination session was live.
+    expect(harness.summarizeForHandoff.mock.calls.length).toBe(1);
+    expect(harness.stopSession.mock.calls.length).toBe(1);
+    expect(harness.startSession.mock.calls.length).toBe(2);
+    expect(harness.pendingHandoffContexts.size).toBe(1);
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.tone).toBe("error");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("partially applied"),
+    });
+    // No success card, and the session projection still shows the source.
+    expect(thread?.activities.some((entry) => entry.kind === "provider.handoff")).toBe(false);
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(thread?.modelSelection.instanceId).toBe(ProviderInstanceId.make("codex"));
+  });
+
+  it("fails the handoff without provider calls when a turn is running at processing time", async () => {
+    const activation = Deferred.makeUnsafe<void>();
+    const harness = await createHarness({
+      serverActivation: Deferred.await(activation),
+    });
+    await setReadyCodexSession(harness);
+    // The decider accepts while the thread is idle; the intent buffers in the
+    // parked event subscription until activation completes.
+    await dispatchHandoff(harness);
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make(`cmd-session-set-running-${++handoffCommandSeq}`),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-in-flight"),
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await Effect.runPromise(Deferred.succeed(activation, undefined));
+    await waitForActivity(harness, "provider.handoff.failed");
+    await harness.drain();
+
+    expect(harness.summarizeForHandoff).not.toHaveBeenCalled();
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+
+    const thread = await readThread(harness);
+    const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff.failed");
+    expect(activity?.payload).toMatchObject({
+      detail: expect.stringContaining("provider turn is running"),
+    });
+    expect(thread?.session?.status).toBe("running");
+    expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(thread?.modelSelection.instanceId).toBe(ProviderInstanceId.make("codex"));
+    expect(harness.pendingHandoffContexts.size).toBe(0);
   });
 
   it("reacts to thread.turn.interrupt-requested by calling provider interrupt", async () => {

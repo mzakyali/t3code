@@ -71,6 +71,7 @@ const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
     rollbackConversation: () => Effect.die("unused"),
     uploadFeedback: () => Effect.die("unused"),
     setPendingHandoffContext: () => Effect.die("unused"),
+    getPendingHandoffContext: () => Effect.die("unused"),
     consumePendingHandoffContext: () => Effect.die("unused"),
     streamEvents: Stream.empty,
   }) satisfies ProviderService.ProviderService["Service"];

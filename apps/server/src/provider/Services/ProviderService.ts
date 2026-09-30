@@ -157,6 +157,15 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Read the pending handoff context without clearing it. Delivery code uses
+   * this to prepend the brief; the context survives until
+   * `consumePendingHandoffContext` runs after a successful send.
+   */
+  readonly getPendingHandoffContext: (
+    threadId: ThreadId,
+  ) => Effect.Effect<PendingHandoffContext | undefined, ProviderServiceError>;
+
+  /**
    * Return the pending handoff brief once, clearing it from the binding.
    */
   readonly consumePendingHandoffContext: (

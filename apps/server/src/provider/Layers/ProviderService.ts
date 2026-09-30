@@ -2594,6 +2594,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     });
   });
 
+  const getPendingHandoffContext: ProviderServiceMethod<"getPendingHandoffContext"> = Effect.fn(
+    "getPendingHandoffContext",
+  )(function* (threadId) {
+    const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+    return readPendingHandoffContext(binding?.runtimePayload);
+  });
+
   const consumePendingHandoffContext: ProviderServiceMethod<"consumePendingHandoffContext"> =
     Effect.fn("consumePendingHandoffContext")(function* (threadId) {
       const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
@@ -2740,6 +2747,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     rollbackConversation,
     uploadFeedback,
     setPendingHandoffContext,
+    getPendingHandoffContext,
     consumePendingHandoffContext,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each

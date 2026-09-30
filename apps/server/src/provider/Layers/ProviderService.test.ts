@@ -3023,6 +3023,11 @@ routing.layer("ProviderServiceLive routing", (it) => {
         context,
       );
 
+      // Peek reads the full context without clearing it; consume still owns
+      // the read-once-then-clear contract.
+      assert.deepEqual(yield* provider.getPendingHandoffContext(threadId), context);
+      assert.deepEqual(yield* provider.getPendingHandoffContext(threadId), context);
+
       assert.equal(yield* provider.consumePendingHandoffContext(threadId), context.brief);
 
       const cleared = yield* directory.getBinding(threadId);
@@ -3033,6 +3038,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         null,
       );
       assert.equal(yield* provider.consumePendingHandoffContext(threadId), undefined);
+      assert.equal(yield* provider.getPendingHandoffContext(threadId), undefined);
     }),
   );
 

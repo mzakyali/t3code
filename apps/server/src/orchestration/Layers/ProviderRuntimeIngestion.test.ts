@@ -151,6 +151,7 @@ function createProviderServiceHarness() {
     rollbackConversation: () => unsupported(),
     uploadFeedback: () => unsupported(),
     setPendingHandoffContext: () => unsupported(),
+    getPendingHandoffContext: () => unsupported(),
     consumePendingHandoffContext: () => unsupported(),
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub).pipe(

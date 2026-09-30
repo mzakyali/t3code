@@ -8,6 +8,7 @@ import {
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
+  type ProviderInstanceId,
   ThreadId,
   type ProviderSession,
   type RuntimeMode,
@@ -83,6 +84,7 @@ type ProviderIntentEvent = Extract<
       | "thread.approval-response-requested"
       | "thread.user-input-response-requested"
       | "thread.session-stop-requested"
+      | "thread.provider-handoff-requested"
       | "thread.settled"
       | "thread.session-set";
   }
@@ -121,6 +123,13 @@ const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
+const HANDOFF_BRIEF_MESSAGE_LIMIT = 6;
+const HANDOFF_BRIEF_MESSAGE_MAX_CHARS = 500;
+
+const truncateHandoffExcerpt = (text: string): string =>
+  text.length > HANDOFF_BRIEF_MESSAGE_MAX_CHARS
+    ? `${text.slice(0, HANDOFF_BRIEF_MESSAGE_MAX_CHARS)}…`
+    : text;
 
 function providerErrorLabel(value: string | undefined): string {
   const normalized = value?.trim();
@@ -266,6 +275,13 @@ const make = Effect.gen(function* () {
     }
   >();
   const stoppingThreadIds = new Set<ThreadId>();
+  // Turn starts also queue in turnsAfterCompaction while a provider handoff
+  // runs; the queue drains once the handoff completes or fails.
+  const handoffsInProgress = new Map<ThreadId, { readonly dest: ModelSelection }>();
+  // Marks threads whose persisted handoff context is folded into an in-flight
+  // send, so concurrent request builds do not prepend the same brief twice
+  // before the post-send consume clears it.
+  const handoffDeliveriesInFlight = new Set<ThreadId>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -274,7 +290,8 @@ const make = Effect.gen(function* () {
       | "provider.turn.interrupt.failed"
       | "provider.approval.respond.failed"
       | "provider.user-input.respond.failed"
-      | "provider.session.stop.failed";
+      | "provider.session.stop.failed"
+      | "provider.handoff.failed";
     readonly summary: string;
     readonly detail: string;
     readonly turnId: TurnId | null;
@@ -300,6 +317,46 @@ const make = Effect.gen(function* () {
               ...(input.requestId ? { requestId: input.requestId } : {}),
             },
             turnId: input.turnId,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
+  const appendHandoffActivity = (input: {
+    readonly threadId: ThreadId;
+    readonly fromProvider: ProviderDriverKind;
+    readonly toProvider: ProviderDriverKind;
+    readonly fromInstanceId: ProviderInstanceId;
+    readonly toInstanceId: ProviderInstanceId;
+    readonly brief: string;
+    readonly degraded: boolean;
+    readonly createdAt: string;
+  }) =>
+    Effect.all({
+      commandId: serverCommandId("provider-handoff-activity"),
+      eventId: serverEventId(),
+    }).pipe(
+      Effect.flatMap(({ commandId, eventId }) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: eventId,
+            tone: "info",
+            kind: "provider.handoff",
+            summary: `Handed off to ${input.toProvider}`,
+            payload: {
+              fromProvider: input.fromProvider,
+              fromInstanceId: input.fromInstanceId,
+              toInstanceId: input.toInstanceId,
+              brief: input.brief,
+              degraded: input.degraded,
+              createdAt: input.createdAt,
+            },
+            turnId: null,
             createdAt: input.createdAt,
           },
           createdAt: input.createdAt,
@@ -535,6 +592,59 @@ const make = Effect.gen(function* () {
     return yield* projectionSnapshotQuery
       .getThreadDetailById(threadId, { activityKinds: [] })
       .pipe(Effect.map(Option.getOrUndefined));
+  });
+
+  // Deterministic stand-in for the source provider's summary when it fails or
+  // returns nothing, so a degraded handoff still lands a usable brief. It fills
+  // HANDOFF_SUMMARY_PROMPT's five sections from the projection and appends the
+  // raw tail of the transcript the sections could not capture.
+  const buildDeterministicHandoffBrief = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const detail = yield* resolveThreadDetail(threadId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider command reactor failed to read thread for handoff brief", {
+          threadId,
+          cause: Cause.pretty(cause),
+        }).pipe(Effect.as(undefined)),
+      ),
+    );
+    const transcriptMessages = (detail?.messages ?? []).filter(
+      (message) => message.role === "user" || message.role === "assistant",
+    );
+    const firstUserMessage = transcriptMessages.find((message) => message.role === "user");
+    const latestPlan = detail?.proposedPlans.at(-1);
+    const latestCheckpoint = detail?.checkpoints.at(-1);
+    const checkpointFileLines =
+      latestCheckpoint?.files.map(
+        (file) => `- ${file.path} (+${file.additions}/-${file.deletions}, ${file.kind})`,
+      ) ?? [];
+    const recentMessages = transcriptMessages
+      .slice(-HANDOFF_BRIEF_MESSAGE_LIMIT)
+      .map((message) => `[${message.role}] ${truncateHandoffExcerpt(message.text.trim())}`);
+    return [
+      "## Goal and explicit requirements",
+      firstUserMessage !== undefined
+        ? truncateHandoffExcerpt(firstUserMessage.text.trim())
+        : "Not captured — no user messages on record.",
+      "",
+      "## Decisions made and why",
+      "Not captured — the outgoing provider could not write a summary; infer decisions from the recent messages below.",
+      "",
+      "## Work completed so far",
+      latestCheckpoint !== undefined && checkpointFileLines.length > 0
+        ? `Latest checkpoint (turn ${latestCheckpoint.checkpointTurnCount}):\n${checkpointFileLines.join("\n")}`
+        : "No checkpoints recorded.",
+      "",
+      "## Pending work and known issues",
+      latestPlan !== undefined
+        ? latestPlan.planMarkdown
+        : "Not captured — review the recent messages below.",
+      "",
+      "## Verification state",
+      "Not captured — re-run tests and checks before trusting prior work.",
+      "",
+      "## Recent messages",
+      recentMessages.length > 0 ? recentMessages.join("\n\n") : "None recorded.",
+    ].join("\n");
   });
 
   const rejectStartedThreadModelChangeIfRequired = Effect.fnUntraced(function* (input: {
@@ -867,7 +977,32 @@ const make = Effect.gen(function* () {
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
+    // Peek, not consume: the pending context clears only after sendTurn
+    // succeeds, so a failed send retries with the brief still attached. The
+    // in-flight marker stops a second queued build from prepending it again
+    // while the first send is still running.
+    const pendingHandoffContext = handoffDeliveriesInFlight.has(input.threadId)
+      ? undefined
+      : yield* providerService.getPendingHandoffContext(input.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : // A read failure must not fail the turn; the context stays
+                // persisted and the next send prepends it.
+                Effect.logWarning(
+                  "provider command reactor failed to read pending handoff context",
+                  {
+                    threadId: input.threadId,
+                    cause: Cause.pretty(cause),
+                  },
+                ).pipe(Effect.as(undefined)),
+          ),
+        );
     const normalizedInput = toNonEmptyProviderInput(input.messageText);
+    const turnInput =
+      pendingHandoffContext !== undefined
+        ? `<handoff-context>\n${pendingHandoffContext.brief}\n</handoff-context>${normalizedInput !== undefined ? `\n\n${normalizedInput}` : ""}`
+        : normalizedInput;
     const normalizedAttachments = input.attachments ?? [];
     const activeSession = yield* providerService
       .listSessions()
@@ -898,11 +1033,14 @@ const make = Effect.gen(function* () {
         : input.modelSelection;
 
     return {
-      threadId: input.threadId,
-      ...(normalizedInput ? { input: normalizedInput } : {}),
-      ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
-      ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
-      ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      pendingHandoffContext,
+      request: {
+        threadId: input.threadId,
+        ...(turnInput !== undefined ? { input: turnInput } : {}),
+        ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
+        ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
+        ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      },
     };
   });
 
@@ -1431,6 +1569,7 @@ const make = Effect.gen(function* () {
       if (
         compactingThreadIds.has(event.payload.threadId) ||
         turnsAfterCompaction.has(event.payload.threadId) ||
+        handoffsInProgress.has(event.payload.threadId) ||
         latestThread?.session?.status === "starting" ||
         latestThread?.session?.status === "running"
       ) {
@@ -1483,6 +1622,7 @@ const make = Effect.gen(function* () {
     if (
       !resumed &&
       (compactingThreadIds.has(event.payload.threadId) ||
+        handoffsInProgress.has(event.payload.threadId) ||
         turnsAfterCompaction.has(event.payload.threadId))
     ) {
       const queued = turnsAfterCompaction.get(event.payload.threadId) ?? [];
@@ -1490,7 +1630,7 @@ const make = Effect.gen(function* () {
       turnsAfterCompaction.set(event.payload.threadId, queued);
       return;
     }
-    const sendTurnRequest = yield* buildSendTurnRequestForThread({
+    const builtSendTurn = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: projectComposerContextForProvider({
         text: message.text,
@@ -1512,19 +1652,52 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
     );
 
-    if (Option.isNone(sendTurnRequest)) {
+    if (Option.isNone(builtSendTurn)) {
       return;
     }
 
-    const send = providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
-    // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
-    if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
-    yield* send.pipe(
-      Effect.ensuring(resumed ? Deferred.succeed(resumed.sent, undefined) : Effect.void),
-      Effect.forkScoped,
+    const { request: sendTurnRequest, pendingHandoffContext } = builtSendTurn.value;
+    if (pendingHandoffContext !== undefined) {
+      handoffDeliveriesInFlight.add(event.payload.threadId);
+    }
+    const send = providerService.sendTurn(sendTurnRequest).pipe(
+      // Consume only after the send lands: a failed send keeps the brief
+      // persisted so the retry prepends it again.
+      Effect.andThen(
+        pendingHandoffContext !== undefined
+          ? providerService.consumePendingHandoffContext(event.payload.threadId).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : // A consume failure leaves the tombstone for the next
+                    // turn to clear; the send already landed.
+                    Effect.logWarning(
+                      "provider command reactor failed to consume delivered handoff context",
+                      {
+                        threadId: event.payload.threadId,
+                        cause: Cause.pretty(cause),
+                      },
+                    ),
+              ),
+            )
+          : Effect.void,
+      ),
+      Effect.asVoid,
+      Effect.catchCause(recoverTurnStartFailure),
     );
+    const sendFiber = yield* send.pipe(Effect.forkScoped);
+    // Exit observers fire even when a scoped child is interrupted before its
+    // first scheduled tick — a case that never runs an ensuring finalizer.
+    // Without this the replay drain could wedge on `sent` forever.
+    sendFiber.addObserver(() => {
+      if (pendingHandoffContext !== undefined) {
+        handoffDeliveriesInFlight.delete(event.payload.threadId);
+      }
+      if (resumed) void Deferred.doneUnsafe(resumed.sent, Effect.void);
+    });
+    // The send fiber owns `sent` from here on, so drop the entry the post-processing
+    // hook uses to settle replays that return before reaching the fork.
+    if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1532,7 +1705,9 @@ const make = Effect.gen(function* () {
   ) {
     yield* cancelTurnsAfterCompaction(
       event.payload.threadId,
-      "Context compaction was interrupted. Send this message again to continue.",
+      handoffsInProgress.has(event.payload.threadId)
+        ? "The provider handoff was interrupted. Send this message again to continue."
+        : "Context compaction was interrupted. Send this message again to continue.",
     );
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
@@ -1731,7 +1906,9 @@ const make = Effect.gen(function* () {
     const clearStopping = Effect.sync(() => void stoppingThreadIds.delete(thread.id));
     yield* cancelTurnsAfterCompaction(
       thread.id,
-      "The session was stopped during context compaction. Send this message again to continue.",
+      handoffsInProgress.has(thread.id)
+        ? "The session was stopped during a provider handoff. Send this message again to continue."
+        : "The session was stopped during context compaction. Send this message again to continue.",
     ).pipe(
       Effect.andThen(
         thread.session && thread.session.status !== "stopped"
@@ -1782,6 +1959,266 @@ const make = Effect.gen(function* () {
           }),
       }),
       Effect.ensuring(clearStopping),
+    );
+  });
+
+  const processProviderHandoffRequested = Effect.fn("processProviderHandoffRequested")(function* (
+    event: Extract<ProviderIntentEvent, { type: "thread.provider-handoff-requested" }>,
+  ) {
+    const threadId = event.payload.threadId;
+    const destination = event.payload.modelSelection;
+    const thread = yield* resolveThreadShell(threadId);
+    if (!thread) {
+      return;
+    }
+    const appendHandoffFailed = (detail: string, createdAt = event.occurredAt) =>
+      appendProviderFailureActivity({
+        threadId,
+        kind: "provider.handoff.failed",
+        summary: "Provider handoff failed",
+        detail,
+        turnId: null,
+        createdAt,
+      });
+    if (handoffsInProgress.has(threadId)) {
+      return yield* appendHandoffFailed(
+        "A provider handoff is already in progress for this thread.",
+      );
+    }
+    if (compactingThreadIds.has(threadId)) {
+      return yield* appendHandoffFailed(
+        "Context compaction is in progress for this thread. Hand off once it finishes.",
+      );
+    }
+    // The decider rejects handoff commands on busy threads, but a turn started
+    // after the command was decided can still be running when this event is
+    // consumed. Reject at processing time, same as compaction.
+    if (
+      thread.session?.activeTurnId != null ||
+      thread.session?.status === "running" ||
+      thread.session?.status === "starting"
+    ) {
+      return yield* appendHandoffFailed(
+        "Provider handoff is unavailable while a provider turn is running.",
+      );
+    }
+    const fromInstanceId = thread.session?.providerInstanceId ?? thread.modelSelection.instanceId;
+
+    const route = yield* Effect.gen(function* () {
+      const fromInfo = yield* providerService.getInstanceInfo(fromInstanceId);
+      const toInfo = yield* providerService.getInstanceInfo(destination.instanceId);
+      const routingRejection =
+        fromInfo.driverKind === toInfo.driverKind
+          ? `Cannot hand off to instance '${destination.instanceId}' because it uses the same provider driver '${toInfo.driverKind}'.`
+          : !toInfo.enabled
+            ? `Cannot hand off to instance '${destination.instanceId}' because it is disabled.`
+            : undefined;
+      if (routingRejection !== undefined) {
+        yield* appendHandoffFailed(routingRejection);
+        return undefined;
+      }
+      const fromCapabilities = yield* providerService.getCapabilities(fromInstanceId);
+      const toCapabilities = yield* providerService.getCapabilities(destination.instanceId);
+      const capabilityRejection = !fromCapabilities.supportsCrossProviderHandoff
+        ? `Provider '${fromInfo.driverKind}' does not support provider handoff.`
+        : !toCapabilities.supportsCrossProviderHandoff
+          ? `Provider '${toInfo.driverKind}' does not support provider handoff.`
+          : undefined;
+      if (capabilityRejection !== undefined) {
+        yield* appendHandoffFailed(capabilityRejection);
+        return undefined;
+      }
+      return { fromInfo, toInfo };
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : appendHandoffFailed(formatFailureDetail(cause)).pipe(Effect.as(undefined)),
+      ),
+    );
+    if (route === undefined) {
+      return;
+    }
+
+    handoffsInProgress.set(threadId, { dest: destination });
+    yield* Effect.gen(function* () {
+      yield* ensureThreadWorktree(thread);
+      // The outgoing provider writes the brief when it can. An empty reply or
+      // any failure degrades to the deterministic brief rather than blocking
+      // the handoff.
+      const summaryBrief = yield* Effect.gen(function* () {
+        yield* ensureSessionForThread(threadId, event.occurredAt);
+        const brief = yield* providerService.summarizeForHandoff(threadId);
+        return brief.trim().length > 0 ? brief : null;
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning(
+                "provider command reactor handoff summary failed; using deterministic brief",
+                {
+                  threadId,
+                  cause: Cause.pretty(cause),
+                },
+              ).pipe(Effect.as(null)),
+        ),
+      );
+      const degraded = summaryBrief === null;
+      const brief = summaryBrief ?? (yield* buildDeterministicHandoffBrief(threadId));
+
+      // The destination startSession already stops stale sessions on other
+      // instances, so a source stop failure is logged, not fatal.
+      yield* providerService.stopSession({ threadId }).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning(
+                "provider command reactor failed to stop source session for handoff",
+                {
+                  threadId,
+                  cause: Cause.pretty(cause),
+                },
+              ),
+        ),
+      );
+
+      const project = yield* resolveProject(thread.projectId);
+      const effectiveCwd = resolveThreadWorkspaceCwd({
+        thread,
+        projects: project ? [project] : [],
+      });
+      const session = yield* providerService
+        .startSession(threadId, {
+          threadId,
+          provider: route.toInfo.driverKind,
+          providerInstanceId: destination.instanceId,
+          ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+          modelSelection: destination,
+          runtimeMode: thread.runtimeMode,
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : // The source binding stays in place so the thread remains
+                // usable on the outgoing provider.
+                appendHandoffFailed(formatFailureDetail(cause)).pipe(Effect.as(null)),
+          ),
+        );
+      if (session === null) {
+        return;
+      }
+      if (session.providerInstanceId === undefined) {
+        return yield* appendHandoffFailed(
+          `Provider session '${session.threadId}' started without a provider instance id.`,
+        );
+      }
+
+      const completedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* providerService
+        .setPendingHandoffContext(threadId, {
+          brief,
+          fromInstanceId,
+          toInstanceId: destination.instanceId,
+          degraded,
+          createdAt: completedAt,
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : // The brief still lands in the handoff card; it just cannot be
+                // injected into the next turn.
+                Effect.logWarning(
+                  "provider command reactor failed to persist pending handoff context",
+                  {
+                    threadId,
+                    cause: Cause.pretty(cause),
+                  },
+                ),
+          ),
+        );
+
+      yield* setThreadSession({
+        threadId,
+        session: {
+          threadId,
+          status: mapProviderSessionStatusToOrchestrationStatus(session.status),
+          providerName: session.provider,
+          providerInstanceId: session.providerInstanceId,
+          runtimeMode: thread.runtimeMode,
+          activeTurnId: null,
+          lastError: session.lastError ?? null,
+          updatedAt: session.updatedAt,
+        },
+        createdAt: completedAt,
+      });
+      yield* appendHandoffActivity({
+        threadId,
+        fromProvider: route.fromInfo.driverKind,
+        toProvider: route.toInfo.driverKind,
+        fromInstanceId,
+        toInstanceId: destination.instanceId,
+        brief,
+        degraded,
+        createdAt: completedAt,
+      });
+      yield* orchestrationEngine.dispatch({
+        type: "thread.meta.update",
+        commandId: yield* serverCommandId("provider-handoff-meta"),
+        threadId,
+        modelSelection: destination,
+      });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("provider command reactor failed to complete provider handoff", {
+              threadId,
+              cause: Cause.pretty(cause),
+            }).pipe(
+              // A failure after the destination session started leaves the
+              // handoff half-applied: the runtime moved but the projection did
+              // not. Surface it as a failed card instead of staying silent.
+              Effect.andThen(
+                appendHandoffFailed(
+                  `Provider handoff stopped partway through and may have partially applied. ${formatFailureDetail(cause)}`,
+                ).pipe(
+                  Effect.catchCause((failureCause) =>
+                    Cause.hasInterruptsOnly(failureCause)
+                      ? Effect.interrupt
+                      : Effect.logWarning(
+                          "provider command reactor failed to record provider handoff failure",
+                          {
+                            threadId,
+                            cause: Cause.pretty(failureCause),
+                            originalCause: Cause.pretty(cause),
+                          },
+                        ),
+                  ),
+                ),
+              ),
+            ),
+      ),
+      Effect.ensuring(
+        Effect.sync(() => void handoffsInProgress.delete(threadId)).pipe(
+          // Ensuring finalizers run uninterruptibly; the replay drain awaits each
+          // send, so it must stay interruptible for runtime shutdown to unwind it.
+          Effect.andThen(
+            Effect.interruptible(resumeTurnsAfterCompaction(threadId)).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning(
+                      "provider command reactor failed to resume queued turns after handoff",
+                      { threadId, cause: Cause.pretty(cause) },
+                    ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
     );
   });
 
@@ -1841,6 +2278,16 @@ const make = Effect.gen(function* () {
       case "thread.session-stop-requested":
         yield* processSessionStopRequested(event);
         return;
+      case "thread.provider-handoff-requested": {
+        const thread = yield* resolveThreadShell(event.payload.threadId);
+        yield* thread?.worktreePath
+          ? withWorkspaceLease(
+              path.resolve(thread.worktreePath),
+              processProviderHandoffRequested(event),
+            )
+          : processProviderHandoffRequested(event);
+        return;
+      }
       case "thread.settled": {
         const thread = yield* projectionSnapshotQuery.getThreadShellById(event.payload.threadId);
         // A thread re-engaged before this event ran keeps its shells and session.
@@ -1912,6 +2359,7 @@ const make = Effect.gen(function* () {
         event.type === "thread.approval-response-requested" ||
         event.type === "thread.user-input-response-requested" ||
         event.type === "thread.session-stop-requested" ||
+        event.type === "thread.provider-handoff-requested" ||
         event.type === "thread.settled"
       ) {
         return yield* worker.enqueue(event);
