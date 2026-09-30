@@ -36,6 +36,18 @@ import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
+ * Handoff brief persisted on the destination thread's provider binding until
+ * the next user turn delivers it.
+ */
+export interface PendingHandoffContext {
+  readonly brief: string;
+  readonly fromInstanceId: ProviderInstanceId;
+  readonly toInstanceId: ProviderInstanceId;
+  readonly degraded: boolean;
+  readonly createdAt: string;
+}
+
+/**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
 export interface ProviderServiceShape {
@@ -127,6 +139,22 @@ export interface ProviderServiceShape {
   readonly uploadFeedback: (
     input: ProviderUploadFeedbackInput,
   ) => Effect.Effect<ProviderUploadFeedbackResult, ProviderServiceError>;
+
+  /**
+   * Persist a handoff brief on the thread's provider binding. It rides along
+   * in `runtimePayload` so a crash cannot lose it before the next user turn.
+   */
+  readonly setPendingHandoffContext: (
+    threadId: ThreadId,
+    context: PendingHandoffContext,
+  ) => Effect.Effect<void, ProviderServiceError>;
+
+  /**
+   * Return the pending handoff brief once, clearing it from the binding.
+   */
+  readonly consumePendingHandoffContext: (
+    threadId: ThreadId,
+  ) => Effect.Effect<string | undefined, ProviderServiceError>;
 
   /**
    * Canonical provider runtime event stream.

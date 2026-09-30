@@ -2883,6 +2883,110 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("keeps each instance's resume cursor when switching providers and back", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-provider-cursor-history");
+
+      const codexSession = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-cursor-history"),
+        runtimeMode: "full-access",
+      });
+
+      routing.claude.startSession.mockClear();
+      const claudeSession = yield* provider.startSession(threadId, {
+        provider: CLAUDE_AGENT_DRIVER,
+        providerInstanceId: claudeAgentInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-cursor-history"),
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(
+        routing.claude.startSession.mock.calls[0]?.[0].resumeCursor,
+        undefined,
+        "first switch to a provider must start fresh",
+      );
+
+      const switched = yield* directory.getBinding(threadId);
+      assert(Option.isSome(switched));
+      assert.equal(switched.value.providerInstanceId, claudeAgentInstanceId);
+      const resumeCursors = (
+        switched.value.runtimePayload as { resumeCursors?: Record<string, unknown> } | null
+      )?.resumeCursors;
+      assert.deepEqual(resumeCursors?.["codex"], codexSession.resumeCursor);
+      assert.deepEqual(resumeCursors?.["claudeAgent"], claudeSession.resumeCursor);
+
+      routing.codex.startSession.mockClear();
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-cursor-history"),
+        runtimeMode: "full-access",
+      });
+      assert.equal(routing.codex.startSession.mock.calls.length, 1);
+      assert.deepEqual(
+        routing.codex.startSession.mock.calls[0]?.[0].resumeCursor,
+        codexSession.resumeCursor,
+      );
+    }),
+  );
+
+  it.effect("stores then consumes the pending handoff context once", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-provider-pending-handoff");
+
+      assert.equal(
+        yield* provider.consumePendingHandoffContext(threadId),
+        undefined,
+        "threads without a binding have no pending context",
+      );
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("project-pending-handoff"),
+        runtimeMode: "full-access",
+      });
+
+      const context: ProviderService.PendingHandoffContext = {
+        brief: "Continue the parser refactor started in src/parse.ts.",
+        fromInstanceId: codexInstanceId,
+        toInstanceId: claudeAgentInstanceId,
+        degraded: false,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      };
+      yield* provider.setPendingHandoffContext(threadId, context);
+
+      const persisted = yield* directory.getBinding(threadId);
+      assert(Option.isSome(persisted));
+      assert.deepEqual(
+        (persisted.value.runtimePayload as { pendingHandoffContext?: unknown } | null)
+          ?.pendingHandoffContext,
+        context,
+      );
+
+      assert.equal(yield* provider.consumePendingHandoffContext(threadId), context.brief);
+
+      const cleared = yield* directory.getBinding(threadId);
+      assert(Option.isSome(cleared));
+      assert.equal(
+        (cleared.value.runtimePayload as { pendingHandoffContext?: unknown } | null)
+          ?.pendingHandoffContext,
+        null,
+      );
+      assert.equal(yield* provider.consumePendingHandoffContext(threadId), undefined);
+    }),
+  );
+
   it.effect("recovers stale sessions for sendTurn using persisted cwd", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

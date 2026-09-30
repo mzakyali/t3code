@@ -29,7 +29,7 @@ import {
   ThreadId,
   TurnId,
   type ProjectId,
-  type ProviderInstanceId,
+  ProviderInstanceId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -426,6 +426,38 @@ function readPersistedCwd(
   if (typeof rawCwd !== "string") return undefined;
   const trimmed = rawCwd.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// The binding row holds one provider's cursor at a time. The per-instance
+// history lives under runtimePayload so switching back can resume the
+// session each instance actually left behind.
+function readPersistedResumeCursors(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): Readonly<Record<string, unknown>> {
+  if (!isRecordValue(runtimePayload)) return {};
+  const raw = runtimePayload.resumeCursors;
+  return isRecordValue(raw) ? raw : {};
+}
+
+const PendingHandoffContextPayload = Schema.Struct({
+  brief: Schema.String,
+  fromInstanceId: ProviderInstanceId,
+  toInstanceId: ProviderInstanceId,
+  degraded: Schema.Boolean,
+  createdAt: Schema.String,
+});
+const isPendingHandoffContext = Schema.is(PendingHandoffContextPayload);
+
+function readPendingHandoffContext(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): typeof PendingHandoffContextPayload.Type | undefined {
+  if (!isRecordValue(runtimePayload)) return undefined;
+  const raw = runtimePayload.pendingHandoffContext;
+  return isPendingHandoffContext(raw) ? raw : undefined;
 }
 
 /** Stopped rows with no active turn are settled; shutdown leaves them untouched. */
@@ -1091,6 +1123,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "ProviderService.upsertSessionBinding",
         session,
       );
+      const existingPayload = Option.getOrUndefined(
+        yield* directory.getBinding(threadId),
+      )?.runtimePayload;
       yield* directory.upsert({
         threadId,
         provider: session.provider,
@@ -1098,7 +1133,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         runtimeMode: session.runtimeMode,
         status: toRuntimeStatus(session),
         ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
-        runtimePayload: toRuntimePayloadFromSession(session, extra),
+        runtimePayload: {
+          ...toRuntimePayloadFromSession(session, extra),
+          ...(session.resumeCursor !== undefined
+            ? {
+                resumeCursors: {
+                  ...readPersistedResumeCursors(existingPayload),
+                  [providerInstanceId]: session.resumeCursor,
+                },
+              }
+            : {}),
+        },
       });
     });
 
@@ -1147,6 +1192,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 provider: source.provider,
                 providerInstanceId: source.instanceId,
                 resumeCursor: session.resumeCursor,
+                runtimePayload: {
+                  resumeCursors: {
+                    ...readPersistedResumeCursors(binding.value.runtimePayload),
+                    [source.instanceId]: session.resumeCursor,
+                  },
+                },
               });
             }
           }).pipe(
@@ -1485,7 +1536,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.resumeCursor ??
           (persistedBinding?.providerInstanceId === resolvedInstanceId
             ? persistedBinding.resumeCursor
-            : undefined);
+            : // Switching providers lands on a different instance; the
+              // destination's own stored cursor is opaque to the previous
+              // driver, so this never crosses the continuation-key check.
+              readPersistedResumeCursors(persistedBinding?.runtimePayload)[resolvedInstanceId]);
         const effectiveCwd =
           input.cwd ??
           (persistedBinding?.providerInstanceId === resolvedInstanceId
@@ -1496,8 +1550,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.resume_cursor.source":
             input.resumeCursor !== undefined
               ? "request"
-              : effectiveResumeCursor !== undefined &&
-                  persistedBinding?.providerInstanceId === resolvedInstanceId
+              : effectiveResumeCursor !== undefined
                 ? "persisted"
                 : "none",
           "provider.resume_cursor.present": effectiveResumeCursor !== undefined,
@@ -1792,6 +1845,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             requestId: turnMetadata.requestId,
           }),
       );
+      const boundPayload =
+        turn.resumeCursor !== undefined
+          ? Option.getOrUndefined(yield* directory.getBinding(input.threadId))?.runtimePayload
+          : undefined;
       yield* directory.upsert({
         threadId: input.threadId,
         provider: routed.adapter.provider,
@@ -1800,6 +1857,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
         runtimePayload: {
           ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+          ...(turn.resumeCursor !== undefined
+            ? {
+                resumeCursors: {
+                  ...readPersistedResumeCursors(boundPayload),
+                  [routed.instanceId]: turn.resumeCursor,
+                },
+              }
+            : {}),
           activeTurnId: turn.turnId,
           // Admission and marker consumption must survive the same restart.
           continueAfterServerUpdate: null,
@@ -2339,6 +2404,48 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const setPendingHandoffContext: ProviderServiceMethod<"setPendingHandoffContext"> = Effect.fn(
+    "setPendingHandoffContext",
+  )(function* (threadId, context) {
+    const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+    if (binding === undefined) {
+      return yield* toValidationError(
+        "ProviderService.setPendingHandoffContext",
+        `Cannot store pending handoff context because no provider binding exists for thread '${threadId}'.`,
+      );
+    }
+    const providerInstanceId = yield* requireBindingInstanceId(
+      "ProviderService.setPendingHandoffContext",
+      binding,
+    );
+    yield* directory.upsert({
+      threadId,
+      provider: binding.provider,
+      providerInstanceId,
+      runtimePayload: { pendingHandoffContext: context },
+    });
+  });
+
+  const consumePendingHandoffContext: ProviderServiceMethod<"consumePendingHandoffContext"> =
+    Effect.fn("consumePendingHandoffContext")(function* (threadId) {
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const pending = readPendingHandoffContext(binding?.runtimePayload);
+      if (binding === undefined || pending === undefined) {
+        return undefined;
+      }
+      const providerInstanceId = yield* requireBindingInstanceId(
+        "ProviderService.consumePendingHandoffContext",
+        binding,
+      );
+      yield* directory.upsert({
+        threadId,
+        provider: binding.provider,
+        providerInstanceId,
+        runtimePayload: { pendingHandoffContext: null },
+      });
+      return pending.brief;
+    });
+
   const runStopAll = Effect.fn("runStopAll")(function* () {
     // Continuation is project-scopable, so decide it per session's project;
     // without orchestration the environment value is all there is.
@@ -2463,6 +2570,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     assertConversationRollbackSupported,
     rollbackConversation,
     uploadFeedback,
+    setPendingHandoffContext,
+    consumePendingHandoffContext,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.

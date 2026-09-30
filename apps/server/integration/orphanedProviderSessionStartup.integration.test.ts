@@ -125,6 +125,8 @@ const startupDependencies = Layer.mergeAll(
     getInstanceInfo: () => Effect.die("unused"),
     rollbackConversation: () => Effect.die("unused"),
     uploadFeedback: () => Effect.die("unused"),
+    setPendingHandoffContext: () => Effect.die("unused"),
+    consumePendingHandoffContext: () => Effect.die("unused"),
     streamEvents: Stream.empty,
   }),
 );
