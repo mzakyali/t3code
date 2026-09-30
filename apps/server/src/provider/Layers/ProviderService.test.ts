@@ -64,7 +64,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { HANDOFF_SUMMARY_PROMPT, makeProviderServiceLive } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -3033,6 +3033,240 @@ routing.layer("ProviderServiceLive routing", (it) => {
         null,
       );
       assert.equal(yield* provider.consumePendingHandoffContext(threadId), undefined);
+    }),
+  );
+
+  it.effect("resolves the handoff summary with the assistant reply text", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-handoff-summary");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      routing.codex.sendTurn.mockClear();
+      const summaryFiber = yield* provider.summarizeForHandoff(threadId).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const turnId = asTurnId(`turn-${threadId}`);
+      assert.equal(routing.codex.sendTurn.mock.calls[0]?.[0].input, HANDOFF_SUMMARY_PROMPT);
+
+      routing.codex.emit({
+        type: "turn.started",
+        eventId: asEventId("evt-handoff-summary-started"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        payload: {},
+      });
+      routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-handoff-summary-delta-1"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        itemId: "item-1",
+        payload: { streamKind: "assistant_text", delta: "Goal: refactor the parser. " },
+      });
+      routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-handoff-summary-delta-2"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:03.000Z",
+        threadId,
+        turnId,
+        itemId: "item-1",
+        payload: { streamKind: "assistant_text", delta: "Pending: none." },
+      });
+      // The completed item restates the item's full text; collecting it on top
+      // of the deltas would double the brief.
+      routing.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-handoff-summary-item"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:04.000Z",
+        threadId,
+        turnId,
+        itemId: "item-1",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: "Goal: refactor the parser. Pending: none.",
+        },
+      });
+      // Text from an unrelated turn must not leak into the brief.
+      routing.codex.emit({
+        type: "content.delta",
+        eventId: asEventId("evt-handoff-summary-stray"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:04.500Z",
+        threadId,
+        turnId: asTurnId("turn-unrelated"),
+        itemId: "item-9",
+        payload: { streamKind: "assistant_text", delta: "stray text" },
+      });
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-handoff-summary-completed"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:05.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+
+      const summary = yield* Fiber.join(summaryFiber);
+      assert.equal(summary, "Goal: refactor the parser. Pending: none.");
+    }),
+  );
+
+  it.effect("falls back to the completed item detail when no deltas streamed", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-handoff-summary-detail");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const summaryFiber = yield* provider.summarizeForHandoff(threadId).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      const turnId = asTurnId(`turn-${threadId}`);
+
+      routing.codex.emit({
+        type: "item.completed",
+        eventId: asEventId("evt-handoff-detail-item"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId,
+        itemId: "item-1",
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: "The whole brief.",
+        },
+      });
+      routing.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-handoff-detail-completed"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      });
+
+      const summary = yield* Fiber.join(summaryFiber);
+      assert.equal(summary, "The whole brief.");
+    }),
+  );
+
+  it.effect("collects summary events emitted before sendTurn returns the turn id", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-handoff-summary-early");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          const turnId = asTurnId("turn-handoff-early");
+          routing.codex.emit({
+            type: "content.delta",
+            eventId: asEventId("evt-handoff-early-delta"),
+            provider: CODEX_DRIVER,
+            createdAt: "2026-01-01T00:00:01.000Z",
+            threadId: input.threadId,
+            turnId,
+            itemId: "item-1",
+            payload: { streamKind: "assistant_text", delta: "Brief before return." },
+          });
+          routing.codex.emit({
+            type: "turn.completed",
+            eventId: asEventId("evt-handoff-early-completed"),
+            provider: CODEX_DRIVER,
+            createdAt: "2026-01-01T00:00:02.000Z",
+            threadId: input.threadId,
+            turnId,
+            payload: { state: "completed" },
+          });
+          yield* Effect.yieldNow;
+          return { threadId: input.threadId, turnId };
+        }),
+      );
+
+      const summary = yield* provider.summarizeForHandoff(threadId);
+      assert.equal(summary, "Brief before return.");
+    }),
+  );
+
+  it.effect("fails the handoff summary when its turn aborts", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-handoff-summary-abort");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const resultFiber = yield* provider
+        .summarizeForHandoff(threadId)
+        .pipe(Effect.result, Effect.forkChild);
+      yield* advanceTestClock(50);
+      routing.codex.emit({
+        type: "turn.aborted",
+        eventId: asEventId("evt-handoff-summary-aborted"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: asTurnId(`turn-${threadId}`),
+        payload: { reason: "session stopped" },
+      });
+      const result = yield* Fiber.join(resultFiber);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterRequestError");
+      }
+    }),
+  );
+
+  it.effect("serializes handoff summaries and times out when the turn never settles", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-handoff-summary-timeout");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const resultFiber = yield* provider
+        .summarizeForHandoff(threadId)
+        .pipe(Effect.result, Effect.forkChild);
+      yield* advanceTestClock(50);
+      const concurrent = yield* provider.summarizeForHandoff(threadId).pipe(Effect.result);
+      assert.equal(concurrent._tag, "Failure");
+
+      yield* advanceTestClock(600_001);
+      const result = yield* Fiber.join(resultFiber);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterRequestError");
+      }
     }),
   );
 

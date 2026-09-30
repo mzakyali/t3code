@@ -73,6 +73,13 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Run one summary turn on the thread's bound provider session and resolve
+   * with the assistant's reply text. The reply becomes the handoff brief a
+   * successor provider receives via `setPendingHandoffContext`.
+   */
+  readonly summarizeForHandoff: (threadId: ThreadId) => Effect.Effect<string, ProviderServiceError>;
+
+  /**
    * Interrupt a running provider turn.
    */
   readonly interruptTurn: (

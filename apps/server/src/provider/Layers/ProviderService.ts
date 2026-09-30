@@ -232,6 +232,16 @@ function compactAccessibilityForPrompt(
 /** How long a manual context compaction may run before ProviderService gives up on it. */
 const COMPACTION_COMPLETION_TIMEOUT = "10 minutes";
 
+/** Fixed prompt for the dedicated turn that writes the source provider's handoff brief. */
+export const HANDOFF_SUMMARY_PROMPT = `This conversation is being handed off to a different coding agent that will continue the work in the same workspace. Write a handoff brief for them covering:
+1. The goal and any explicit user requirements or constraints
+2. Decisions made and why
+3. Work completed so far (files created/edited, commits)
+4. Pending work and known issues
+5. Verification state (tests run, build status)
+
+Be concrete and concise. Output only the brief.`;
+
 interface PendingCompaction {
   readonly completion: Deferred.Deferred<string>;
   readonly native: boolean;
@@ -239,6 +249,20 @@ interface PendingCompaction {
   readonly requestId: MessageId | undefined;
   readonly earlyEvents: ProviderRuntimeEvent[];
   compactedEventObserved: boolean;
+  expectedTurnId: TurnId | undefined;
+}
+
+interface PendingHandoffSummary {
+  readonly completion: Deferred.Deferred<string, ProviderAdapterError>;
+  readonly provider: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly earlyEvents: ProviderRuntimeEvent[];
+  /**
+   * itemId → assistant text for the summary turn. `item.completed` carries a
+   * `detail` fallback restating the item's whole text, so it only wins when it
+   * is longer than what the item's deltas already delivered.
+   */
+  readonly textByItem: Map<string, string>;
   expectedTurnId: TurnId | undefined;
 }
 
@@ -535,6 +559,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       if (pendingCompactions.get(threadId) !== pending) return false;
       pendingCompactions.delete(threadId);
       yield* Deferred.succeed(pending.completion, terminal);
+      return true;
+    });
+  const pendingHandoffSummaries = new Map<ThreadId, PendingHandoffSummary>();
+  const settleHandoffSummary = (
+    threadId: ThreadId,
+    pending: PendingHandoffSummary,
+    terminal: string,
+  ) =>
+    Effect.gen(function* () {
+      if (pendingHandoffSummaries.get(threadId) !== pending) return false;
+      pendingHandoffSummaries.delete(threadId);
+      yield* terminal === "completed"
+        ? Deferred.succeed(pending.completion, [...pending.textByItem.values()].join("\n\n"))
+        : Deferred.fail(
+            pending.completion,
+            new ProviderAdapterRequestError({
+              provider: pending.provider,
+              method: "turn/start",
+              detail: `Provider handoff summary ended with ${terminal}.`,
+            }),
+          );
       return true;
     });
   const turnAnalytics = yield* Ref.make<TurnAnalyticsState>({
@@ -1090,6 +1135,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* publishRuntimeEvent(compactedEvent);
     });
 
+  const isHandoffSummaryTextEvent = (event: ProviderRuntimeEvent) =>
+    (event.type === "content.delta" && event.payload.streamKind === "assistant_text") ||
+    (event.type === "item.completed" && event.payload.itemType === "assistant_message");
+
+  const collectHandoffSummaryText = (
+    pending: PendingHandoffSummary,
+    event: ProviderRuntimeEvent,
+  ) => {
+    if (event.type === "content.delta" && event.payload.streamKind === "assistant_text") {
+      const key = String(event.itemId ?? event.turnId);
+      pending.textByItem.set(key, (pending.textByItem.get(key) ?? "") + event.payload.delta);
+      return;
+    }
+    if (event.type !== "item.completed" || event.payload.itemType !== "assistant_message") return;
+    const detail = event.payload.detail;
+    if (detail === undefined) return;
+    const key = String(event.itemId ?? event.turnId);
+    if ((pending.textByItem.get(key)?.length ?? 0) >= detail.length) return;
+    pending.textByItem.set(key, detail);
+  };
+
+  const observeHandoffSummaryEvent = (
+    pending: PendingHandoffSummary,
+    event: ProviderRuntimeEvent,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const matchesTurn = event.turnId !== undefined && event.turnId === pending.expectedTurnId;
+      if (!matchesTurn) return;
+      collectHandoffSummaryText(pending, event);
+      const terminal = compactionTerminal(event);
+      if (terminal === null) return;
+      yield* settleHandoffSummary(event.threadId, pending, terminal);
+    });
+
   const requireBindingInstanceId = (
     operation: string,
     payload: {
@@ -1223,6 +1302,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ) {
         yield* publishRuntimeEvent(canonicalEvent);
         return;
+      }
+      const pendingHandoff = pendingHandoffSummaries.get(canonicalEvent.threadId);
+      if (pendingHandoff !== undefined && pendingHandoff.providerInstanceId === source.instanceId) {
+        if (
+          pendingHandoff.expectedTurnId === undefined &&
+          canonicalEvent.turnId !== undefined &&
+          (isHandoffSummaryTextEvent(canonicalEvent) || compactionTerminal(canonicalEvent) !== null)
+        ) {
+          // Turn-scoped events that arrive before sendTurn returns the summary
+          // turn id are replayed once it is known. Publication is unaffected —
+          // the paths below still emit every event exactly once.
+          pendingHandoff.earlyEvents.push(canonicalEvent);
+        } else {
+          yield* observeHandoffSummaryEvent(pendingHandoff, canonicalEvent);
+        }
       }
       const pendingCompaction = pendingCompactions.get(canonicalEvent.threadId);
       if (!pendingCompaction) {
@@ -2034,6 +2128,68 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const summarizeForHandoff: ProviderServiceMethod<"summarizeForHandoff"> = Effect.fn(
+    "summarizeForHandoff",
+  )(function* (threadId) {
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.summarizeForHandoff",
+      allowRecovery: true,
+    });
+    yield* Effect.annotateCurrentSpan({
+      "provider.operation": "handoff-summary",
+      "provider.kind": routed.adapter.provider,
+      "provider.thread_id": threadId,
+    });
+    yield* McpSessionRegistry.touchActiveMcpThread(threadId);
+    const completion = yield* Deferred.make<string, ProviderAdapterError>();
+    const pending: PendingHandoffSummary = {
+      completion,
+      provider: routed.adapter.provider,
+      providerInstanceId: routed.instanceId,
+      earlyEvents: [],
+      textByItem: new Map(),
+      expectedTurnId: undefined,
+    };
+    const claimed = yield* Effect.sync(() => {
+      if (pendingHandoffSummaries.has(threadId)) return false;
+      pendingHandoffSummaries.set(threadId, pending);
+      return true;
+    });
+    if (!claimed) {
+      return yield* new ProviderAdapterRequestError({
+        provider: routed.adapter.provider,
+        method: "turn/start",
+        detail: "A provider handoff summary is already in progress for this thread.",
+      });
+    }
+    const clearPending = Effect.sync(() => {
+      if (pendingHandoffSummaries.get(threadId) === pending) {
+        pendingHandoffSummaries.delete(threadId);
+      }
+    });
+    return yield* Effect.gen(function* () {
+      const turn = yield* sendTurn({ threadId, input: HANDOFF_SUMMARY_PROMPT });
+      pending.expectedTurnId = turn.turnId;
+      for (const earlyEvent of pending.earlyEvents.splice(0)) {
+        yield* observeHandoffSummaryEvent(pending, earlyEvent);
+      }
+      return yield* Deferred.await(completion).pipe(
+        Effect.timeout(COMPACTION_COMPLETION_TIMEOUT),
+        Effect.catchTag("TimeoutError", (cause) =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: routed.adapter.provider,
+              method: "turn/start",
+              detail: `Provider did not finish the handoff summary within ${COMPACTION_COMPLETION_TIMEOUT}.`,
+              cause,
+            }),
+          ),
+        ),
+      );
+    }).pipe(Effect.ensuring(clearPending));
+  });
+
   const interruptTurn: ProviderServiceMethod<"interruptTurn"> = Effect.fn("interruptTurn")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -2182,6 +2338,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const pendingCompaction = pendingCompactions.get(input.threadId);
         if (pendingCompaction !== undefined) {
           yield* settleCompaction(input.threadId, pendingCompaction, "turn.aborted");
+        }
+        const pendingHandoff = pendingHandoffSummaries.get(input.threadId);
+        if (pendingHandoff !== undefined) {
+          yield* settleHandoffSummary(input.threadId, pendingHandoff, "turn.aborted");
         }
         timedOutNativeCompactions.delete(input.threadId);
         yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
@@ -2568,6 +2728,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     startSession,
     sendTurn,
     compactThread,
+    summarizeForHandoff,
     interruptTurn,
     respondToRequest,
     respondToUserInput,
