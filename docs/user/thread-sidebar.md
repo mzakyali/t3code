@@ -144,6 +144,31 @@ Expand a tool call in the conversation to see its full command and output.
 Summaries shorten shell wrappers and can still describe the latest call after it
 finishes; the call's own result shows its status.
 
+## Continue with another provider
+
+A thread that has already started can pick up on a different provider: the
+conversation and workspace stay, and the new provider takes over from there.
+Choose **Continue with another provider…** from the thread's menu on web and
+desktop, or from the thread settings sheet on mobile, and pick the provider
+and model to move to. The option shows once the thread has started and another
+provider is ready to take over; it is unavailable while a turn is running or an
+approval is waiting for an answer.
+
+The outgoing provider first writes a brief covering the goal, decisions, and
+work so far. A card in the thread marks the switch — expand it to read the
+brief — and the new provider receives that brief ahead of your next message, so
+it starts with context instead of cold. When the outgoing provider cannot write
+a brief, T3 Code assembles one from the thread instead and the card shows
+**Fallback brief**.
+
+Continuing works both ways: hand the thread back to the earlier provider and it
+resumes its own session, with a fresh brief covering the intervening work.
+Devin can neither send nor receive a handoff.
+
+Rewinding the conversation cannot cross a handoff — turns before the card
+belong to the previous provider's session, and a rewind that would land before
+the switch is refused.
+
 ## Snooze until later
 
 Choose **Snooze → Custom…** from a thread's menu to pick a date and time in your
