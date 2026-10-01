@@ -14,6 +14,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
+  CheckpointRef,
   CommandId,
   ComposerContextId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -3939,6 +3940,73 @@ describe("ProviderCommandReactor", () => {
     const activity = thread?.activities.find((entry) => entry.kind === "provider.handoff");
     expect(activity?.payload).toMatchObject({ degraded: true });
     expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("claudeAgent"));
+  });
+
+  it("bounds the plan and checkpoint file list in a degraded handoff brief", async () => {
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      summarizeForHandoffEffect: () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: ProviderDriverKind.make("codex"),
+            method: "turn/start",
+            detail: "summary exploded",
+          }),
+        ),
+    });
+    await setReadyCodexSession(harness);
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.proposed-plan.upsert",
+        commandId: CommandId.make(`cmd-proposed-plan-${++handoffCommandSeq}`),
+        threadId: ThreadId.make("thread-1"),
+        proposedPlan: {
+          id: "plan-1",
+          turnId: null,
+          planMarkdown: "P".repeat(5000),
+          implementedAt: null,
+          implementationThreadId: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make(`cmd-diff-complete-${++handoffCommandSeq}`),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("turn-1"),
+        completedAt: now,
+        checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-1/turn/1"),
+        status: "ready",
+        files: Array.from({ length: 50 }, (_, index) => ({
+          path: `src/file-${index}.ts`,
+          kind: "modified",
+          additions: 1,
+          deletions: 0,
+        })),
+        checkpointTurnCount: 1,
+        createdAt: now,
+      }),
+    );
+
+    await dispatchHandoff(harness);
+    await waitForActivity(harness, "provider.handoff");
+    await harness.drain();
+
+    const pending = harness.pendingHandoffContexts.get(ThreadId.make("thread-1"));
+    expect(pending?.degraded).toBe(true);
+    const brief = pending?.brief ?? "";
+    // The 5000-char plan truncates at the plan bound; the 50-file checkpoint
+    // list keeps the first entries plus a count marker.
+    expect(brief).toContain(`${"P".repeat(2000)}…`);
+    expect(brief).not.toContain("P".repeat(2001));
+    expect(brief).toContain("- src/file-19.ts");
+    expect(brief).not.toContain("src/file-20.ts");
+    expect(brief).toContain("… (+30 more)");
+    expect(brief.length).toBeLessThan(5000);
   });
 
   it("prepends the pending handoff brief to the next turn and consumes it once", async () => {

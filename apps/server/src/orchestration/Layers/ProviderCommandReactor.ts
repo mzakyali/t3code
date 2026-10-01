@@ -126,11 +126,13 @@ const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const HANDOFF_BRIEF_MESSAGE_LIMIT = 6;
 const HANDOFF_BRIEF_MESSAGE_MAX_CHARS = 500;
+const HANDOFF_BRIEF_PLAN_MAX_CHARS = 2000;
+const HANDOFF_BRIEF_CHECKPOINT_FILE_LIMIT = 20;
 
-const truncateHandoffExcerpt = (text: string): string =>
-  text.length > HANDOFF_BRIEF_MESSAGE_MAX_CHARS
-    ? `${text.slice(0, HANDOFF_BRIEF_MESSAGE_MAX_CHARS)}…`
-    : text;
+const truncateHandoffExcerpt = (
+  text: string,
+  maxChars = HANDOFF_BRIEF_MESSAGE_MAX_CHARS,
+): string => (text.length > maxChars ? `${text.slice(0, maxChars)}…` : text);
 
 function providerErrorLabel(value: string | undefined): string {
   const normalized = value?.trim();
@@ -619,10 +621,14 @@ const make = Effect.gen(function* () {
     const firstUserMessage = transcriptMessages.find((message) => message.role === "user");
     const latestPlan = detail?.proposedPlans.at(-1);
     const latestCheckpoint = detail?.checkpoints.at(-1);
-    const checkpointFileLines =
-      latestCheckpoint?.files.map(
-        (file) => `- ${file.path} (+${file.additions}/-${file.deletions}, ${file.kind})`,
-      ) ?? [];
+    // The brief is persisted as an activity, streamed to clients, and
+    // prepended into a prompt, so every projection payload copied into it is
+    // bounded the same way message excerpts are.
+    const checkpointFiles = latestCheckpoint?.files ?? [];
+    const checkpointFileLines = checkpointFiles
+      .slice(0, HANDOFF_BRIEF_CHECKPOINT_FILE_LIMIT)
+      .map((file) => `- ${file.path} (+${file.additions}/-${file.deletions}, ${file.kind})`);
+    const hiddenCheckpointFileCount = checkpointFiles.length - checkpointFileLines.length;
     const recentMessages = transcriptMessages
       .slice(-HANDOFF_BRIEF_MESSAGE_LIMIT)
       .map((message) => `[${message.role}] ${truncateHandoffExcerpt(message.text.trim())}`);
@@ -637,12 +643,12 @@ const make = Effect.gen(function* () {
       "",
       "## Work completed so far",
       latestCheckpoint !== undefined && checkpointFileLines.length > 0
-        ? `Latest checkpoint (turn ${latestCheckpoint.checkpointTurnCount}):\n${checkpointFileLines.join("\n")}`
+        ? `Latest checkpoint (turn ${latestCheckpoint.checkpointTurnCount}):\n${checkpointFileLines.join("\n")}${hiddenCheckpointFileCount > 0 ? `\n… (+${hiddenCheckpointFileCount} more)` : ""}`
         : "No checkpoints recorded.",
       "",
       "## Pending work and known issues",
       latestPlan !== undefined
-        ? latestPlan.planMarkdown
+        ? truncateHandoffExcerpt(latestPlan.planMarkdown, HANDOFF_BRIEF_PLAN_MAX_CHARS)
         : "Not captured — review the recent messages below.",
       "",
       "## Verification state",
