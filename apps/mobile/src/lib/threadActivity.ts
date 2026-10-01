@@ -1,4 +1,8 @@
 import * as Option from "effect/Option";
+import {
+  decodeProviderHandoffInfo,
+  type ProviderHandoffInfo,
+} from "@t3tools/client-runtime/work-log/provider-handoff";
 import { foldUserInputActivities } from "@t3tools/client-runtime/work-log/user-input";
 import * as Schema from "effect/Schema";
 import {
@@ -123,6 +127,8 @@ export interface WorkLogEntry {
       readonly updatedAt: string;
     }>;
   };
+  /** Decoded provider.handoff / provider.handoff.failed payload — the feed renders it as a card, never a work row. */
+  providerHandoff?: ProviderHandoffInfo;
   toolData?: unknown;
 }
 
@@ -281,6 +287,16 @@ export function isContextCompactionActivityGroup(
   return (
     entry.activities.length === 1 &&
     entry.activities[0]?.workEntry.sourceActivityKind === "context-compaction"
+  );
+}
+
+/**
+ * A provider handoff renders as its own card, like the compaction divider —
+ * never inside a generic work-log group, fold, or mixed activity run.
+ */
+export function isProviderHandoffActivityGroup(entry: ThreadFeedActivityGroup): boolean {
+  return (
+    entry.activities.length === 1 && entry.activities[0]?.workEntry.providerHandoff !== undefined
   );
 }
 
@@ -531,6 +547,12 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       return Option.isSome(answer) ? { questionAnswer: answer.value } : {};
     })(),
   };
+  // Handoff activities render as dedicated cards, so the decoded payload
+  // travels on the work entry instead of flattening into label/detail.
+  const providerHandoff = decodeProviderHandoffInfo(activity);
+  if (providerHandoff !== null) {
+    entry.providerHandoff = providerHandoff;
+  }
   const toolCallId =
     asTrimmedString(payload?.toolCallId) ?? asTrimmedString(asRecord(payload?.data)?.toolCallId);
   if (toolCallId) {
@@ -1584,6 +1606,7 @@ function groupAdjacentActivities(entries: ReadonlyArray<RawThreadFeedEntry>): Th
 
     const isStandalone =
       entry.activity.workEntry.sourceActivityKind === "context-compaction" ||
+      entry.activity.workEntry.providerHandoff !== undefined ||
       entry.activity.workEntry.questionAnswer !== undefined;
     if (isStandalone || firstActivityEntry?.turnId !== entry.turnId) {
       flushGroup();
@@ -1711,7 +1734,8 @@ function deriveThreadFeedTurnFolds(
           (entry) =>
             entry.id !== firstAssistantMessageId &&
             entry.id !== terminalAssistantMessageId &&
-            !(entry.type === "activity-group" && isUserInputActivityGroup(entry)),
+            !(entry.type === "activity-group" && isUserInputActivityGroup(entry)) &&
+            !(entry.type === "activity-group" && isProviderHandoffActivityGroup(entry)),
         )
         .map((entry) => entry.id),
     );
@@ -1902,6 +1926,7 @@ function activityRunTurnId(entry: ThreadFeedEntry): TurnId | null {
   if (
     entry.type === "activity-group" &&
     !isContextCompactionActivityGroup(entry) &&
+    !isProviderHandoffActivityGroup(entry) &&
     !isUserInputActivityGroup(entry) &&
     entry.activities.every(
       (activity) => !activity.workEntry.agentSpawn && activity.workEntry.tone !== "error",
@@ -2069,7 +2094,11 @@ function appendPresentedFeedEntry(
     result.push(entry);
     return;
   }
-  if (isContextCompactionActivityGroup(entry) || isUserInputActivityGroup(entry)) {
+  if (
+    isContextCompactionActivityGroup(entry) ||
+    isProviderHandoffActivityGroup(entry) ||
+    isUserInputActivityGroup(entry)
+  ) {
     result.push(entry);
     return;
   }

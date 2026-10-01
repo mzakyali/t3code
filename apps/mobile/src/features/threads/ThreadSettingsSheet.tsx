@@ -43,7 +43,7 @@ import {
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { SymbolView } from "../../components/AppSymbol";
+import { SymbolView, type AppSymbolName } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { AndroidAnchoredMenu } from "../../components/AndroidAnchoredMenu";
@@ -178,19 +178,32 @@ function ProviderHeader(props: {
 /** Compact row that opens a single-choice submenu panel. */
 function DisclosureRow(props: {
   readonly label: string;
-  readonly value: string | undefined;
+  readonly value?: string | undefined;
+  readonly icon?: AppSymbolName;
   readonly onPress: () => void;
+  readonly disabled?: boolean;
   readonly isLast?: boolean;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityState={{ disabled: props.disabled === true }}
+      disabled={props.disabled === true}
       onPress={props.onPress}
       className={cn(
         "min-h-11 flex-row items-center gap-2 bg-card px-4 py-2 active:bg-subtle android:min-h-14",
         !props.isLast && "border-b border-border-subtle",
+        props.disabled === true && "opacity-40",
       )}
     >
+      {props.icon !== undefined ? (
+        <SymbolView
+          name={props.icon}
+          size={14}
+          tintColorClassName="accent-icon-subtle"
+          type="monochrome"
+        />
+      ) : null}
       <Text className="text-sm font-t3-medium text-foreground">{props.label}</Text>
       <View className="flex-1" />
       {props.value ? (
@@ -247,6 +260,15 @@ type ThreadSettingsSessionProps = {
   readonly onUpdateOptionSelections: (selections: ReadonlyArray<ProviderOptionSelection>) => void;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
+  /**
+   * Present when another provider instance can continue this thread; the row
+   * swaps this sheet's session for the destination-scoped picker.
+   */
+  readonly onOpenProviderHandoff?: (() => void) | undefined;
+  /** True while a turn is in flight — the handoff row stays visible but inert. */
+  readonly providerHandoffDisabled?: boolean;
+  /** Header title override; handoff sessions read "Continue with another provider". */
+  readonly presentationTitle?: string | undefined;
 };
 
 export type ExistingThreadSettingsRouteSession = ThreadSettingsSessionProps & {
@@ -294,6 +316,9 @@ type ThreadSettingsSessionValue = {
   readonly environmentId: EnvironmentId | null;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
+  readonly onOpenProviderHandoff?: (() => void) | undefined;
+  readonly providerHandoffDisabled?: boolean;
+  readonly presentationTitle: string;
   readonly favoriteKeys: ReadonlySet<string>;
   readonly favoritesLoaded: boolean;
   readonly toggleFavorite: (option: ModelOption) => void;
@@ -454,6 +479,9 @@ function ThreadSettingsSessionProvider(
       environmentId: props.environmentId,
       providerInstanceId: props.providerInstanceId,
       providerGroups: props.providerGroups,
+      onOpenProviderHandoff: props.onOpenProviderHandoff,
+      providerHandoffDisabled: props.providerHandoffDisabled,
+      presentationTitle: props.presentationTitle ?? "Thread settings",
       runtimeMode: props.runtimeMode,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
       displayedDescriptors,
@@ -488,6 +516,9 @@ function ThreadSettingsSessionProvider(
       isDisplayed,
       props.environmentId,
       props.providerInstanceId,
+      props.onOpenProviderHandoff,
+      props.providerHandoffDisabled,
+      props.presentationTitle,
       pendingModel,
       pressModel,
       providerFilter,
@@ -702,6 +733,17 @@ function ThreadSettingsOptionsItem(props: {
   return (
     <View style={{ paddingBottom: insets.bottom + bottomToolbarInset + 12 }}>
       <ChatGptSharingStatus provider={selectedProvider} />
+      {session.onOpenProviderHandoff !== undefined ? (
+        <View className="mx-4 mb-2 mt-1 overflow-hidden rounded-2xl bg-card">
+          <DisclosureRow
+            isLast
+            icon="arrow.left.arrow.right"
+            label="Continue with another provider…"
+            disabled={session.providerHandoffDisabled === true}
+            onPress={session.onOpenProviderHandoff}
+          />
+        </View>
+      ) : null}
       <Text className="px-5 pb-2 pt-2 text-sm font-t3-medium text-foreground-muted">Options</Text>
       <Animated.View
         className="mx-4 overflow-hidden rounded-2xl bg-card"
@@ -1145,7 +1187,7 @@ function ThreadSettingsModelsScreen() {
             </View>
           }
           onBack={presentation.onClose}
-          title="Thread settings"
+          title={session.presentationTitle}
           hideBottomBorder
         />
       ) : null}
@@ -1156,6 +1198,7 @@ function ThreadSettingsModelsScreen() {
           session.showLegacy,
         ]}
         options={{
+          title: session.presentationTitle,
           unstable_headerToolbarItems: usesNativeMailSearchToolbar
             ? () => [
                 createNativeMailSearchToolbarItem({
@@ -1354,10 +1397,12 @@ export function ExistingThreadSettingsRouteScreen() {
     return <View className="flex-1 bg-sheet" />;
   }
 
-  const { ownerId: _ownerId, ...settings } = session;
+  const { ownerId, ...settings } = session;
 
   return (
-    <ThreadSettingsSessionProvider {...settings}>
+    // A different owner (e.g. the provider-handoff session) must not inherit a
+    // staged model pick from the session it replaced — remount for fresh state.
+    <ThreadSettingsSessionProvider key={ownerId} {...settings}>
       <ThreadSettingsPickerNavigator onClose={() => navigation.goBack()} />
     </ThreadSettingsSessionProvider>
   );

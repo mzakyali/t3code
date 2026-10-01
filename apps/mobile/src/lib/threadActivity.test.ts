@@ -552,6 +552,191 @@ describe("buildThreadFeed", () => {
     ]);
   });
 
+  it("keeps a provider handoff as its own timeline card", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-provider-handoff"),
+      projectId: ProjectId.make("project-1"),
+      title: "Provider handoff",
+      activities: [
+        makeActivity({
+          id: EventId.make("provider-handoff"),
+          kind: "provider.handoff",
+          tone: "info",
+          summary: "Handed off to claudeAgent",
+          createdAt: "2026-09-01T00:00:00.000Z",
+          payload: {
+            fromProvider: "codex",
+            fromInstanceId: "codex",
+            toInstanceId: "claudeAgent",
+            brief: "carry on",
+            degraded: true,
+          },
+        }),
+      ],
+    });
+
+    const presented = deriveThreadFeedPresentation(buildThreadFeed(thread), null, new Set());
+    expect(presented).toMatchObject([
+      {
+        type: "activity-group",
+        id: "provider-handoff",
+        activities: [
+          {
+            workEntry: {
+              providerHandoff: {
+                outcome: "success",
+                fromProvider: "codex",
+                fromInstanceId: "codex",
+                toInstanceId: "claudeAgent",
+                brief: "carry on",
+                degraded: true,
+              },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps a failed provider handoff as its own error card", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-provider-handoff-failed"),
+      projectId: ProjectId.make("project-1"),
+      title: "Provider handoff failed",
+      activities: [
+        makeActivity({
+          id: EventId.make("provider-handoff-failed"),
+          kind: "provider.handoff.failed",
+          tone: "error",
+          summary: "Provider handoff failed",
+          createdAt: "2026-09-01T00:00:00.000Z",
+          payload: { detail: "A turn is still running." },
+        }),
+      ],
+    });
+
+    const presented = deriveThreadFeedPresentation(buildThreadFeed(thread), null, new Set());
+    expect(presented).toMatchObject([
+      {
+        type: "activity-group",
+        id: "provider-handoff-failed",
+        activities: [
+          {
+            workEntry: {
+              providerHandoff: { outcome: "failure", detail: "A turn is still running." },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("still renders a card when a handoff payload is missing or malformed", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-provider-handoff-partial"),
+      projectId: ProjectId.make("project-1"),
+      title: "Partial handoff",
+      activities: [
+        makeActivity({
+          id: EventId.make("provider-handoff-partial"),
+          kind: "provider.handoff",
+          tone: "info",
+          summary: "Handed off",
+          createdAt: "2026-09-01T00:00:00.000Z",
+          payload: "junk",
+        }),
+      ],
+    });
+
+    const presented = deriveThreadFeedPresentation(buildThreadFeed(thread), null, new Set());
+    expect(presented).toMatchObject([
+      {
+        type: "activity-group",
+        activities: [
+          {
+            workEntry: {
+              providerHandoff: {
+                outcome: "success",
+                fromProvider: null,
+                fromInstanceId: null,
+                toInstanceId: null,
+                brief: null,
+                degraded: false,
+              },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("does not merge a provider handoff into the work groups around it", () => {
+    const turnId = TurnId.make("turn-handoff-adjacent");
+    const thread = makeThread({
+      id: ThreadId.make("thread-handoff-adjacent-work"),
+      projectId: ProjectId.make("project-1"),
+      title: "Handoff between work",
+      activities: [
+        makeActivity({
+          id: EventId.make("tool-before"),
+          kind: "tool.completed",
+          summary: "Read files",
+          createdAt: "2026-09-01T00:00:00.000Z",
+          turnId,
+          payload: { itemType: "file_read", status: "completed" },
+        }),
+        makeActivity({
+          id: EventId.make("provider-handoff"),
+          kind: "provider.handoff",
+          tone: "info",
+          summary: "Handed off to claudeAgent",
+          createdAt: "2026-09-01T00:00:01.000Z",
+          turnId,
+          payload: {
+            fromProvider: "codex",
+            fromInstanceId: "codex",
+            toInstanceId: "claudeAgent",
+            brief: "carry on",
+            degraded: false,
+          },
+        }),
+        makeActivity({
+          id: EventId.make("tool-after"),
+          kind: "tool.completed",
+          summary: "Write file",
+          createdAt: "2026-09-01T00:00:02.000Z",
+          turnId,
+          payload: { itemType: "file_change", status: "completed" },
+        }),
+      ],
+    });
+
+    // Raw feed keeps the handoff as its own group between the same-turn work.
+    const feed = buildThreadFeed(thread);
+    expect(
+      feed.map((entry) => [
+        entry.type,
+        entry.type === "activity-group" ? entry.activities.map((a) => a.id) : [],
+      ]),
+    ).toEqual([
+      ["activity-group", ["tool-before"]],
+      ["activity-group", ["provider-handoff"]],
+      ["activity-group", ["tool-after"]],
+    ]);
+
+    // Presentation folds the turn's work but leaves the handoff card standing.
+    const presented = deriveThreadFeedPresentation(feed, null, new Set());
+    expect(
+      presented.map((entry) => [
+        entry.type,
+        entry.type === "activity-group" ? entry.activities.map((a) => a.id) : [],
+      ]),
+    ).toEqual([
+      ["turn-fold", []],
+      ["activity-group", ["provider-handoff"]],
+    ]);
+  });
+
   it("keeps long Claude commands expandable without repeating them in full detail", () => {
     const command = `printf 'first line\nsecond line'\n&& printf done`;
     const thread = makeThread({

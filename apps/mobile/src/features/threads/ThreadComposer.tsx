@@ -87,6 +87,18 @@ import {
   groupByProvider,
   isModelSelectionUnavailable,
 } from "../../lib/modelOptions";
+import {
+  deriveProviderHandoffDestinations,
+  deriveProviderHandoffGroups,
+  providerHandoffSourceInstanceId,
+  threadShellHasStarted,
+} from "../../lib/providerHandoff";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import { threadEnvironment } from "../../state/threads";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
 import type { RemoteClientConnectionState } from "../../lib/connection";
 import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
@@ -545,7 +557,72 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       }),
     [currentModelOption?.capabilities, currentModelSelection.options],
   );
+  const handoffProvider = useAtomCommand(threadEnvironment.handoffProvider, {
+    reportFailure: false,
+  });
+  const providerHandoffGroups = useMemo(() => {
+    if (!props.serverConfig || !threadShellHasStarted(props.selectedThread)) {
+      return [];
+    }
+    const destinations = deriveProviderHandoffDestinations({
+      providers: props.serverConfig.providers,
+      modelOptions,
+      currentInstanceId: providerHandoffSourceInstanceId(props.selectedThread),
+    });
+    return deriveProviderHandoffGroups({ destinations, providerGroups });
+  }, [props.serverConfig, props.selectedThread, modelOptions, providerGroups]);
+  const dispatchProviderHandoff = useCallback(
+    async (modelSelection: ModelSelection) => {
+      const result = await handoffProvider({
+        environmentId: props.environmentId,
+        input: { threadId: props.selectedThread.id, modelSelection },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        Alert.alert(
+          "Failed to continue with another provider",
+          error instanceof Error ? error.message : "The provider handoff failed.",
+        );
+      }
+    },
+    [handoffProvider, props.environmentId, props.selectedThread.id],
+  );
   const settingsOwnerId = composerOwnerKey;
+  // The handoff picker shares the settings sheet route; its distinct ownerId
+  // remounts the session instead of inheriting a staged model pick.
+  const providerHandoffOwnerId = `${settingsOwnerId}:provider-handoff`;
+  const providerHandoffSession = useMemo<ExistingThreadSettingsRouteSession | null>(
+    () =>
+      providerHandoffGroups.length === 0
+        ? null
+        : {
+            ownerId: providerHandoffOwnerId,
+            environmentId: props.environmentId,
+            providerGroups: providerHandoffGroups,
+            selectedModel: null,
+            onSelectModel: (option) => void dispatchProviderHandoff(option.selection),
+            optionDescriptors: [],
+            onUpdateOptionSelections: () => undefined,
+            runtimeMode: currentRuntimeMode,
+            onUpdateRuntimeMode: props.onUpdateRuntimeMode,
+            presentationTitle: "Continue with another provider",
+          },
+    [
+      currentRuntimeMode,
+      dispatchProviderHandoff,
+      providerHandoffGroups,
+      props.environmentId,
+      props.onUpdateRuntimeMode,
+      providerHandoffOwnerId,
+    ],
+  );
+  const openProviderHandoff = useCallback(() => {
+    if (providerHandoffSession === null) return;
+    settingsRoutePresentation.present(providerHandoffSession);
+  }, [providerHandoffSession, settingsRoutePresentation.present]);
+  const providerHandoffInFlight =
+    props.selectedThread.session?.status === "running" &&
+    props.selectedThread.session.activeTurnId !== null;
   const settingsRouteSession = useMemo<ExistingThreadSettingsRouteSession>(
     () => ({
       ownerId: settingsOwnerId,
@@ -560,10 +637,19 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         props.onUpdateModelSelection({ ...currentModelSelection, options }),
       runtimeMode: currentRuntimeMode,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
+      ...(providerHandoffSession !== null
+        ? {
+            onOpenProviderHandoff: openProviderHandoff,
+            providerHandoffDisabled: providerHandoffInFlight,
+          }
+        : {}),
     }),
     [
       currentModelSelection,
       currentRuntimeMode,
+      providerHandoffInFlight,
+      providerHandoffSession,
+      openProviderHandoff,
       props.onUpdateModelSelection,
       props.onUpdateRuntimeMode,
       providerOptionDescriptors,
@@ -576,11 +662,25 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     settingsSheetPresentation.open();
   }, [settingsRoutePresentation.present, settingsRouteSession, settingsSheetPresentation.open]);
 
+  // Keep the presented session's props fresh. When the handoff picker owns the
+  // sheet its session is refreshed in place; if its destinations disappear
+  // (provider went offline), it snaps back to the regular settings session.
   useEffect(() => {
-    if (settingsSheetPresentation.isActive) {
-      settingsRoutePresentation.present(settingsRouteSession);
+    if (!settingsSheetPresentation.isActive) {
+      return;
     }
-  }, [settingsRoutePresentation.present, settingsRouteSession, settingsSheetPresentation.isActive]);
+    const next =
+      settingsRoutePresentation.session?.ownerId === providerHandoffOwnerId
+        ? (providerHandoffSession ?? settingsRouteSession)
+        : settingsRouteSession;
+    settingsRoutePresentation.present(next);
+  }, [
+    providerHandoffOwnerId,
+    providerHandoffSession,
+    settingsRoutePresentation,
+    settingsRouteSession,
+    settingsSheetPresentation.isActive,
+  ]);
 
   useEffect(() => {
     if (!settingsSheetPresentation.isVisible || settingsRoutePresentedRef.current) {
@@ -600,7 +700,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       settingsRoutePresentedRef.current = false;
       settingsSheetPresentation.onDismissed();
       settingsRoutePresentation.clear(settingsOwnerId);
-    }, [settingsOwnerId, settingsRoutePresentation.clear, settingsSheetPresentation.onDismissed]),
+      settingsRoutePresentation.clear(providerHandoffOwnerId);
+    }, [
+      providerHandoffOwnerId,
+      settingsOwnerId,
+      settingsRoutePresentation.clear,
+      settingsSheetPresentation.onDismissed,
+    ]),
   );
 
   useEffect(

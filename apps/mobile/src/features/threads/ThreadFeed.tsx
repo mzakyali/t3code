@@ -13,6 +13,7 @@ import type {
   EnvironmentId,
   MessageId,
   OrchestrationMessageContext,
+  ServerProvider,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -151,9 +152,11 @@ import {
   deriveThreadFeedPresentation,
   deriveUnsettledTurnId,
   isContextCompactionActivityGroup,
+  isProviderHandoffActivityGroup,
   type ThreadFeedEntry,
   type ThreadFeedLatestTurn,
 } from "../../lib/threadActivity";
+import { ThreadProviderHandoffCard } from "./ThreadProviderHandoffCard";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import {
   resolveThreadFeedLiveFollow,
@@ -253,6 +256,8 @@ export interface ThreadFeedProps {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly workspaceRoot?: string | null;
+  /** Provider catalog for the environment — resolves handoff card labels. */
+  readonly providers?: ReadonlyArray<ServerProvider>;
   readonly feed: ReadonlyArray<ThreadFeedEntry>;
   readonly contentPresentation: ThreadContentPresentation;
   readonly agentLabel: string;
@@ -1355,6 +1360,7 @@ function renderFeedEntry(
   props: Pick<
     ThreadFeedProps,
     | "environmentId"
+    | "providers"
     | "onUseArtifactTemplate"
     | "skills"
     | "dispatchingMessageId"
@@ -1479,6 +1485,20 @@ function renderFeedEntry(
         </View>
         <View className="h-px flex-1 bg-subtle" />
       </View>
+    );
+  }
+
+  if (entry.type === "activity-group" && isProviderHandoffActivityGroup(entry)) {
+    const activity = entry.activities[0]!;
+    return (
+      <ThreadProviderHandoffCard
+        activity={activity}
+        providers={props.providers ?? []}
+        expanded={props.expandedWorkRows[activity.id] === true}
+        iconSubtleColor={iconSubtleColor}
+        onToggle={() => props.onToggleWorkRow(activity.id, entry.id)}
+        onCopy={() => props.onCopyWorkRow(activity.id, activity.getCopyText())}
+      />
     );
   }
 
@@ -2729,7 +2749,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         case "thinking":
           return WORK_GROUP_TOGGLE_HEIGHT;
         case "activity-group":
-          if (isContextCompactionActivityGroup(entry)) {
+          if (isContextCompactionActivityGroup(entry) || isProviderHandoffActivityGroup(entry)) {
             return undefined;
           }
           // Expanded rows append a variable detail block — fall back to
@@ -2755,6 +2775,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         <ThreadMediaVisibility>
           {renderFeedEntry(info, {
             environmentId: props.environmentId,
+            providers: props.providers,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
             copiedRowId,
@@ -2829,6 +2850,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       onToggleWorkGroup,
       onToggleWorkRow,
       props.environmentId,
+      props.providers,
       props.onUseArtifactTemplate,
       props.skills,
       renderMarkdownImage,
