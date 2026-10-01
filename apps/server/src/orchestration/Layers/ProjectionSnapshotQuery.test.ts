@@ -1549,6 +1549,201 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
     }),
   );
 
+  it.effect(
+    "reads the provider handoff boundary from payload with a checkpoint join fallback",
+    () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+
+        yield* sql`DELETE FROM projection_projects`;
+        yield* sql`DELETE FROM projection_threads`;
+        yield* sql`DELETE FROM projection_turns`;
+        yield* sql`DELETE FROM projection_thread_activities`;
+
+        yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        )
+        VALUES (
+          'project-boundary', 'Boundary Project', '/tmp/boundary-workspace',
+          NULL, '[]', '2026-03-02T00:00:00.000Z', '2026-03-02T00:00:01.000Z', NULL
+        )
+      `;
+        yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, branch, worktree_path, latest_turn_id,
+          created_at, updated_at, archived_at, deleted_at
+        )
+        VALUES (
+          'thread-boundary', 'project-boundary', 'Boundary Thread',
+          '{"provider":"codex","model":"gpt-5-codex"}', 'full-access', 'default',
+          NULL, NULL, NULL,
+          '2026-03-02T00:00:02.000Z', '2026-03-02T00:00:03.000Z', NULL, NULL
+        )
+      `;
+        const insertTurn = (
+          turnId: string,
+          checkpointTurnCount: number,
+          completedAt: string,
+        ) => sql`
+        INSERT INTO projection_turns (
+          thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id,
+          source_proposed_plan_id, assistant_message_id, state, requested_at,
+          started_at, completed_at, checkpoint_turn_count, checkpoint_ref,
+          checkpoint_status, checkpoint_files_json
+        )
+        VALUES (
+          'thread-boundary', ${turnId}, NULL, NULL, NULL, NULL, 'completed',
+          ${completedAt}, ${completedAt}, ${completedAt}, ${checkpointTurnCount},
+          ${`checkpoint-${turnId}`}, 'ready', '[]'
+        )
+      `;
+        yield* insertTurn("turn-1", 1, "2026-03-02T00:00:04.000Z");
+        yield* insertTurn("turn-2", 2, "2026-03-02T00:00:05.000Z");
+        yield* insertTurn("turn-3", 3, "2026-03-02T00:00:07.000Z");
+        const insertActivity = (
+          activityId: string,
+          kind: string,
+          sequence: number,
+          payloadJson: string,
+          createdAt: string,
+        ) => sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+          sequence, created_at
+        )
+        VALUES (
+          ${activityId}, 'thread-boundary', NULL, 'info', ${kind}, ${kind},
+          ${payloadJson}, ${sequence}, ${createdAt}
+        )
+      `;
+
+        // No handoff yet.
+        const missing = yield* snapshotQuery.getProviderHandoffBoundaryTurnCount(
+          ThreadId.make("thread-boundary"),
+        );
+        assert.equal(missing._tag, "None");
+
+        // Legacy record without payload.turnCount falls back to the checkpoint
+        // join: turn 2 completed at T05, before the handoff at T06.
+        yield* insertActivity(
+          "handoff-legacy",
+          "provider.handoff",
+          10,
+          '{"fromProvider":"codex","toInstanceId":"claudeAgent"}',
+          "2026-03-02T00:00:06.000Z",
+        );
+        const legacy = yield* snapshotQuery.getProviderHandoffBoundaryTurnCount(
+          ThreadId.make("thread-boundary"),
+        );
+        assert.deepEqual(legacy, Option.some(2));
+
+        // A failed handoff later does not move the boundary.
+        yield* insertActivity(
+          "handoff-failed",
+          "provider.handoff.failed",
+          11,
+          '{"detail":"destination rejected"}',
+          "2026-03-02T00:00:08.000Z",
+        );
+        // The newest successful handoff wins and its payload turnCount is used
+        // even when its own checkpoints are not in the table anymore.
+        yield* insertActivity(
+          "handoff-latest",
+          "provider.handoff",
+          12,
+          '{"fromProvider":"claudeAgent","toInstanceId":"codex","turnCount":5}',
+          "2026-03-02T00:00:09.000Z",
+        );
+        const latest = yield* snapshotQuery.getProviderHandoffBoundaryTurnCount(
+          ThreadId.make("thread-boundary"),
+        );
+        assert.deepEqual(latest, Option.some(5));
+      }),
+  );
+
+  it.effect("keeps provider handoff activities pinned past the thread detail activity window", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_thread_activities`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        )
+        VALUES (
+          'project-pinned', 'Pinned Project', '/tmp/pinned-workspace',
+          NULL, '[]', '2026-03-02T00:00:00.000Z', '2026-03-02T00:00:01.000Z', NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, branch, worktree_path, latest_turn_id,
+          created_at, updated_at, archived_at, deleted_at
+        )
+        VALUES (
+          'thread-pinned', 'project-pinned', 'Pinned Thread',
+          '{"provider":"codex","model":"gpt-5-codex"}', 'full-access', 'default',
+          NULL, NULL, NULL,
+          '2026-03-02T00:00:02.000Z', '2026-03-02T00:00:03.000Z', NULL, NULL
+        )
+      `;
+      yield* sql`
+        WITH RECURSIVE activity_rows(sequence) AS (
+          SELECT 1
+          UNION ALL
+          SELECT sequence + 1 FROM activity_rows WHERE sequence < 601
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+          sequence, created_at
+        )
+        SELECT
+          printf('activity-%04d', sequence),
+          'thread-pinned',
+          NULL,
+          'info',
+          CASE
+            WHEN sequence = 1 THEN 'provider.handoff'
+            WHEN sequence = 2 THEN 'provider.handoff.failed'
+            ELSE 'tool.completed'
+          END,
+          'activity',
+          CASE
+            WHEN sequence = 1 THEN '{"turnCount":2}'
+            ELSE '{}'
+          END,
+          sequence,
+          printf('2026-03-02T00:%02d:%02d.000Z', sequence / 60, sequence % 60)
+        FROM activity_rows
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(ThreadId.make("thread-pinned"));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        const activities = detail.value.activities;
+        // 500 recent rows plus the pinned handoff; the failed handoff is not
+        // pinned and stays evicted.
+        assert.equal(activities.length, 501);
+        const pinned = activities.find((activity) => activity.id === asEventId("activity-0001"));
+        assert.equal(pinned?.kind, "provider.handoff");
+        assert.equal(
+          activities.some((activity) => activity.id === asEventId("activity-0002")),
+          false,
+        );
+      }
+    }),
+  );
+
   it.effect("keeps thread detail activity ordering consistent with shell snapshot ordering", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;

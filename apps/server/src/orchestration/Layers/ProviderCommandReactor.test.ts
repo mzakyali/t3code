@@ -3837,6 +3837,9 @@ describe("ProviderCommandReactor", () => {
       toInstanceId: "claudeAgent",
       brief: "The outgoing provider's handoff brief.",
       degraded: false,
+      // The revert boundary is stamped on the activity so it survives
+      // checkpoint-window eviction; this thread had no checkpointed turns.
+      turnCount: 0,
     });
     expect(thread?.session?.providerName).toBe("claudeAgent");
     expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("claudeAgent"));

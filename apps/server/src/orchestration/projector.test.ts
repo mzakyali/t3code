@@ -1237,4 +1237,79 @@ describe("orchestration projector", () => {
       expect(thread?.activities[0]?.id).toBe(`worktree-setup:${threadId}`);
     }),
   );
+
+  effectIt.effect("keeps the provider handoff record past the activity retention cap", () =>
+    Effect.gen(function* () {
+      const createdAt = "2026-03-01T10:00:00.000Z";
+      const threadId = "thread-handoff-retained";
+      const afterCreate = yield* projectEvent(
+        createEmptyReadModel(createdAt),
+        makeEvent({
+          sequence: 1,
+          type: "thread.created",
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: createdAt,
+          commandId: "cmd-create-handoff-retained",
+          payload: {
+            threadId,
+            projectId: "project-1",
+            title: "handoff retained",
+            modelSelection: {
+              provider: ProviderDriverKind.make("codex"),
+              model: "gpt-5-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        }),
+      );
+      const activityEvent = (sequence: number, id: string, kind: string) =>
+        makeEvent({
+          sequence,
+          type: "thread.activity-appended",
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: `2026-03-01T10:${String(Math.floor(sequence / 60) % 60).padStart(2, "0")}:${String(sequence % 60).padStart(2, "0")}.000Z`,
+          commandId: `cmd-activity-${sequence}`,
+          payload: {
+            threadId,
+            activity: {
+              id,
+              tone: "info",
+              kind,
+              summary: kind,
+              payload: {},
+              turnId: null,
+              createdAt: `2026-03-01T10:${String(Math.floor(sequence / 60) % 60).padStart(2, "0")}:${String(sequence % 60).padStart(2, "0")}.000Z`,
+            },
+          },
+        });
+      let model = yield* projectEvent(
+        afterCreate,
+        activityEvent(2, `handoff:${threadId}`, "provider.handoff"),
+      );
+      // A failed handoff never moved the boundary, so it is not pinned and the
+      // activity window below should evict it.
+      model = yield* projectEvent(
+        model,
+        activityEvent(3, `handoff-failed:${threadId}`, "provider.handoff.failed"),
+      );
+      for (let index = 0; index < 600; index += 1) {
+        model = yield* projectEvent(
+          model,
+          activityEvent(4 + index, `tool-${index}`, "tool.completed"),
+        );
+      }
+      const thread = model.threads.find((entry) => entry.id === threadId);
+      expect(thread?.activities).toHaveLength(501);
+      expect(thread?.activities[0]?.id).toBe(`handoff:${threadId}`);
+      expect(
+        thread?.activities.some((activity) => activity.id === `handoff-failed:${threadId}`),
+      ).toBe(false);
+    }),
+  );
 });

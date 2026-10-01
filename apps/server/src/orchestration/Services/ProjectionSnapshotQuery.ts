@@ -90,6 +90,17 @@ export interface ProjectionSnapshotQueryShape {
   }) => Effect.Effect<Option.Option<OrchestrationThreadActivity>, ProjectionRepositoryError>;
 
   /**
+   * Read the provider-era revert boundary for a thread: the latest
+   * `provider.handoff` activity's recorded `turnCount`, falling back to the
+   * highest checkpoint turn count completed at or before that activity for
+   * records written before the field existed. Command snapshots omit
+   * activities and checkpoints, so revert commands read this directly.
+   */
+  readonly getProviderHandoffBoundaryTurnCount: (
+    threadId: ThreadId,
+  ) => Effect.Effect<Option.Option<number>, ProjectionRepositoryError>;
+
+  /**
    * Read every activity of one kind across active (not deleted, not archived)
    * threads, without hydrating the threads. Used at startup to find state a
    * crashed process left behind.

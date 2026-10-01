@@ -307,6 +307,7 @@ function checkpoint(
 function handoffActivity(
   createdAt: string,
   id = `handoff-${createdAt}`,
+  turnCount?: number,
 ): OrchestrationThreadActivity {
   return {
     id: EventId.make(id),
@@ -322,6 +323,7 @@ function handoffActivity(
       brief: "carry on",
       degraded: false,
       createdAt,
+      ...(turnCount === undefined ? {} : { turnCount }),
     },
   };
 }
@@ -489,6 +491,105 @@ it.layer(NodeServices.layer)("conversation revert across provider handoff", (it)
       });
       const events = Array.isArray(result) ? result : [result];
       expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
+    }),
+  );
+
+  // New handoff records stamp the boundary on the payload so the gate keeps
+  // working after the projector's checkpoint window evicts every pre-handoff
+  // checkpoint.
+  it.effect("reads the boundary from the activity payload when its checkpoints are evicted", () =>
+    Effect.gen(function* () {
+      const thread = makeThread({
+        latestTurn: handedOffThread.latestTurn,
+        checkpoints: [
+          checkpoint(505, "2026-01-02T00:00:00.000Z"),
+          checkpoint(506, "2026-01-02T00:00:01.000Z"),
+        ],
+        activities: [handoffActivity("2026-01-01T00:00:03.000Z", "handoff-1", 2)],
+      });
+      const error = yield* decideOrchestrationCommand({
+        command: revertCommand(2),
+        readModel: makeReadModel(thread),
+      }).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.conversation.revert",
+        detail: expect.stringContaining("turn 2"),
+      });
+      const result = yield* decideOrchestrationCommand({
+        command: revertCommand(3),
+        readModel: makeReadModel(thread),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
+    }),
+  );
+
+  it.effect("falls back to the checkpoint join when the payload turnCount is malformed", () =>
+    Effect.gen(function* () {
+      for (const turnCount of ["2", -1, 2.5] as const) {
+        const activity: OrchestrationThreadActivity = {
+          ...handoffActivity("2026-01-01T00:00:03.000Z"),
+          payload: { turnCount },
+        };
+        const thread = {
+          ...handedOffThread,
+          activities: [activity],
+        };
+        const error = yield* decideOrchestrationCommand({
+          command: revertCommand(2),
+          readModel: makeReadModel(thread),
+        }).pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "OrchestrationCommandInvariantError",
+          commandType: "thread.conversation.revert",
+          detail: expect.stringContaining("turn 2"),
+        });
+      }
+    }),
+  );
+
+  // On restart the command read model carries no activities or checkpoints;
+  // the engine resolves the boundary straight from the projection tables and
+  // injects it here.
+  it.effect("enforces an injected durable boundary without any snapshot state", () =>
+    Effect.gen(function* () {
+      const thread = makeThread({ latestTurn: handedOffThread.latestTurn });
+      const error = yield* decideOrchestrationCommand({
+        command: revertCommand(2),
+        readModel: makeReadModel(thread),
+        providerHandoffBoundary: 2,
+      }).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.conversation.revert",
+        detail: expect.stringContaining("turn 2"),
+      });
+      const result = yield* decideOrchestrationCommand({
+        command: revertCommand(3),
+        readModel: makeReadModel(thread),
+        providerHandoffBoundary: 2,
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events.map((event) => event.type)).toEqual(["thread.checkpoint-revert-requested"]);
+    }),
+  );
+
+  it.effect("keeps the stricter boundary when the injected and snapshot values disagree", () =>
+    Effect.gen(function* () {
+      // Snapshot says turn 2, durable projection says turn 4 — a late
+      // source-era checkpoint landed after the activity was written. The
+      // gate stays at the higher (safer) boundary.
+      const error = yield* decideOrchestrationCommand({
+        command: revertCommand(3),
+        readModel: makeReadModel(handedOffThread),
+        providerHandoffBoundary: 4,
+      }).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "thread.conversation.revert",
+        detail: expect.stringContaining("turn 4"),
+      });
     }),
   );
 });

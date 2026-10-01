@@ -13,6 +13,7 @@ import {
   OrchestrationMessage,
   OrchestrationSession,
   OrchestrationThread,
+  PROVIDER_HANDOFF_ACTIVITY_KIND,
   WORKTREE_SETUP_ACTIVITY_KIND,
 } from "@t3tools/contracts";
 import {
@@ -84,7 +85,12 @@ function retainThreadActivities(activities: OrchestrationThread["activities"]) {
       // The worktree setup record is upserted under one id for the thread's
       // whole life and is the only durable copy of a running setup; an async
       // setup script can outlast a chatty first turn.
-      activity.kind === WORKTREE_SETUP_ACTIVITY_KIND,
+      activity.kind === WORKTREE_SETUP_ACTIVITY_KIND ||
+      // The provider handoff marks the revert boundary between provider eras;
+      // dropping it behind the window would silently reopen cross-era
+      // rollbacks. Failed handoffs never moved the boundary, so they are not
+      // pinned.
+      activity.kind === PROVIDER_HANDOFF_ACTIVITY_KIND,
   );
 }
 

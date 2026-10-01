@@ -242,11 +242,24 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           envelope.command.type === "thread.user-input.dismiss"
             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
             : Option.none();
+        // Same rationale for the provider handoff revert boundary: the
+        // `provider.handoff` activity and the checkpoints it joins against can
+        // both be absent from the command snapshot.
+        const providerHandoffBoundary =
+          envelope.command.type === "thread.conversation.revert" ||
+          envelope.command.type === "thread.checkpoint.revert"
+            ? yield* projectionSnapshotQuery.getProviderHandoffBoundaryTurnCount(
+                envelope.command.threadId,
+              )
+            : Option.none();
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
+            : {}),
+          ...(Option.isSome(providerHandoffBoundary)
+            ? { providerHandoffBoundary: providerHandoffBoundary.value }
             : {}),
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),

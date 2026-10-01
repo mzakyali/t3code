@@ -5,6 +5,7 @@ import {
   EventId,
   type ModelSelection,
   type OrchestrationEvent,
+  PROVIDER_HANDOFF_ACTIVITY_KIND,
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
@@ -332,6 +333,10 @@ const make = Effect.gen(function* () {
     readonly toInstanceId: ProviderInstanceId;
     readonly brief: string;
     readonly degraded: boolean;
+    // Source provider era's checkpoint turn count at handoff time. The
+    // activity outlives the projection's activity/checkpoint windows, so the
+    // revert boundary must be durable on the record itself.
+    readonly turnCount: number;
     readonly createdAt: string;
   }) =>
     Effect.all({
@@ -346,7 +351,7 @@ const make = Effect.gen(function* () {
           activity: {
             id: eventId,
             tone: "info",
-            kind: "provider.handoff",
+            kind: PROVIDER_HANDOFF_ACTIVITY_KIND,
             summary: `Handed off to ${input.toProvider}`,
             payload: {
               fromProvider: input.fromProvider,
@@ -355,6 +360,7 @@ const make = Effect.gen(function* () {
               brief: input.brief,
               degraded: input.degraded,
               createdAt: input.createdAt,
+              turnCount: input.turnCount,
             },
             turnId: null,
             createdAt: input.createdAt,
@@ -2153,6 +2159,35 @@ const make = Effect.gen(function* () {
         },
         createdAt: completedAt,
       });
+      // The boundary count is durable on the activity, so read it as late as
+      // the flow allows: the summary turn's checkpoint capture may still be
+      // in flight, and any later decider falls back to a timestamp join that
+      // counts it once it lands.
+      const handoffTurnCount = yield* projectionSnapshotQuery
+        .getThreadCheckpointContext(threadId)
+        .pipe(
+          Effect.map((context) =>
+            Option.match(context, {
+              onNone: () => 0,
+              onSome: (value) =>
+                value.checkpoints.reduce(
+                  (max, checkpoint) => Math.max(max, checkpoint.checkpointTurnCount),
+                  0,
+                ),
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logWarning(
+                  "provider command reactor failed to read checkpoint count for handoff boundary",
+                  {
+                    threadId,
+                    cause: Cause.pretty(cause),
+                  },
+                ).pipe(Effect.as(0)),
+          ),
+        );
       yield* appendHandoffActivity({
         threadId,
         fromProvider: route.fromInfo.driverKind,
@@ -2161,6 +2196,7 @@ const make = Effect.gen(function* () {
         toInstanceId: destination.instanceId,
         brief,
         degraded,
+        turnCount: handoffTurnCount,
         createdAt: completedAt,
       });
       yield* orchestrationEngine.dispatch({

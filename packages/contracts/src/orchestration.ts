@@ -670,6 +670,15 @@ export const OrchestrationThreadActivity = Schema.Struct({
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
 
+/**
+ * Activity kind recorded when a thread's provider session is handed off to
+ * another provider instance. It marks the revert boundary between provider
+ * eras, so projections pin it beyond the rolling activity window and its
+ * payload carries `turnCount` — the source era's checkpoint turn count at
+ * handoff time.
+ */
+export const PROVIDER_HANDOFF_ACTIVITY_KIND = "provider.handoff";
+
 const OrchestrationLatestTurnState = Schema.Literals([
   "running",
   "interrupted",

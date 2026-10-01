@@ -9,6 +9,7 @@ import {
   NonNegativeInt,
   OrchestrationCheckpointFile,
   OrchestrationCheckpointStatus,
+  PROVIDER_HANDOFF_ACTIVITY_KIND,
   OrchestrationProposedPlanId,
   OrchestrationReadModel,
   OrchestrationThreadSearchSource,
@@ -1539,6 +1540,56 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const getProviderHandoffBoundaryRow = SqlSchema.findOneOption({
+    Request: ThreadIdLookupInput,
+    Result: Schema.Struct({
+      payloadTurnCount: Schema.Unknown,
+      fallbackTurnCount: Schema.NullOr(Schema.Number),
+    }),
+    execute: ({ threadId }) => sql`
+      SELECT
+        json_extract(latest_handoff.payload_json, '$.turnCount') AS "payloadTurnCount",
+        (
+          SELECT MAX(turns.checkpoint_turn_count)
+          FROM projection_turns AS turns
+          WHERE turns.thread_id = latest_handoff.thread_id
+            AND turns.checkpoint_turn_count IS NOT NULL
+            AND turns.completed_at <= latest_handoff.created_at
+        ) AS "fallbackTurnCount"
+      FROM (
+        SELECT thread_id, payload_json, created_at
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND kind = ${PROVIDER_HANDOFF_ACTIVITY_KIND}
+        ORDER BY sequence DESC, created_at DESC, activity_id DESC
+        LIMIT 1
+      ) AS latest_handoff
+    `,
+  });
+
+  const getProviderHandoffBoundaryTurnCount: ProjectionSnapshotQueryShape["getProviderHandoffBoundaryTurnCount"] =
+    (threadId) =>
+      getProviderHandoffBoundaryRow({ threadId }).pipe(
+        Effect.map(
+          Option.map(({ payloadTurnCount, fallbackTurnCount }) =>
+            Math.max(
+              typeof payloadTurnCount === "number" &&
+                Number.isInteger(payloadTurnCount) &&
+                payloadTurnCount >= 0
+                ? payloadTurnCount
+                : 0,
+              fallbackTurnCount ?? 0,
+            ),
+          ),
+        ),
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.getProviderHandoffBoundaryTurnCount:query",
+            "ProjectionSnapshotQuery.getProviderHandoffBoundaryTurnCount:decodeRow",
+          ),
+        ),
+      );
+
   const listActivityRowsByKind = SqlSchema.findAll({
     Request: Schema.Struct({ kind: Schema.String }),
     Result: ProjectionThreadActivityDbRowSchema,
@@ -1926,6 +1977,14 @@ pending_approval_requests AS (
           FROM user_input_lifecycle
           WHERE request_order = 1
             AND kind = 'user-input.requested'
+          UNION ALL
+          -- The handoff record carries the provider-era revert boundary; it
+          -- must outlive the rolling activity window. Failed handoffs are not
+          -- pinned: they never moved the boundary.
+          SELECT activity_id
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId}
+            AND kind = ${PROVIDER_HANDOFF_ACTIVITY_KIND}
         )
   `;
 
@@ -3839,6 +3898,7 @@ pending_approval_requests AS (
   return {
     getCommandReadModel,
     getUserInputActivity,
+    getProviderHandoffBoundaryTurnCount,
     listActivitiesByKind,
     getSnapshot,
     getShellSnapshot,

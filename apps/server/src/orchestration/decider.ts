@@ -1,6 +1,7 @@
 import {
   EventId,
   MAX_SCRIPT_ID_LENGTH,
+  PROVIDER_HANDOFF_ACTIVITY_KIND,
   SCRIPT_RUN_COMMAND_PATTERN,
   MessageId,
   ThreadLinkedPullRequest,
@@ -132,27 +133,56 @@ function hasQueuedTurnStartForThread(
 }
 
 /**
- * Turn index of the latest provider boundary: the highest checkpointed turn
- * count completed at or before the most recent `provider.handoff` activity.
- * Turns at or below it ran under a previous provider's session, so a revert
- * landing there would restore that provider's history as the visible head
- * while the binding belongs to the destination provider.
+ * `payload.turnCount` recorded on a `provider.handoff` activity, or null when
+ * the record predates the field or carries a malformed value.
+ */
+function providerHandoffPayloadTurnCount(payload: unknown): number | null {
+  if (!Predicate.isObject(payload)) {
+    return null;
+  }
+  const turnCount = payload.turnCount;
+  return typeof turnCount === "number" && Number.isInteger(turnCount) && turnCount >= 0
+    ? turnCount
+    : null;
+}
+
+/**
+ * Turn index of the latest provider boundary. `provider.handoff` activities
+ * record the source era's turn count on the payload; records written before
+ * that field existed fall back to the timestamp join over retained
+ * checkpoints, and the join also counts a source-era checkpoint that had not
+ * landed yet when the boundary was written. `durableBoundaryTurnCount` is the
+ * same boundary resolved straight from the projection tables — the command
+ * snapshot omits activities at startup and caps them while running, so
+ * without it a restart or eviction would silently reopen the gate. The max of
+ * every signal keeps the boundary closed when any source undercounts.
  * Null when the thread has never handed off.
  */
 function providerHandoffBoundaryTurnCount(
   thread: Pick<OrchestrationThread, "activities" | "checkpoints">,
+  durableBoundaryTurnCount?: number,
 ): number | null {
-  const handoff = thread.activities.findLast((activity) => activity.kind === "provider.handoff");
-  if (handoff === undefined) {
-    return null;
+  const handoff = thread.activities.findLast(
+    (activity) => activity.kind === PROVIDER_HANDOFF_ACTIVITY_KIND,
+  );
+  const candidates: number[] = [];
+  if (durableBoundaryTurnCount !== undefined) {
+    candidates.push(durableBoundaryTurnCount);
   }
-  let boundaryTurnCount = 0;
-  for (const checkpoint of thread.checkpoints) {
-    if (compareDateTimeStrings(checkpoint.completedAt, handoff.createdAt) <= 0) {
-      boundaryTurnCount = Math.max(boundaryTurnCount, checkpoint.checkpointTurnCount);
+  if (handoff !== undefined) {
+    const payloadTurnCount = providerHandoffPayloadTurnCount(handoff.payload);
+    if (payloadTurnCount !== null) {
+      candidates.push(payloadTurnCount);
     }
+    let joinedTurnCount = 0;
+    for (const checkpoint of thread.checkpoints) {
+      if (compareDateTimeStrings(checkpoint.completedAt, handoff.createdAt) <= 0) {
+        joinedTurnCount = Math.max(joinedTurnCount, checkpoint.checkpointTurnCount);
+      }
+    }
+    candidates.push(joinedTurnCount);
   }
-  return boundaryTurnCount;
+  return candidates.length === 0 ? null : Math.max(...candidates);
 }
 
 function findPullRequestLink(
@@ -236,10 +266,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   command,
   readModel,
   userInputActivity,
+  providerHandoffBoundary,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
   readonly userInputActivity?: OrchestrationThreadActivity;
+  // Latest provider handoff boundary resolved from the projection tables.
+  // The command snapshot can lose the boundary activity to its 500-row window
+  // or hold none at all after a restart, so the engine reads it directly.
+  readonly providerHandoffBoundary?: number;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
   OrchestrationCommandRejection | PlatformError.PlatformError,
@@ -1854,7 +1889,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // destination provider's turns and restore the previous provider's
       // history while the session belongs to the destination — a state
       // neither side owns.
-      const boundaryTurnCount = providerHandoffBoundaryTurnCount(thread);
+      const boundaryTurnCount = providerHandoffBoundaryTurnCount(thread, providerHandoffBoundary);
       if (boundaryTurnCount !== null && command.turnCount <= boundaryTurnCount) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
